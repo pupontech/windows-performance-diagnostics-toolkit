@@ -1,0 +1,14 @@
+# Build artifacts
+/dist/
+*.zip
+*.sha256
+
+# Local diagnostics and secrets
+artifacts/
+*.etl
+*.pml
+*.blg
+*.cab
+*.dmp
+*.log
+.env

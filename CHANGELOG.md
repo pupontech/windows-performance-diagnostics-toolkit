@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 — 2026-08-27
+
+Read-only network-state snapshot (next pattern adopted from the field-tested RemoteDiagnostics kit: `capture-network-state.ps1`).
+
+- **Network state stage (`Get-NetworkState`)**: every collection now writes `network-state.json` — IP configuration (`ipconfig /all`), adapter status, connection profiles, DNS server configuration and client cache, IPv4 routing table, ARP table, hosts-file active entries, proxy settings (`netsh winhttp` + Internet Settings), established/listening TCP connections, and a security/VPN/filtering software inventory. Read-only and collectible from a standard (non-admin) account; no new consent flag (covered by the existing `-ConfirmLocalCollection` gate).
+- **DNS-vs-ping split test**: raw-IP pings (`8.8.8.8`, `1.1.1.1`) versus public-name resolution (`google.com`, `cloudflare.com`, `microsoft.com`) produce a manifest verdict — `dns-and-connectivity-ok`, `dns-failure` (reachable by IP but names do not resolve → hosts file/proxy/DNS-server issue), `icmp-blocked-or-partial`, `connectivity-failure`, or `inconclusive`.
+- **Security-software inventory**: running processes and installed programs (64-bit + WOW6432Node Uninstall keys) are matched against a grouped EDR/AV, DNS-filter, firewall/proxy/VPN keyword list (the CrowdStrike+McAfee lesson from 2026-08-19 is baked in); `securitySoftwareMatches` counts land in the manifest, full detail in the artifact. The matcher (`Test-SecuritySoftwareMatch`) is a pure function unit-tested on Linux; `Get-PropertyValue` keeps registry reads StrictMode-safe on sparse Uninstall keys.
+- **Resilience**: every network sub-collection is independently guarded — one failing section records a `network-state-<section>` entry in `collectionErrors` and never loses the rest; `network.status`/`sectionErrorCount` in the manifest make partial captures visible.
+- Plan mode advertises `collect-network-state-after-explicit-consent` and the `network.subCollections` list; report schema covers the `network` block; live test case WPD-17 added to the matrix; windows-verify asserts the network block and artifact on windows-2022/2025.
+- Safety contract unchanged: read-only, local-only, no auto-elevation, no remediation.
+
 ## 0.4.0 — 2026-08-27
 
 Crash evidence analysis + resilient event reading (patterns adopted from the field-tested RemoteDiagnostics kit).

@@ -15,6 +15,7 @@ document defines the contract for those JSON files and their companion artifacts
 | `performance-samples.csv` | Time-series samples of CPU load, available memory, and free disk space collected once per second. |
 | `top-processes.json` | Snapshot of the top 20 processes sorted by CPU usage, including PID, memory, and handle count. |
 | `system-events-last-24-hours.json` | System event log entries from the preceding 24 hours (up to MaxEventCount). |
+| `network-state.json` | Read-only network-state snapshot: IP configuration, adapter status, DNS servers/cache, routes, ARP table, a DNS-vs-ping split test, hosts-file entries, proxy settings, active TCP connections, and a security/VPN/filtering software inventory. |
 | `wpr-trace.etl` | Windows Performance Recorder ETL trace, only present when `-CaptureWpr` and `-ConfirmWprCapture` are used. |
 | `defender-performance.etl` | Microsoft Defender Antivirus performance recording (Microsoft-Antimalware-Engine and NT kernel process events), only present when `-CaptureDefender` and `-ConfirmDefenderCapture` are used. |
 
@@ -123,3 +124,29 @@ Both arrays are empty when no matching evidence is in the window. Correlation
 is evidence, not causation: a bugcheck code names the crash *type*, but naming
 the exact driver usually needs WinDbg `!analyze -v` against the matching
 minidump.
+
+## Network State Block
+
+The `network` object appears in both manifest modes. In Plan mode it lists the
+planned read-only sub-collections. In Collect mode it summarizes the captured
+`network-state.json` artifact so the technician can see the connectivity
+verdict without opening the file.
+
+| Field | Meaning |
+|-------|---------|
+| `subCollections` | (Plan mode) The read-only network-state sub-collections that will be captured after consent: IP configuration, adapter status, connection profiles, DNS server configuration, DNS client cache, IPv4 routing table, ARP table, DNS-vs-ping split test, hosts file, proxy settings, TCP connections, and security-software inventory. |
+| `status` | (Collect mode) `completed` when `network-state.json` was written, `failed` otherwise. |
+| `artifact` | (Collect mode) Always `network-state.json`. |
+| `dnsVsPing.rawIpReachable` | Whether at least one raw-IP ping (`8.8.8.8`, `1.1.1.1`) succeeded — link/routing works without DNS. |
+| `dnsVsPing.dnsResolutionOk` | Whether at least one public name (`google.com`, `cloudflare.com`, `microsoft.com`) resolved. |
+| `dnsVsPing.verdict` | `dns-and-connectivity-ok` (both work), `dns-failure` (raw IPs reachable but names do not resolve — hosts file, proxy, or DNS-server issue), `icmp-blocked-or-partial` (names resolve but ICMP to public IPs fails), `connectivity-failure` (neither works), or `inconclusive`. |
+| `securitySoftwareMatches.processMatches` | (Collect mode) Number of running processes matching the EDR/AV/DNS-filter/firewall/proxy/VPN keyword inventory. |
+| `securitySoftwareMatches.installedSoftwareMatches` | (Collect mode) Number of installed programs (from both 64-bit and WOW6432Node Uninstall keys) matching the same inventory. |
+| `sectionErrorCount` | (Collect mode) Number of network-state sub-collections that failed individually; each failure is also recorded in `collectionErrors` with a `network-state-<section>` stage. |
+
+`network-state.json` carries the full detail: raw `ipconfig /all` and `arp -a`
+output, per-adapter/per-interface tables, the complete DNS-vs-ping results with
+the resolved addresses, every active hosts-file entry, `netsh winhttp` and
+Internet Settings proxy values, established/listening TCP connections, and the
+full security-software matches with the keyword list used. All of it is
+read-only and collectible from a standard (non-admin) account.

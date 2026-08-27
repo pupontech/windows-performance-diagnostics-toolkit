@@ -2,9 +2,9 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.3.0
+**Version:** 0.5.0
 
-**Status:** Read-only collection MVP plus consent-gated WPR and Defender performance captures. It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
+**Status:** Read-only collection MVP plus consent-gated WPR and Defender performance captures, and a built-in read-only network-state snapshot (DNS-vs-ping split test, hosts file, proxy, security-software inventory). It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
 
 [![CI](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml)
 

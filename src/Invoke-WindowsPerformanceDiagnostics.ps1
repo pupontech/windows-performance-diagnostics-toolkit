@@ -27,7 +27,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.4.0'
+$ScriptVersion = '0.5.0'
 
 function Write-JsonFile {
     param(
@@ -177,6 +177,307 @@ function Get-CrashAnalysis {
     }
 }
 
+# Keywords for spotting VPN/filter/firewall/EDR/AV software by process name or
+# install entry. Grouped by category so it is easy to extend when a new case
+# turns up a product this list does not catch yet (e.g. the CrowdStrike+McAfee
+# case, 2026-08-19 - the original list only covered consumer VPN/ad-filter
+# names and missed both entirely).
+$script:SecuritySoftwareKeywords = @(
+    # EDR / endpoint AV (enterprise + consumer)
+    'crowdstrike', 'falcon', 'mcafee', 'huntress', 'sentinelone', 'sentinel one', 'sophos',
+    'carbonblack', 'carbon black', 'cylance', 'cybereason', 'tanium', 'deep instinct',
+    'harfanglab', 'qualys', 'rapid7', 'malwarebytes', 'webroot', 'bitdefender', 'kaspersky',
+    'avast', 'avg', 'f-secure', 'trendmicro', 'trend micro', 'symantec', 'norton', 'eset',
+    'nod32', 'windows defender atp', 'microsoft defender for endpoint', 'cortex xdr',
+    'palo alto',
+    # DNS / content / web filtering
+    'opendns', 'umbrella', 'dnsfilter', 'cleanbrowsing', 'netfree', 'techloq', 'circle',
+    'net nanny', 'covenant eyes', 'x3watch', 'k9 web',
+    # Firewall / proxy / VPN
+    'vpn', 'proxy', 'firewall', 'fortinet', 'forticlient', 'checkpoint', 'check point',
+    'globalprotect', 'pulse secure', 'anyconnect', 'sonicwall', 'cyberoam', 'zscaler',
+    'forcepoint', 'barracuda', 'watchguard', 'netlimiter', 'pihole', 'adguard',
+    'nordvpn', 'expressvpn', 'openvpn', 'wireguard', 'tailscale'
+)
+
+function Test-SecuritySoftwareMatch {
+    <#
+      Pure predicate used by the security-software inventory: true when the
+      process/install name or company mentions a known EDR/AV, DNS-filter,
+      firewall, proxy, or VPN product. Case-insensitive substring matching.
+    #>
+    param(
+        [AllowNull()]
+        [string]$Name,
+
+        [AllowNull()]
+        [string]$Company
+    )
+
+    $haystack = "$Name $Company".ToLowerInvariant()
+    foreach ($keyword in $script:SecuritySoftwareKeywords) {
+        if ($haystack.Contains($keyword.ToLowerInvariant())) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-PropertyValue {
+    <#
+      StrictMode-safe property read: returns $null when the object has no such
+      property instead of throwing (registry Uninstall keys are sparse - many
+      lack DisplayName/Publisher/InstallDate).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -ne $property) {
+        return $property.Value
+    }
+    return $null
+}
+
+function Get-NetworkState {
+    <#
+      Read-only network-state snapshot (pattern adopted from the field-tested
+      RemoteDiagnostics capture-network-state.ps1). Captures the live network
+      picture that disappears on reboot: IP configuration, adapter status,
+      DNS servers/cache, routes, ARP, a DNS-vs-ping split test (raw-IP ping
+      reachability versus name resolution - the classic discriminator between
+      "DNS is broken" and "the network is down"), hosts-file entries, proxy
+      settings, active TCP connections, and a security/VPN/filtering software
+      inventory. No admin rights required; every section is independently
+      guarded so one failure never loses the rest.
+      Returns [pscustomobject]@{ State = <ordered dict>; Errors = @(...) }.
+    #>
+
+    $errors = @()
+    $state = [ordered]@{}
+
+    $state['capturedAtUtc'] = Get-UtcTimestamp
+    $state['computerName'] = $env:COMPUTERNAME
+
+    try {
+        $state['ipConfigAll'] = ((ipconfig /all) -join "`n")
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'ipconfig'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $state['adapters'] = @(
+            Get-NetAdapter | Select-Object Name, InterfaceDescription, Status, LinkSpeed, MacAddress
+        )
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'adapters'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $state['connectionProfiles'] = @(
+            Get-NetConnectionProfile | Select-Object Name, InterfaceAlias, NetworkCategory, IPv4Connectivity, IPv6Connectivity
+        )
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'connection-profiles'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $state['dnsServerAddresses'] = @(
+            Get-DnsClientServerAddress | Select-Object InterfaceAlias, AddressFamily, ServerAddresses
+        )
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'dns-servers'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $state['dnsClientCache'] = @(
+            Get-DnsClientCache | Select-Object -First 50 Entry, Name, Data, Status
+        )
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'dns-cache'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $state['ipv4Routes'] = @(
+            Get-NetRoute -AddressFamily IPv4 | Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric
+        )
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'routes'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $state['arpTable'] = ((arp -a) -join "`n")
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'arp'; Message = $_.Exception.Message }
+    }
+
+    # DNS-vs-ping split test: reach a public IP by raw address (link/routing
+    # without DNS) and resolve public names (DNS). The combination tells the
+    # technician whether the outage is in connectivity or in name resolution.
+    $pingTargets = @('8.8.8.8', '1.1.1.1')
+    $pingResults = @()
+    foreach ($target in $pingTargets) {
+        try {
+            $replies = @(Test-Connection -ComputerName $target -Count 3 -ErrorAction SilentlyContinue)
+            $pingResults += [pscustomobject]@{
+                Target = $target
+                Reachable = ($replies.Count -gt 0)
+                ReplyCount = $replies.Count
+            }
+        }
+        catch {
+            $pingResults += [pscustomobject]@{
+                Target = $target
+                Reachable = $false
+                ReplyCount = 0
+                Error = $_.Exception.Message
+            }
+        }
+    }
+
+    $dnsTargets = @('google.com', 'cloudflare.com', 'microsoft.com')
+    $dnsResults = @()
+    foreach ($domain in $dnsTargets) {
+        try {
+            $resolvedIps = @(
+                Resolve-DnsName -Name $domain -ErrorAction Stop |
+                    Where-Object { $_.Type -in @('A', 'AAAA') } |
+                    ForEach-Object { $_.IPAddress }
+            )
+            $dnsResults += [pscustomobject]@{
+                Domain = $domain
+                Resolved = ($resolvedIps.Count -gt 0)
+                IpAddresses = @($resolvedIps)
+            }
+        }
+        catch {
+            $dnsResults += [pscustomobject]@{
+                Domain = $domain
+                Resolved = $false
+                IpAddresses = @()
+                Error = $_.Exception.Message
+            }
+        }
+    }
+
+    $rawIpReachable = @($pingResults | Where-Object { $_.Reachable }).Count -gt 0
+    $dnsResolutionOk = @($dnsResults | Where-Object { $_.Resolved }).Count -gt 0
+    $verdict = 'inconclusive'
+    if ($rawIpReachable -and $dnsResolutionOk) {
+        $verdict = 'dns-and-connectivity-ok'
+    }
+    elseif ($rawIpReachable -and -not $dnsResolutionOk) {
+        $verdict = 'dns-failure'
+    }
+    elseif (-not $rawIpReachable -and $dnsResolutionOk) {
+        $verdict = 'icmp-blocked-or-partial'
+    }
+    else {
+        $verdict = 'connectivity-failure'
+    }
+
+    $state['dnsVsPing'] = [ordered]@{
+        rawIpPing = @($pingResults)
+        dnsResolution = @($dnsResults)
+        rawIpReachable = $rawIpReachable
+        dnsResolutionOk = $dnsResolutionOk
+        verdict = $verdict
+    }
+
+    try {
+        $hostsPath = Join-Path -Path $env:SystemRoot -ChildPath 'System32\drivers\etc\hosts'
+        $activeEntries = @()
+        if (Test-Path -LiteralPath $hostsPath) {
+            $activeEntries = @(
+                Get-Content -LiteralPath $hostsPath |
+                    Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }
+            )
+        }
+        $state['hostsFile'] = [ordered]@{
+            path = $hostsPath
+            activeEntryCount = $activeEntries.Count
+            activeEntries = $activeEntries
+        }
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'hosts-file'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $winhttpProxy = ((netsh winhttp show proxy) -join "`n")
+        $ieProxy = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue |
+            Select-Object ProxyEnable, ProxyServer, AutoConfigURL
+        $state['proxySettings'] = [ordered]@{
+            winhttpProxy = $winhttpProxy
+            internetSettings = @($ieProxy)
+        }
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'proxy'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $state['tcpConnections'] = @(
+            Get-NetTCPConnection -ErrorAction SilentlyContinue |
+                Where-Object { $_.State -in @('Established', 'Listen') } |
+                Sort-Object LocalPort |
+                Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess
+        )
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'tcp-connections'; Message = $_.Exception.Message }
+    }
+
+    try {
+        $allProcesses = @(Get-Process | Sort-Object Name | Select-Object Name, Id, Company)
+        $securityProcesses = @(
+            $allProcesses | Where-Object { Test-SecuritySoftwareMatch -Name $_.Name -Company $_.Company }
+        )
+
+        $uninstallPaths = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $installedSecuritySoftware = @(
+            Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
+                Where-Object {
+                    Test-SecuritySoftwareMatch `
+                        -Name (Get-PropertyValue -InputObject $_ -Name 'DisplayName') `
+                        -Company (Get-PropertyValue -InputObject $_ -Name 'Publisher')
+                } |
+                Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
+        )
+
+        $state['securitySoftware'] = [ordered]@{
+            keywordList = @($script:SecuritySoftwareKeywords)
+            processMatches = @($securityProcesses)
+            installedSoftwareMatches = @($installedSecuritySoftware)
+        }
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'security-software'; Message = $_.Exception.Message }
+    }
+
+    $state['sectionErrors'] = @($errors)
+
+    return [pscustomobject]@{
+        State = $state
+        Errors = @($errors)
+    }
+}
+
 try {
     $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
     New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
@@ -203,10 +504,27 @@ $planManifest = [ordered]@{
     plannedActions = @(
         'write-local-plan-manifest',
         'collect-read-only-system-snapshots-after-explicit-consent',
+        'collect-network-state-after-explicit-consent',
         'export-bounded-system-event-summary-after-explicit-consent',
         'analyze-crash-evidence-after-explicit-consent',
         'write-local-artifact-hashes-after-explicit-consent'
     )
+    network = [ordered]@{
+        subCollections = @(
+            'ip-configuration',
+            'adapter-status',
+            'connection-profiles',
+            'dns-server-configuration',
+            'dns-client-cache',
+            'ipv4-routing-table',
+            'arp-table',
+            'dns-vs-ping-split-test',
+            'hosts-file',
+            'proxy-settings',
+            'tcp-connections',
+            'security-software-inventory'
+        )
+    }
 }
 
 if ($CaptureWpr) {
@@ -254,6 +572,15 @@ function Add-CollectionError {
     $script:collectionErrors += [pscustomobject]@{
         Stage = $Stage
         Message = $ErrorRecord.Exception.Message
+    }
+}
+
+function Add-CollectionErrorText {
+    param([string]$Stage, [string]$Message)
+
+    $script:collectionErrors += [pscustomobject]@{
+        Stage = $Stage
+        Message = $Message
     }
 }
 
@@ -317,6 +644,24 @@ try {
 }
 catch {
     Add-CollectionError -Stage 'process-snapshot' -ErrorRecord $_
+}
+
+$networkState = $null
+$networkStatus = 'failed'
+$networkSectionErrorCount = 0
+try {
+    $networkResult = Get-NetworkState
+    $networkState = $networkResult.State
+    $networkSectionErrorCount = @($networkResult.Errors).Count
+    foreach ($sectionError in @($networkResult.Errors)) {
+        Add-CollectionErrorText -Stage "network-state-$($sectionError.Section)" -Message $sectionError.Message
+    }
+    Write-JsonFile -InputObject $networkState -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'network-state.json')
+    $networkStatus = 'completed'
+}
+catch {
+    Add-CollectionError -Stage 'network-state' -ErrorRecord $_
+    $networkStatus = 'failed'
 }
 
 $systemLogInfo = $null
@@ -512,6 +857,20 @@ $collectionManifest = [ordered]@{
         skippedUnrenderableCount = $null
     }
     crashAnalysis = $crashAnalysis
+    network = [ordered]@{
+        status = $networkStatus
+        artifact = 'network-state.json'
+        dnsVsPing = [ordered]@{
+            rawIpReachable = $null
+            dnsResolutionOk = $null
+            verdict = 'inconclusive'
+        }
+        securitySoftwareMatches = [ordered]@{
+            processMatches = 0
+            installedSoftwareMatches = 0
+        }
+        sectionErrorCount = $networkSectionErrorCount
+    }
     collectionErrors = $collectionErrors
     artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory
 }
@@ -522,6 +881,25 @@ if ($systemLogInfo -and $safeEvents) {
         recordCount = $systemLogInfo.RecordCount
         pulledCount = $safeEvents.Events.Count
         skippedUnrenderableCount = $safeEvents.SkippedMessageCount
+    }
+}
+
+if ($networkState) {
+    $dnsVsPingState = $networkState['dnsVsPing']
+    $securitySoftwareState = $networkState['securitySoftware']
+    $collectionManifest.network = [ordered]@{
+        status = $networkStatus
+        artifact = 'network-state.json'
+        dnsVsPing = [ordered]@{
+            rawIpReachable = if ($null -ne $dnsVsPingState) { $dnsVsPingState['rawIpReachable'] } else { $null }
+            dnsResolutionOk = if ($null -ne $dnsVsPingState) { $dnsVsPingState['dnsResolutionOk'] } else { $null }
+            verdict = if ($null -ne $dnsVsPingState) { $dnsVsPingState['verdict'] } else { 'inconclusive' }
+        }
+        securitySoftwareMatches = [ordered]@{
+            processMatches = if ($null -ne $securitySoftwareState) { @($securitySoftwareState['processMatches']).Count } else { 0 }
+            installedSoftwareMatches = if ($null -ne $securitySoftwareState) { @($securitySoftwareState['installedSoftwareMatches']).Count } else { 0 }
+        }
+        sectionErrorCount = $networkSectionErrorCount
     }
 }
 

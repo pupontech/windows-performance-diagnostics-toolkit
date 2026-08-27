@@ -270,6 +270,158 @@ def test_plan_mode_lists_crash_analysis_action(tmp_path):
     assert "analyze-crash-evidence-after-explicit-consent" in manifest["plannedActions"]
 
 
+def test_plan_mode_lists_network_state_action_and_scope(tmp_path):
+    """Plan mode must advertise the read-only network-state collection and its
+    sub-collections without touching Windows-only network cmdlets."""
+    output_directory = tmp_path / "plan-network"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "collect-network-state-after-explicit-consent" in manifest["plannedActions"]
+    assert manifest["network"]["subCollections"] == [
+        "ip-configuration",
+        "adapter-status",
+        "connection-profiles",
+        "dns-server-configuration",
+        "dns-client-cache",
+        "ipv4-routing-table",
+        "arp-table",
+        "dns-vs-ping-split-test",
+        "hosts-file",
+        "proxy-settings",
+        "tcp-connections",
+        "security-software-inventory",
+    ]
+
+
+def test_network_keyword_matching_is_pure_and_strict_mode_safe():
+    """Test-SecuritySoftwareMatch (dot-sourced from the collector) must catch
+    EDR/AV/DNS-filter/VPN products by name or company without false-positives,
+    and Get-PropertyValue must return $null for missing properties instead of
+    throwing under Set-StrictMode -Version Latest (registry Uninstall keys are
+    sparse)."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        "$null = . '" + script + "' -Mode Plan -OutputDirectory /tmp/wpd-net-test; "
+        "$r = [ordered]@{"
+        "crowdstrike=(Test-SecuritySoftwareMatch -Name 'CSAgent' -Company 'CrowdStrike, Inc.');"
+        "sentinel=(Test-SecuritySoftwareMatch -Name 'SentinelAgent' -Company 'SentinelOne');"
+        "mcafee=(Test-SecuritySoftwareMatch -Name 'McAfee WebAdvisor' -Company '');"
+        "openvpn=(Test-SecuritySoftwareMatch -Name 'OpenVPN' -Company '');"
+        "pihole=(Test-SecuritySoftwareMatch -Name 'pihole' -Company '');"
+        "chrome=(Test-SecuritySoftwareMatch -Name 'chrome' -Company 'Google LLC');"
+        "notepad=(Test-SecuritySoftwareMatch -Name 'notepad' -Company 'Microsoft Corporation');"
+        "missingProp=(Get-PropertyValue -InputObject ([pscustomobject]@{DisplayName='x'}) -Name 'Publisher')"
+        "}; $r | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    matches = json.loads(result.stdout)
+
+    assert matches["crowdstrike"] is True
+    assert matches["sentinel"] is True
+    assert matches["mcafee"] is True
+    assert matches["openvpn"] is True
+    assert matches["pihole"] is True
+    assert matches["chrome"] is False
+    assert matches["notepad"] is False
+    assert matches["missingProp"] is None
+
+
+def test_network_state_collection_is_resilient_and_structured(tmp_path):
+    """Get-NetworkState (dot-sourced, Windows cmdlets mocked) must produce the
+    full structured snapshot, compute the DNS-vs-ping verdict, and keep every
+    other section when one fails - all StrictMode-safe on sparse registry
+    keys. Runs on the Linux verification host; windows-verify exercises the
+    real cmdlets on windows-2022/2025."""
+    script = str(SCRIPT).replace("\\", "/")
+    # .NET on Linux normalizes the backslash child path to forward slashes,
+    # so the fixture tree mirrors what Join-Path resolves to here (on Windows
+    # the native separator produces the same physical file).
+    hosts_file = tmp_path / "System32" / "drivers" / "etc" / "hosts"
+    hosts_file.parent.mkdir(parents=True)
+    hosts_file.write_text(
+        "# comment line\n127.0.0.1 localhost\n\n0.0.0.0 ads.example.com\n",
+        encoding="utf-8",
+    )
+    command = (
+        "$null = . '" + script + "' -Mode Plan -OutputDirectory /tmp/wpd-net-state; "
+        "$env:SystemRoot = '" + str(tmp_path) + "'; "
+        "function ipconfig { param($x) 'Windows IP Configuration','   IPv4 Address. . . : 192.168.1.50' }; "
+        "function arp { param($x) 'Interface: 192.168.1.50','192.168.1.1 aa-bb-cc-dd-ee-ff dynamic' }; "
+        "function netsh { param($a,$b,$c) 'Current WinHTTP proxy settings:','Direct access (no proxy server).' }; "
+        "function Get-NetAdapter { [pscustomobject]@{Name='Ethernet';InterfaceDescription='Test Adapter';Status='Up';LinkSpeed='1 Gbps';MacAddress='00:11:22:33:44:55'} }; "
+        "function Get-NetConnectionProfile { [pscustomobject]@{Name='testnet';InterfaceAlias='Ethernet';NetworkCategory='Private';IPv4Connectivity='Internet';IPv6Connectivity='NoTraffic'} }; "
+        "function Get-DnsClientServerAddress { [pscustomobject]@{InterfaceAlias='Ethernet';AddressFamily=2;ServerAddresses=@('8.8.8.8','1.1.1.1')} }; "
+        "function Get-DnsClientCache { [pscustomobject]@{Entry='google.com';Name='google.com';Data='142.250.1.1';Status='Success'} }; "
+        "function Get-NetRoute { [pscustomobject]@{DestinationPrefix='0.0.0.0/0';NextHop='192.168.1.1';InterfaceAlias='Ethernet';RouteMetric=10} }; "
+        "function Test-Connection { param($ComputerName,$Count) [pscustomobject]@{Address=$ComputerName;ResponseTime=5;StatusCode=0} }; "
+        "function Resolve-DnsName { param($Name) [pscustomobject]@{Name=$Name;Type='A';IPAddress='1.2.3.4'} }; "
+        "function Get-NetTCPConnection { [pscustomobject]@{LocalAddress='0.0.0.0';LocalPort=443;RemoteAddress='1.2.3.4';RemotePort=50000;State='Established';OwningProcess=1234} }; "
+        "function Get-Process { [pscustomobject]@{Name='chrome';Id=1;Company='Google LLC'},[pscustomobject]@{Name='csagent';Id=2;Company='CrowdStrike, Inc.'} }; "
+        "function Get-ItemProperty { param($Path,$ErrorAction) [pscustomobject]@{DisplayName='Google Chrome';DisplayVersion='1.0';Publisher='Google LLC'},[pscustomobject]@{DisplayName='CrowdStrike Falcon';Publisher='CrowdStrike, Inc.'},[pscustomobject]@{DisplayVersion='2.0'} }; "
+        "$good = (Get-NetworkState).State | ConvertTo-Json -Depth 8; "
+        "function Get-NetAdapter { throw 'mocked adapter failure' }; "
+        "$bad = Get-NetworkState; "
+        "$badSections = @($bad.Errors | ForEach-Object { $_.Section }) -join ','; "
+        "[ordered]@{good=$good;badSections=$badSections;badVerdict=$bad.State.dnsVsPing.verdict} | ConvertTo-Json -Depth 8"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    parsed = json.loads(result.stdout)
+    state = json.loads(parsed["good"])
+
+    # full structured snapshot with every section present
+    for section in (
+        "ipConfigAll", "adapters", "connectionProfiles", "dnsServerAddresses",
+        "dnsClientCache", "ipv4Routes", "arpTable", "dnsVsPing", "hostsFile",
+        "proxySettings", "tcpConnections", "securitySoftware",
+    ):
+        assert section in state, f"missing network-state section: {section}"
+
+    # DNS-vs-ping split test: both mocks succeed -> both green
+    assert state["dnsVsPing"]["rawIpReachable"] is True
+    assert state["dnsVsPing"]["dnsResolutionOk"] is True
+    assert state["dnsVsPing"]["verdict"] == "dns-and-connectivity-ok"
+    assert len(state["dnsVsPing"]["rawIpPing"]) == 2
+    assert len(state["dnsVsPing"]["dnsResolution"]) == 3
+
+    # hosts file: comments and blank lines excluded
+    assert state["hostsFile"]["activeEntryCount"] == 2
+    assert state["hostsFile"]["activeEntries"] == [
+        "127.0.0.1 localhost",
+        "0.0.0.0 ads.example.com",
+    ]
+
+    # security inventory: chrome is not a match, csagent is; the sparse
+    # uninstall key (no DisplayName) must not throw under StrictMode
+    assert [p["Name"] for p in state["securitySoftware"]["processMatches"]] == ["csagent"]
+    assert [s["DisplayName"] for s in state["securitySoftware"]["installedSoftwareMatches"]] == [
+        "CrowdStrike Falcon"
+    ]
+    assert state["sectionErrors"] == []
+
+    # resilience: a failing section is recorded and never loses the rest
+    assert parsed["badSections"] == "adapters"
+    assert parsed["badVerdict"] == "dns-and-connectivity-ok"
+
+
 def test_crash_analysis_decodes_bugchecks_and_flags_unexplained_shutdowns():
     """Get-CrashAnalysis (pure function, dot-sourced from the collector) must
     decode BugCheck 1001 codes and flag Kernel-Power 41 without a nearby

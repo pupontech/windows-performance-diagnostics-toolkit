@@ -216,6 +216,63 @@
       },
       "additionalProperties": false
     },
+    "network": {
+      "type": "object",
+      "description": "In Plan mode: the planned read-only network-state sub-collections. In Collect mode: the DNS-vs-ping split-test summary and security-software match counts from the captured network-state.json.",
+      "properties": {
+        "subCollections": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "failed"]
+        },
+        "artifact": {
+          "type": "string"
+        },
+        "dnsVsPing": {
+          "type": "object",
+          "properties": {
+            "rawIpReachable": {
+              "type": ["boolean", "null"]
+            },
+            "dnsResolutionOk": {
+              "type": ["boolean", "null"]
+            },
+            "verdict": {
+              "type": "string",
+              "enum": [
+                "dns-and-connectivity-ok",
+                "dns-failure",
+                "icmp-blocked-or-partial",
+                "connectivity-failure",
+                "inconclusive"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "securitySoftwareMatches": {
+          "type": "object",
+          "properties": {
+            "processMatches": {
+              "type": "integer"
+            },
+            "installedSoftwareMatches": {
+              "type": "integer"
+            }
+          },
+          "additionalProperties": false
+        },
+        "sectionErrorCount": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
     "collectionErrors": {
       "type": "array",
       "items": {

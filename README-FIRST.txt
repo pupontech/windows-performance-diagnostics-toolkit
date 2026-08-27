@@ -1,7 +1,7 @@
 WINDOWS PERFORMANCE DIAGNOSTICS TOOLKIT
 =======================================
 Read-Only Diagnostics Collector for Windows 10/11
-Version 0.3.0
+Version 0.5.0
 
 This toolkit collects read-only Windows performance diagnostics to help
 troubleshoot performance issues. It does NOT upload data, remediate problems,
@@ -12,6 +12,11 @@ WHAT THIS TOOL COLLECTS
 - CPU, memory, and disk performance samples (counters)
 - Top processes by resource usage
 - System event log entries (recent)
+- Network state snapshot (read-only, no admin needed):
+  IP configuration, adapter status, DNS servers/cache, routes, ARP table,
+  a DNS-vs-ping split test (is it DNS or is the network down?), hosts-file
+  entries, proxy settings, active TCP connections, and an inventory of
+  running/installed security, VPN, and filtering software
 - Optional WPR (Windows Performance Recorder) trace
   (requires explicit consent and elevated console)
 - Optional Microsoft Defender performance recording
@@ -79,7 +84,7 @@ HASH VERIFICATION
 -----------------
 Verify the downloaded zip against the published SHA-256 hash:
 
-    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.3.0.zip
+    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.5.0.zip
 
 Compare the output hash to the value in the .sha256 file published alongside
 the release. They must match exactly.

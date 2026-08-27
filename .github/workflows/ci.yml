@@ -182,12 +182,32 @@ jobs:
             Write-Error "Unexpected manifest mode: $($m.mode)"
             exit 1
           }
+          if ($m.network.status -ne "completed") {
+            Write-Error "Unexpected network.status: $($m.network.status)"
+            exit 1
+          }
+          if ($m.network.dnsVsPing.verdict -notin @("dns-and-connectivity-ok","dns-failure","icmp-blocked-or-partial","connectivity-failure","inconclusive")) {
+            Write-Error "Unexpected dnsVsPing verdict: $($m.network.dnsVsPing.verdict)"
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath "C:\Temp\WPD-Case\network-state.json")) {
+            Write-Error "network-state.json missing"
+            exit 1
+          }
+          if (@($m.artifacts | Where-Object { $_.Name -eq "network-state.json" }).Count -ne 1) {
+            Write-Error "network-state.json not listed in manifest hashes"
+            exit 1
+          }
           $p = Get-Content -LiteralPath $plan -Raw | ConvertFrom-Json
           if ($p.mode -ne "Plan") {
             Write-Error "Unexpected plan mode: $($p.mode)"
             exit 1
           }
-          Write-Output "Launchers OK: $manifest (toolVersion $($m.toolVersion)), $plan (toolVersion $($p.toolVersion))"
+          if ($p.plannedActions -notcontains "collect-network-state-after-explicit-consent") {
+            Write-Error "Plan does not advertise network-state collection"
+            exit 1
+          }
+          Write-Output "Launchers OK: $manifest (toolVersion $($m.toolVersion)), $plan (toolVersion $($p.toolVersion)); network verdict $($m.network.dnsVsPing.verdict), security matches $($m.network.securitySoftwareMatches.processMatches)/$($m.network.securitySoftwareMatches.installedSoftwareMatches)"
 
   # WPD-08/09/10: WPR consent + elevation gates on a real Windows VM
   # (GitHub-hosted windows-2022/windows-2025 runner = the owner-provided Windows

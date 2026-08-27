@@ -3,6 +3,11 @@
 *.zip
 *.sha256
 
+# Local Python test environment
+.venv/
+__pycache__/
+*.pyc
+
 # Local diagnostics and secrets
 artifacts/
 *.etl

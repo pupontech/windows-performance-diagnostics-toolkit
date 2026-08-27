@@ -4,7 +4,7 @@
 
 **Version:** 0.1.0
 
-**Status:** Initial research/specification release — no executable collector is included.
+**Status:** Read-only collection MVP. It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
 
 ## Purpose
 
@@ -48,10 +48,33 @@ See [SECURITY.md](SECURITY.md) for data-handling and approval boundaries.
 - No automatic Defender exclusions, protection changes, or cloud upload
 - No unattended collection of full memory dumps
 
+## MVP usage
+
+Create a **non-collecting safety plan** (works on the Linux verification host too):
+
+```powershell
+powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Plan `
+  -OutputDirectory C:\Temp\WPD-Plan
+```
+
+Run a **local, read-only, explicitly consented** collection on Windows:
+
+```powershell
+powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Collect `
+  -ConfirmLocalCollection `
+  -DurationSeconds 30 `
+  -MaxEventCount 200 `
+  -OutputDirectory C:\Temp\WPD-Case-001
+```
+
+The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, and a manifest with SHA-256 hashes. It does **not** start WPR/Procmon/Defender recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything.
+
 ## Planned deliverables
 
 - A schema for a consented, machine-readable diagnostic report
-- Read-only PowerShell collection wrappers with explicit scope and retention controls
+- WPR/WPA and Defender performance captures behind separate, time-bounded consent gates
 - Reproducible packaging and artifact verification
 - Windows lab test matrix before any live remediation capability
 

@@ -188,3 +188,114 @@ jobs:
             exit 1
           }
           Write-Output "Launchers OK: $manifest (toolVersion $($m.toolVersion)), $plan (toolVersion $($p.toolVersion))"
+
+  # WPD-08/09/10: WPR consent + elevation gates on a real Windows VM
+  # (GitHub-hosted windows-2022/windows-2025 runner = the owner-provided Windows
+  #  environment; elevated by default, Windows PowerShell 5.1, real wpr.exe).
+  # WPD-08 consent refusal and WPD-10 elevated capture run directly in the
+  # runner context; WPD-09 drops to a standard local user via a scheduled task
+  # to verify the no-UAC / no-auto-elevation path.
+  wpd-live-gates:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: WPD-08 - WPR capture without consent must refuse before collection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outDir = 'C:\WPD\WPD-08'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $log = Join-Path $outDir 'console.log'
+          $wps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          & $wps -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\src\Invoke-WindowsPerformanceDiagnostics.ps1" `
+            -Mode Collect -ConfirmLocalCollection -CaptureWpr -DurationSeconds 5 -OutputDirectory $outDir *>&1 | Tee-Object -FilePath $log
+          $exit = $LASTEXITCODE
+          if ($exit -eq 0) { throw "WPD-08 FAIL: expected refusal without -ConfirmWprCapture (exit 0)" }
+          $output = Get-Content -LiteralPath $log -Raw
+          if ($output -notmatch 'WPR capture requires -ConfirmWprCapture\. No diagnostic data was collected\.') {
+            throw "WPD-08 FAIL: consent message not found in console output: $output"
+          }
+          $artifacts = @(Get-ChildItem -LiteralPath $outDir -File | Where-Object { $_.Name -ne 'console.log' })
+          if ($artifacts.Count -gt 0) { throw "WPD-08 FAIL: unexpected artifacts: $($artifacts.Name -join ', ')" }
+          Write-Output "WPD-08 PASS: refused with consent message, no artifacts, exit $exit"
+
+      - name: WPD-10 - WPR capture from elevated console completes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outDir = 'C:\WPD\WPD-10'
+          $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          if (-not $isElevated) { throw "WPD-10 FAIL: runner console is not elevated" }
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $log = Join-Path $outDir 'console.log'
+          $wps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          & $wps -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\src\Invoke-WindowsPerformanceDiagnostics.ps1" `
+            -Mode Collect -ConfirmLocalCollection -CaptureWpr -ConfirmWprCapture -DurationSeconds 5 -OutputDirectory $outDir *>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "WPD-10 FAIL: script exit $LASTEXITCODE; see $log" }
+          $etl = Join-Path $outDir 'wpr-trace.etl'
+          if (-not (Test-Path -LiteralPath $etl)) { throw 'WPD-10 FAIL: wpr-trace.etl missing' }
+          if ((Get-Item -LiteralPath $etl).Length -eq 0) { throw 'WPD-10 FAIL: wpr-trace.etl is empty' }
+          $manifest = Get-Content -LiteralPath (Join-Path $outDir 'diagnostic-manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.wpr.status -ne 'completed') { throw "WPD-10 FAIL: wpr.status=$($manifest.wpr.status)" }
+          $inHashes = @($manifest.artifacts | Where-Object { $_.Name -eq 'wpr-trace.etl' })
+          if ($inHashes.Count -ne 1) { throw 'WPD-10 FAIL: wpr-trace.etl not listed in manifest hashes' }
+          $bytes = (Get-Item -LiteralPath $etl).Length
+          Write-Output "WPD-10 PASS: wpr-trace.etl $bytes bytes, wpr.status completed, hashed in manifest"
+
+      - name: WPD-09 - WPR on standard (non-admin) console is skipped, no elevation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'C:\WPD'
+          $outDir = Join-Path $base 'WPD-09'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $user = 'wpdstd'
+          $pass = 'Wpd#2026!Test'
+          net user $user $pass /add | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'WPD-09 FAIL: net user /add failed' }
+          icacls $base /grant "${user}:(OI)(CI)M" | Out-Null
+          Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE\src\Invoke-WindowsPerformanceDiagnostics.ps1" `
+            -Destination (Join-Path $base 'Invoke-WindowsPerformanceDiagnostics.ps1') -Force
+          icacls (Join-Path $base 'Invoke-WindowsPerformanceDiagnostics.ps1') /grant "${user}:R" | Out-Null
+          $runner = Join-Path $base 'wpd09.cmd'
+          $cmdLines = @(
+            '@echo off',
+            '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "C:\WPD\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CaptureWpr -ConfirmWprCapture -DurationSeconds 5 -OutputDirectory "C:\WPD\WPD-09" > "C:\WPD\WPD-09\console.log" 2>&1',
+            'echo %errorlevel% > "C:\WPD\WPD-09\exitcode.txt"'
+          )
+          $cmdLines | Set-Content -LiteralPath $runner -Encoding Ascii
+          schtasks /create /tn wpd09 /tr "cmd.exe /c C:\WPD\wpd09.cmd" /sc once /st 23:59 /ru $user /rp $pass /f | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'WPD-09 FAIL: schtasks /create failed' }
+          schtasks /run /tn wpd09 | Out-Null
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not (Test-Path -LiteralPath (Join-Path $outDir 'exitcode.txt')) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $outDir 'exitcode.txt'))) {
+            throw 'WPD-09 FAIL: standard-user task did not finish within 120s'
+          }
+          $exit = [int](Get-Content -LiteralPath (Join-Path $outDir 'exitcode.txt') -Raw).Trim()
+          if ($exit -ne 0) { throw "WPD-09 FAIL: script exit code $exit; see console.log" }
+          $manifest = Get-Content -LiteralPath (Join-Path $outDir 'diagnostic-manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.wpr.status -ne 'skipped-elevation-required') {
+            throw "WPD-09 FAIL: wpr.status=$($manifest.wpr.status)"
+          }
+          $wprErrors = @($manifest.collectionErrors | Where-Object { $_.Stage -eq 'wpr-capture' })
+          if ($wprErrors.Count -lt 1) { throw 'WPD-09 FAIL: no wpr-capture collectionErrors entry' }
+          if ($wprErrors[0].Message -notmatch 'elevated') {
+            throw "WPD-09 FAIL: unexpected wpr-capture error: $($wprErrors[0].Message)"
+          }
+          if (Test-Path -LiteralPath (Join-Path $outDir 'wpr-trace.etl')) { throw 'WPD-09 FAIL: wpr-trace.etl must NOT exist' }
+          Write-Output "WPD-09 PASS: wpr.status=skipped-elevation-required, no ETL, no elevation attempted"
+
+      - name: Upload WPD-08/09/10 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpd-gates-${{ matrix.os }}
+          path: C:\WPD
+          if-no-files-found: error

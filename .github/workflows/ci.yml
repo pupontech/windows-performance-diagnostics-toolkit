@@ -610,7 +610,7 @@ jobs:
           Set-Content -LiteralPath $bundlePy -Value $bundler -Encoding utf8
           $py = (Get-Command python3 -ErrorAction SilentlyContinue) ?? (Get-Command python -ErrorAction SilentlyContinue)
           if (-not $py) { throw 'WPD-11 FAIL: python not found on runner' }
-          $built = Join-Path $env:WPD11_WORK "$($state.base).zip"
+          $built = Join-Path $env:WPD11_WORK "rebuilt-$($state.base).zip"
           $env:STAGE_DIR = $stage
           $env:ZIP_FILE = $built
           & $py.Source $bundlePy
@@ -738,15 +738,16 @@ jobs:
           $ps1zi = Get-Item -LiteralPath $ps1 -Stream Zone.Identifier -ErrorAction SilentlyContinue
           if ($ps1zi) { throw 'WPD-11 FAIL: extracted .ps1 still has Zone.Identifier after Unblock-File' }
           "Required files present; extracted .ps1 unblocked (no Zone.Identifier)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          # Per-file hash verification against the tag source: the workspace was
-          # switched to the release tag by the hash step, and the release zip is
-          # built from exactly this tree via make-deploy-bundle.sh, so the
-          # extracted files must be byte-identical to the checkout.
+          # Per-file hash verification against the tag source: the stage tree is the
+          # exact `git archive` output (core.autocrlf=false) the rebuilt release zip
+          # was built from, and the rebuilt zip is byte-identical to the published
+          # asset (hash leg above) - so extracted files must match the stage bytes.
+          $refRoot = Join-Path $env:WPD11_WORK "stage\$($state.base)"
           $files = @('src\Invoke-WindowsPerformanceDiagnostics.ps1','Run-Diagnostics.bat','START-HERE.bat','README-FIRST.txt','VERSION')
           foreach ($rel in $files) {
             $extracted = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $root $rel)
-            $refPath = Join-Path $env:GITHUB_WORKSPACE ($rel -replace '\\','/')
-            if (-not (Test-Path -LiteralPath $refPath)) { throw "WPD-11 FAIL: tag checkout reference missing: $refPath" }
+            $refPath = Join-Path $refRoot ($rel -replace '\\','/')
+            if (-not (Test-Path -LiteralPath $refPath)) { throw "WPD-11 FAIL: tag source reference missing: $refPath" }
             $ref = Get-FileHash -Algorithm SHA256 -LiteralPath $refPath
             $match = ($extracted.Hash -eq $ref.Hash)
             "$rel : extracted=$($extracted.Hash) tag@$($state.tag)=$($ref.Hash) match=$match" | Out-File -FilePath $evidence -Append -Encoding utf8

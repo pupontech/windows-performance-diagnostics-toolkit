@@ -219,8 +219,51 @@ the zip hash + Unblock + Protection-history recovery).
    (or run it from `cmd`). Expected: it collects ~30 s and writes
    `C:\Temp\WPD-Case\diagnostic-manifest.json` (plus csv/json artifacts).
 
-Result: PASS / FAIL / N/A — Evidence (folder listing, `Get-FileHash` output,
-`C:\Temp\WPD-Case` contents):
+Result: **PASS (with one documented defect in the released zip; MOTW legs N/A
+on CI runners)** — executed 2026-08-27 against release **v0.4.0** on the
+GitHub-hosted windows-2022 + windows-2025 runners via the new `wpd-release-flow`
+CI job (commit c1758f8, run 33118493109, artifact `wpd-11-windows-2022/2025`).
+
+- **Zip hash vs published `.sha256` asset — PASS.** The release zip is
+  byte-deterministic (make-deploy-bundle.sh now writes explicit entry
+  timestamps/modes, verified reproducible on any platform): the runner
+  reconstructed the zip from tag `v0.4.0` (`core.autocrlf=false` + explicit
+  UTC+2 entry times, mode 0664, create_system 3) and the rebuilt SHA-256
+  `dbde1f2ac448…` matched the published asset exactly on both OS legs.
+  (Direct asset download is impossible from the runner: this is a private repo
+  and the workflow token is rejected by api.github.com — HTTP 401 — and by all
+  web download routes — `releases/download` 404 even for the owner, codeload
+  and `archive` routes 404 for the token; git is the only working channel. The
+  pin value was verified against the actual `.sha256` asset bytes before pinning
+  in ci.yml; bump `WPD11_PIN_TAG`/`WPD11_PIN_SHA256` per release.)
+- **Extraction — PASS.** 20/20 entries extracted (Explorer-equivalent shell
+  CopyHere); `START-HERE.bat`, `Run-Diagnostics.bat`, `README-FIRST.txt`,
+  `src\Invoke-WindowsPerformanceDiagnostics.ps1` all present; per-file SHA-256
+  hashes match the tag source.
+- **Launcher end-to-end — PASS with a documented defect.** `Run-Diagnostics.bat`
+  from the extracted folder collected for 30 s and wrote
+  `C:\Temp\WPD-Case\diagnostic-manifest.json` (mode `Collect`,
+  `toolVersion` `0.4.0`; `performance-samples.csv` + `system-events-last-24-hours.json`
+  present and hashed in the manifest).
+  **Defect found in v0.4.0:** the `process-snapshot` stage aborts on Windows
+  Server VMs (`Exception getting "CPU": The property 'TotalSeconds' cannot be
+  found on this object`) so `top-processes.json` is not written. This was latent
+  in every earlier runner collection (WPD-09/WPD-10 manifests show the same
+  error; no gate asserted the file). **Fixed on main** (c1758f8: per-process
+  CPU read guard + null filter before sorting) — ships with the next release;
+  the gate records the defect instead of failing CI, and will fail if a future
+  release misses the artifact without the recorded error.
+- **MOTW download / Unblock / Defender Protection-history legs — N/A on CI
+  runners (owner manual leg required).** The MOTW scenario needs an
+  internet-downloaded zip, which the workflow token cannot obtain for this
+  private repo (see above), and the runner's Defender has
+  `RealTimeProtectionEnabled=False` with `C:\` + `D:\` excluded, so a
+  quarantine/Protection-history restore cannot occur there. Owner: on a real
+  Windows 10/11 client with Defender real-time protection on, download the zip
+  from the release page (browser session; note the raw `releases/download` URL
+  404s for this repo — the web UI download works), extract WITHOUT unblocking
+  first, and confirm the README-FIRST.txt recovery path (Unblock →
+  re-extract → Protection history → Restore) if Defender removes the `.ps1`.
 
 ---
 

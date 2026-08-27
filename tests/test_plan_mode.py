@@ -266,6 +266,14 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     assert b"\r\n" in bat  # CRLF line endings required for .bat files
     assert b'\\"' not in bat, "backslash-immediately-before-quote hazard in START-HERE.bat"
     assert all(b < 128 for b in bat), "START-HERE.bat must be pure ASCII"
+    # cmd parser regression: parenthesized if/for blocks with parens in the
+    # body kill the bat ('. was unexpected at this time.'); goto-style only
+    import re as re_module
+
+    for line in bat.decode("ascii").splitlines():
+        assert not re_module.match(r"\s*(if|for)\b.*\(\s*$", line), (
+            f"parenthesized block in START-HERE.bat: {line!r}"
+        )
 
     text = bat.decode("ascii")
     # UAC self-elevation: net session probe + re-launch with RunAs

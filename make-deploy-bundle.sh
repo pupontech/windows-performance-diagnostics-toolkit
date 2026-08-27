@@ -41,7 +41,7 @@ if not stage or not zip_path:
     sys.exit(1)
 
 stage = stage.rstrip("/") + "/"
-parent = os.path.dirname(stage) + "/"
+parent = os.path.dirname(stage.rstrip("/")) + "/"
 entries = []
 for root, dirs, files in os.walk(stage):
     dirs.sort()

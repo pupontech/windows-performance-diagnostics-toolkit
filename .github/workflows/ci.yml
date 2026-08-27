@@ -297,6 +297,7 @@ jobs:
           exit 0
 
       - name: WPD-09 - WPR on standard (non-admin) console is skipped, no elevation
+        if: always()
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'

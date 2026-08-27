@@ -11,12 +11,19 @@ param(
 
     [string]$OutputDirectory = (Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics'),
 
-    [switch]$ConfirmLocalCollection
+    [switch]$ConfirmLocalCollection,
+
+    [switch]$CaptureWpr,
+
+    [switch]$ConfirmWprCapture,
+
+    [ValidateSet('General')]
+    [string]$WprProfile = 'General'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.1.0'
+$ScriptVersion = '0.2.0'
 
 function Write-JsonFile {
     param(
@@ -77,6 +84,14 @@ $planManifest = [ordered]@{
     )
 }
 
+if ($CaptureWpr) {
+    $planManifest.plannedActions += 'capture-wpr-etl-after-explicit-consent'
+    $planManifest.wpr = [ordered]@{
+        profile = $WprProfile
+        durationSeconds = $DurationSeconds
+    }
+}
+
 if ($Mode -eq 'Plan') {
     $planPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-plan.json'
     Write-JsonFile -InputObject $planManifest -Path $planPath
@@ -86,6 +101,10 @@ if ($Mode -eq 'Plan') {
 
 if (-not $ConfirmLocalCollection) {
     throw 'Collect mode requires -ConfirmLocalCollection. No diagnostic data was collected.'
+}
+
+if (-not $ConfirmWprCapture -and $CaptureWpr) {
+    throw 'WPR capture requires -ConfirmWprCapture. No diagnostic data was collected.'
 }
 
 if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
@@ -174,6 +193,73 @@ catch {
     Add-CollectionError -Stage 'system-event-summary' -ErrorRecord $_
 }
 
+$wprStatus = $null
+$wprStartedAtUtc = $null
+$wprCompletedAtUtc = $null
+$wprEtlFilePath = $null
+$wprStartExitCode = $null
+$wprStopExitCode = $null
+
+if ($CaptureWpr) {
+    $wprStatus = 'skipped-wpr-not-found'
+    try {
+        $wprExe = Join-Path $env:SystemRoot 'System32\wpr.exe'
+        if (-not (Test-Path -LiteralPath $wprExe)) {
+            Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new('wpr.exe not found; WPR capture skipped'),
+                'WprNotFound',
+                [System.Management.Automation.ErrorCategory]::ObjectNotFound,
+                $null
+            ))
+        }
+        else {
+            $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $isElevated) {
+                Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                    [System.Exception]::new('requires an elevated (Administrator) console; WPR capture skipped'),
+                    'WprElevationRequired',
+                    [System.Management.Automation.ErrorCategory]::PermissionDenied,
+                    $null
+                ))
+                $wprStatus = 'skipped-elevation-required'
+            }
+            else {
+                $wprStartedAtUtc = Get-UtcTimestamp
+                $wprEtlPath = Join-Path $resolvedOutputDirectory 'wpr-trace.etl'
+                try {
+                    & $wprExe -start $WprProfile -filemode
+                    $wprStartExitCode = $LASTEXITCODE
+                }
+                catch {
+                    $wprStartExitCode = $LASTEXITCODE
+                    Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
+                    $wprStatus = 'failed'
+                }
+
+                if ($wprStatus -ne 'failed') {
+                    Start-Sleep -Seconds $DurationSeconds
+                    try {
+                        & $wprExe -stop $wprEtlPath
+                        $wprStopExitCode = $LASTEXITCODE
+                        $wprEtlFilePath = $wprEtlPath
+                        $wprStatus = 'completed'
+                    }
+                    catch {
+                        $wprStopExitCode = $LASTEXITCODE
+                        Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
+                        $wprStatus = 'failed'
+                    }
+                    $wprCompletedAtUtc = Get-UtcTimestamp
+                }
+            }
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
+        $wprStatus = 'failed'
+    }
+}
+
 $completedAtUtc = Get-UtcTimestamp
 $collectionManifest = [ordered]@{
     schemaVersion = '1.0'
@@ -192,6 +278,19 @@ $collectionManifest = [ordered]@{
     system = $systemSummary
     collectionErrors = $collectionErrors
     artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory
+}
+
+if ($CaptureWpr) {
+    $collectionManifest.wpr = [ordered]@{
+        profile = $WprProfile
+        durationSeconds = $DurationSeconds
+        etlFilePath = $wprEtlFilePath
+        startedAtUtc = $wprStartedAtUtc
+        completedAtUtc = $wprCompletedAtUtc
+        startExitCode = $wprStartExitCode
+        stopExitCode = $wprStopExitCode
+        status = $wprStatus
+    }
 }
 
 $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'

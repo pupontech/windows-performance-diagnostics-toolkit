@@ -2,9 +2,9 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.1.0
+**Version:** 0.2.0
 
-**Status:** Read-only collection MVP. It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
+**Status:** Read-only collection MVP plus consent-gated WPR capture. It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
 
 ## Purpose
 
@@ -50,7 +50,7 @@ See [SECURITY.md](SECURITY.md) for data-handling and approval boundaries.
 
 ## MVP usage
 
-Create a **non-collecting safety plan** (works on the Linux verification host too):
+Start with a **non-collecting safety plan** (works on the Linux verification host too):
 
 ```powershell
 powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
@@ -69,23 +69,53 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
 
-The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, and a manifest with SHA-256 hashes. It does **not** start WPR/Procmon/Defender recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything.
+Capture a **bounded WPR trace** (requires an elevated console, its own consent gate):
+
+```powershell
+powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Collect `
+  -ConfirmLocalCollection `
+  -CaptureWpr `
+  -ConfirmWprCapture `
+  -DurationSeconds 30 `
+  -OutputDirectory C:\Temp\WPD-Case-001
+```
+
+The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, an optional `wpr-trace.etl`, and a manifest with SHA-256 hashes. It does **not** start Procmon/Defender recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything. On a non-elevated console, WPR capture is skipped and recorded in the manifest rather than auto-elevating.
+
+## Deployment bundle
+
+`make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from a verified clean git tree. The bundle ships:
+
+- `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
+- `Run-Diagnostics.bat` — double-click launcher (survives Defender's Mark-of-the-Web stripping far better than a bare `.ps1`)
+- `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)
+- `schema\`, `docs\`, `tests\` — report contract, source map, live test matrix
 
 ## Planned deliverables
 
-- A schema for a consented, machine-readable diagnostic report
-- WPR/WPA and Defender performance captures behind separate, time-bounded consent gates
-- Reproducible packaging and artifact verification
-- Windows lab test matrix before any live remediation capability
+- ✅ Machine-readable report schema (`schema/diagnostic-report.schema.json`, `docs/report-schema.md`)
+- ✅ Consent-gated, time-bounded WPR capture (`-CaptureWpr` + `-ConfirmWprCapture`, General profile)
+- ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)
+- 🔜 Defender performance captures behind their own consent gate
+- 🔜 WPA-oriented analysis guidance for the captured ETL
+- 🔜 Windows lab test matrix execution before any live remediation capability
 
 ## Repository layout
 
 ```text
 README.md                         project overview and safety contract
 SECURITY.md                       consent, privacy, retention, approval model
+src/Invoke-WindowsPerformanceDiagnostics.ps1   the collector
+schema/diagnostic-report.schema.json          machine-readable report contract
 docs/official-microsoft-source-map.md  official Microsoft capability map
+docs/report-schema.md             report schema documentation
+docs/windows-live-test-matrix.md  Windows lab test matrix
 CHANGELOG.md                      release notes
 VERSION                           semantic project version
+Run-Diagnostics.bat               Defender-safe double-click launcher
+README-FIRST.txt                  quick start + Mark-of-the-Web recovery
+make-deploy-bundle.sh             reproducible release zip builder
 ```
 
 ## License

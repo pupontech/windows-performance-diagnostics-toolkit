@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pytest
+        run: python3 -m pip install pytest
+
+      - name: Run pytest
+        run: |
+          if [ -d .venv ]; then
+            .venv/bin/python -m pytest tests/ -q
+          else
+            python3 -m pytest tests/ -q
+          fi
+
+      - name: PowerShell parse gate
+        run: |
+          pwsh -NoProfile -Command '
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              "src/Invoke-WindowsPerformanceDiagnostics.ps1",
+              [ref]$null,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              Write-Error "Parse errors found: $($errors.Count)"
+              $errors | ForEach-Object { Write-Error $_.ToString() }
+              exit 1
+            }
+          '
+
+  windows-verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse gate (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "src\Invoke-WindowsPerformanceDiagnostics.ps1",
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            Write-Error "Parse errors found: $($errors.Count)"
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+
+      - name: Parse gate (pwsh)
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "src/Invoke-WindowsPerformanceDiagnostics.ps1",
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            Write-Error "Parse errors found: $($errors.Count)"
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+
+      - name: Run Plan mode
+        shell: pwsh
+        run: |
+          $planDir = Join-Path $env:TEMP "wpd-plan"
+          & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Plan -OutputDirectory $planDir
+          $planFile = Join-Path $planDir "diagnostic-plan.json"
+          if (-not (Test-Path $planFile)) {
+            Write-Error "diagnostic-plan.json not found at $planFile"
+            exit 1
+          }
+
+      - name: Collect without consent must fail
+        shell: pwsh
+        run: |
+          try {
+            & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -OutputDirectory (Join-Path $env:TEMP "wpd-no-consent")
+            Write-Error "Expected Collect without -ConfirmLocalCollection to fail"
+            exit 1
+          } catch {
+            if ($_.Exception.Message -notmatch "requires -ConfirmLocalCollection") {
+              Write-Error "Unexpected error: $($_.Exception.Message)"
+              exit 1
+            }
+          }
+
+      - name: Collect with consent but no WPR consent must fail
+        shell: pwsh
+        run: |
+          try {
+            & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+              -Mode Collect `
+              -ConfirmLocalCollection `
+              -CaptureWpr `
+              -OutputDirectory (Join-Path $env:TEMP "wpd-no-wpr")
+            Write-Error "Expected Collect without -ConfirmWprCapture to fail"
+            exit 1
+          } catch {
+            if ($_.Exception.Message -notmatch "requires -ConfirmWprCapture") {
+              Write-Error "Unexpected error: $($_.Exception.Message)"
+              exit 1
+            }
+          }

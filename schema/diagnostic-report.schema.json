@@ -1,0 +1,170 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Windows Performance Diagnostics Toolkit Report",
+  "description": "Schema for diagnostic-plan.json (Plan mode) and diagnostic-manifest.json (Collect mode) emitted by the Windows Performance Diagnostics Toolkit.",
+  "type": "object",
+  "required": ["schemaVersion", "toolName", "toolVersion", "mode", "safety"],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["1.0", "1.1"]
+    },
+    "toolName": {
+      "type": "string",
+      "enum": ["Windows Performance Diagnostics Toolkit"]
+    },
+    "toolVersion": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["Plan", "Collect"]
+    },
+    "generatedAtUtc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "outputDirectory": {
+      "type": "string"
+    },
+    "safety": {
+      "type": "object",
+      "required": [
+        "localOnly",
+        "readOnly",
+        "requiresExplicitCollectionConsent",
+        "automaticUpload",
+        "automaticRemediation",
+        "automaticLogClearing"
+      ],
+      "properties": {
+        "localOnly": {
+          "type": "boolean"
+        },
+        "readOnly": {
+          "type": "boolean"
+        },
+        "requiresExplicitCollectionConsent": {
+          "type": "boolean"
+        },
+        "automaticUpload": {
+          "type": "boolean"
+        },
+        "automaticRemediation": {
+          "type": "boolean"
+        },
+        "automaticLogClearing": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "plannedActions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "wpr": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["General"]
+        },
+        "durationSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 300
+        },
+        "etlFilePath": {
+          "type": ["string", "null"]
+        },
+        "startedAtUtc": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "completedAtUtc": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "startExitCode": {
+          "type": ["integer", "null"]
+        },
+        "stopExitCode": {
+          "type": ["integer", "null"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "skipped-wpr-not-found", "skipped-elevation-required", "failed"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "startedAtUtc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completedAtUtc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "durationSeconds": {
+          "type": "integer"
+        },
+        "maxSystemEvents": {
+          "type": "integer"
+        },
+        "systemEventLookbackHours": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
+    "system": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "collectionErrors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["Stage", "Message"],
+        "properties": {
+          "Stage": {
+            "type": "string"
+          },
+          "Message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["Name", "SizeBytes", "Sha256"],
+        "properties": {
+          "Name": {
+            "type": "string"
+          },
+          "SizeBytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "Sha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": true
+}

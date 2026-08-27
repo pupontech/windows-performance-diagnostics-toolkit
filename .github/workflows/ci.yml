@@ -413,14 +413,16 @@ jobs:
     env:
       WPD11_WORK: C:\WPD11
     steps:
+      - uses: actions/checkout@v4
+
       - name: WPD-11 - resolve latest release (tag + assets)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           # Resolve the latest semver tag without the API (auth-free): asset URLs are
           # deterministic (https://github.com/<owner>/<repo>/releases/download/<tag>/...).
-          $repo = 'https://github.com/pupontech/windows-performance-diagnostics-toolkit.git'
-          $lines = @(git ls-remote --tags --refs $repo)
+          # `origin` is wired to GitHub credentials by actions/checkout.
+          $lines = @(git ls-remote --tags --refs origin)
           if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0) { throw 'WPD-11 FAIL: git ls-remote failed to enumerate release tags' }
           $versions = foreach ($l in $lines) {
             $t = ($l -split 'refs/tags/')[-1].Trim()

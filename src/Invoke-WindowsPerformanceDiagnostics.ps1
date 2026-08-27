@@ -23,7 +23,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.2.0'
+$ScriptVersion = '0.2.1'
 
 function Write-JsonFile {
     param(
@@ -58,7 +58,12 @@ function Get-ArtifactMetadata {
     return $artifacts
 }
 
-$resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+try {
+    $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+}
+catch {
+    throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
+}
 New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
 
 $planManifest = [ordered]@{

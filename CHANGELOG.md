@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-08-27
+
+Bug fix release: `Run-Diagnostics.bat` failed on real Windows with `Exception calling "GetFullPath" ... "Illegal characters in path."`
+
+- **Root cause:** the launcher passed `-OutputDirectory "C:\Temp\WPD-Case\"` — a trailing backslash immediately before the closing quote of a `powershell.exe -File` argument is parsed as an escaped quote, so the script received a path ending in a literal `"`, which is illegal in Windows paths.
+- Fixed the launcher argument (no trailing backslash) and added a CI-safe `if not "%CI%"=="true" pause` guard so GitHub runners do not hang on the interactive pause.
+- Hardened the collector: an invalid `-OutputDirectory` now fails with a clear message (`OutputDirectory '<path>' is not a valid local path: ...`) instead of a cryptic `MethodInvocationException`.
+- **GitHub VM testing:** `windows-verify` now executes the real `Run-Diagnostics.bat` via `cmd` on windows-2022/2025 and asserts `C:\Temp\WPD-Case\diagnostic-manifest.json` is produced, plus a clear-error check for invalid paths. Regression test locks the bat to quote-safe/CI-safe form.
+- Safety contract unchanged.
+
 ## 0.2.0 — 2026-08-27
 
 Consent-gated WPR capture, machine-readable report schema, and hardened packaging.

@@ -119,3 +119,38 @@ jobs:
               exit 1
             }
           }
+
+      - name: Invalid OutputDirectory yields a clear error
+        shell: pwsh
+        run: |
+          try {
+            & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+              -Mode Plan `
+              -OutputDirectory "C:\Temp\wpd-bad|path"
+            Write-Error "Expected an invalid path to fail"
+            exit 1
+          } catch {
+            if ($_.Exception.Message -notmatch "is not a valid local path") {
+              Write-Error "Unexpected error: $($_.Exception.Message)"
+              exit 1
+            }
+          }
+
+      - name: Run the real launcher (Run-Diagnostics.bat)
+        shell: cmd
+        run: call Run-Diagnostics.bat
+
+      - name: Assert launcher produced the diagnostic manifest
+        shell: pwsh
+        run: |
+          $manifest = "C:\Temp\WPD-Case\diagnostic-manifest.json"
+          if (-not (Test-Path -LiteralPath $manifest)) {
+            Write-Error "Run-Diagnostics.bat did not produce $manifest"
+            exit 1
+          }
+          $plan = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          if ($plan.mode -ne "Collect") {
+            Write-Error "Unexpected manifest mode: $($plan.mode)"
+            exit 1
+          }
+          Write-Output "Launcher OK: $manifest (mode $($plan.mode), toolVersion $($plan.toolVersion))"

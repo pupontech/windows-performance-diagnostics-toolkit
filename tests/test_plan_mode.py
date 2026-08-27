@@ -147,3 +147,19 @@ def test_report_schema_is_valid_json():
     schema = json_module.loads(schema_path.read_text(encoding="utf-8"))
     assert schema["$schema"] == "http://json-schema.org/draft-07/schema#"
     assert schema["properties"]["mode"]["enum"] == ["Plan", "Collect"]
+
+
+def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
+    """Regression for v0.2.1: a trailing backslash before a closing quote in a
+    powershell.exe -File argument becomes a literal quote character, which made
+    GetFullPath throw 'Illegal characters in path.' on Windows. The bat must
+    also skip the interactive pause under CI so GitHub runners do not hang."""
+    bat = (REPO_ROOT / "Run-Diagnostics.bat").read_bytes()
+
+    assert b"\r\n" in bat  # CRLF line endings required for .bat files
+    assert b'\\"' not in bat, "backslash-immediately-before-quote hazard in Run-Diagnostics.bat"
+
+    text = bat.decode("ascii")
+    assert "-Mode Collect" in text
+    assert "-ConfirmLocalCollection" in text  # consent flag must be passed explicitly
+    assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard

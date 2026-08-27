@@ -77,7 +77,7 @@ SAFETY SUMMARY
 - WPR TRACE: Only collected when you pass -CaptureWpr AND confirm with
   -ConfirmWprCapture from an already-elevated PowerShell console.
 - OUTPUT: All results are written to the directory you specify via
-  -OutputDirectory (default: C:\Temp\WPD-Case\).
+  -OutputDirectory (default when using Run-Diagnostics.bat: C:\Temp\WPD-Case).
 
 FILE LAYOUT
 -----------

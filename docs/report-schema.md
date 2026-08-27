@@ -42,7 +42,7 @@ be used during collection.
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `profile` | string enum | Only `"General"` is currently supported. |
+| `profile` | string enum | `GeneralProfile` (default) or a built-in WPR profile (`CPU`, `DiskIO`, `FileIO`, `Network`, `Power`, `GPU`, `Registry`). |
 | `durationSeconds` | integer | Range 5–300. Default is 30. |
 | `etlFilePath` | string | Populated after collection completes. |
 | `startedAtUtc` | string (date-time) | ISO 8601 timestamp of trace start. |

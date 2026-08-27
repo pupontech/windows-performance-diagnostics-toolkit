@@ -70,7 +70,7 @@
       "properties": {
         "profile": {
           "type": "string",
-          "enum": ["General"]
+          "enum": ["GeneralProfile", "CPU", "DiskIO", "FileIO", "Network", "Power", "GPU", "Registry"]
         },
         "durationSeconds": {
           "type": "integer",

@@ -110,7 +110,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 ## Planned deliverables
 
 - ✅ Machine-readable report schema (`schema/diagnostic-report.schema.json`, `docs/report-schema.md`)
-- ✅ Consent-gated, time-bounded WPR capture (`-CaptureWpr` + `-ConfirmWprCapture`, General profile)
+- ✅ Consent-gated, time-bounded WPR capture (`-CaptureWpr` + `-ConfirmWprCapture`, `GeneralProfile` or `CPU`/`DiskIO`/`FileIO`/`Network`/`Power`/`GPU`/`Registry`)
 - ✅ Consent-gated, time-bounded Defender performance capture (`-CaptureDefender` + `-ConfirmDefenderCapture`, official `New-MpPerformanceRecording`)
 - ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)
 - ✅ WPA-oriented analysis guidance (`docs/wpa-analysis-guide.md`)

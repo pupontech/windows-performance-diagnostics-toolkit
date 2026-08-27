@@ -17,8 +17,8 @@ param(
 
     [switch]$ConfirmWprCapture,
 
-    [ValidateSet('General')]
-    [string]$WprProfile = 'General',
+    [ValidateSet('GeneralProfile', 'CPU', 'DiskIO', 'FileIO', 'Network', 'Power', 'GPU', 'Registry')]
+    [string]$WprProfile = 'GeneralProfile',
 
     [switch]$CaptureDefender,
 
@@ -378,30 +378,54 @@ if ($CaptureWpr) {
             else {
                 $wprStartedAtUtc = Get-UtcTimestamp
                 $wprEtlPath = Join-Path $resolvedOutputDirectory 'wpr-trace.etl'
+                $wprStartFailed = $false
                 try {
                     & $wprExe -start $WprProfile -filemode
                     $wprStartExitCode = $LASTEXITCODE
+                    if ($wprStartExitCode -ne 0) {
+                        $wprStartFailed = $true
+                    }
                 }
                 catch {
                     $wprStartExitCode = $LASTEXITCODE
                     Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
-                    $wprStatus = 'failed'
+                    $wprStartFailed = $true
                 }
 
-                if ($wprStatus -ne 'failed') {
+                if ($wprStartFailed) {
+                    $wprStatus = 'failed'
+                    Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                        [System.Exception]::new("wpr.exe -start $WprProfile failed with exit code $wprStartExitCode; WPR capture skipped (an already-running trace is left untouched)"),
+                        'WprStartFailed',
+                        [System.Management.Automation.ErrorCategory]::InvalidOperation,
+                        $null
+                    ))
+                }
+                else {
                     Start-Sleep -Seconds $DurationSeconds
                     try {
                         & $wprExe -stop $wprEtlPath
                         $wprStopExitCode = $LASTEXITCODE
-                        $wprEtlFilePath = $wprEtlPath
-                        $wprStatus = 'completed'
+                        $wprCompletedAtUtc = Get-UtcTimestamp
+                        if ((Test-Path -LiteralPath $wprEtlPath) -and (Get-Item -LiteralPath $wprEtlPath).Length -gt 0) {
+                            $wprEtlFilePath = $wprEtlPath
+                            $wprStatus = 'completed'
+                        }
+                        else {
+                            Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                                [System.Exception]::new("wpr.exe -stop reported exit code $wprStopExitCode but no wpr-trace.etl was produced"),
+                                'WprEtlMissing',
+                                [System.Management.Automation.ErrorCategory]::InvalidData,
+                                $null
+                            ))
+                            $wprStatus = 'failed'
+                        }
                     }
                     catch {
                         $wprStopExitCode = $LASTEXITCODE
                         Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
                         $wprStatus = 'failed'
                     }
-                    $wprCompletedAtUtc = Get-UtcTimestamp
                 }
             }
         }

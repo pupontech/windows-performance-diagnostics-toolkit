@@ -80,7 +80,7 @@ def test_plan_mode_with_wpr_lists_capture_action_and_scope(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
 
     assert "capture-wpr-etl-after-explicit-consent" in manifest["plannedActions"]
-    assert manifest["wpr"]["profile"] == "General"
+    assert manifest["wpr"]["profile"] == "GeneralProfile"
     assert manifest["wpr"]["durationSeconds"] == 30
 
 

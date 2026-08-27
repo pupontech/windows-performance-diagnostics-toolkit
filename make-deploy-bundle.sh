@@ -70,6 +70,8 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         info = zipfile.ZipInfo(arcname, date_time=entry_dt)
         info.compress_type = zipfile.ZIP_DEFLATED
         info.external_attr = FILE_ATTR
+        info.create_system = 3
+        info.create_version = 20
         with open(full, "rb") as fh:
             zf.writestr(info, fh.read())
 

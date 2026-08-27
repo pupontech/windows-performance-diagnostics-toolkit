@@ -567,7 +567,10 @@ jobs:
           $stage = Join-Path $env:WPD11_WORK "stage\$($state.base)"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           $tarFile = Join-Path $env:WPD11_WORK 'tree.tar'
-          git archive --format=tar HEAD -o $tarFile
+          # core.autocrlf=false is required: Git-for-Windows defaults to autocrlf=true,
+          # which makes `git archive` emit CRLF and changes the zip bytes vs the
+          # release build (LF).
+          git -c core.autocrlf=false archive --format=tar HEAD -o $tarFile
           if ($LASTEXITCODE -ne 0) { throw 'WPD-11 FAIL: git archive failed' }
           tar -xf $tarFile -C $stage
           if ($LASTEXITCODE -ne 0) { throw 'WPD-11 FAIL: tar extraction failed' }
@@ -597,6 +600,8 @@ jobs:
                   info = zipfile.ZipInfo(arcname, date_time=entry_dt)
                   info.compress_type = zipfile.ZIP_DEFLATED
                   info.external_attr = FILE_ATTR
+                  info.create_system = 3
+                  info.create_version = 20
                   with open(full, "rb") as fh:
                       zf.writestr(info, fh.read())
           print("bundler: %d entries, timestamp %s" % (len(entries), entry_dt))

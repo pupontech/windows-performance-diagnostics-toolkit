@@ -60,11 +60,11 @@ function Get-ArtifactMetadata {
 
 try {
     $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
 }
 catch {
     throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
 }
-New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
 
 $planManifest = [ordered]@{
     schemaVersion = '1.0'

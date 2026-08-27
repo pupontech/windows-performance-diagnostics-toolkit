@@ -639,7 +639,22 @@ catch {
 }
 
 try {
-    $processes = Get-Process | Sort-Object -Property CPU -Descending | Select-Object -First 20 -Property ProcessName, Id, CPU, WorkingSet64, Handles, Path
+    # CPU access can throw for individual processes (observed on Windows Server
+    # VMs: 'Exception getting "CPU": The property TotalSeconds cannot be found'),
+    # which previously aborted the whole snapshot. Guard per process and drop
+    # processes without a comparable CPU value before sorting.
+    $processes = @(Get-Process -ErrorAction SilentlyContinue) | ForEach-Object {
+        $cpu = $null
+        try { $cpu = $_.CPU } catch { }
+        [pscustomobject]@{
+            ProcessName = $_.ProcessName
+            Id = $_.Id
+            CPU = $cpu
+            WorkingSet64 = $_.WorkingSet64
+            Handles = $_.Handles
+            Path = $_.Path
+        }
+    } | Where-Object { $null -ne $_.CPU } | Sort-Object -Property CPU -Descending | Select-Object -First 20
     Write-JsonFile -InputObject $processes -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'top-processes.json')
 }
 catch {

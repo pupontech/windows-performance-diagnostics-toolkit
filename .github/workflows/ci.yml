@@ -470,9 +470,11 @@ jobs:
           # PRIVATE repo: direct release-asset fetch is blocked from the runner
           # (api.github.com 401/404 for the workflow token; web releases/download
           # route 404 even for the owner - recorded below). The tag zip is fetched
-          # from codeload (git-archive of the same tag; file contents byte-identical
-          # to the release zip, verified). MOTW is stamped by Windows PowerShell
-          # 5.1 Invoke-WebRequest (pwsh 7 does not stamp).
+          # from codeload / the github.com archive route (git-archive of the same
+          # tag; file contents byte-identical to the release zip, verified).
+          # The workflow token is known to work over git with Basic x-access-token
+          # auth, so both Basic and Bearer are tried. MOTW is stamped by Windows
+          # PowerShell 5.1 Invoke-WebRequest (pwsh 7 does not stamp).
           "--- direct asset fetch diagnostics ---" | Out-File -FilePath $evidence -Append -Encoding utf8
           $apiUrl = "https://api.github.com/repos/pupontech/windows-performance-diagnostics-toolkit/releases/tags/$($state.tag)"
           $webUrl = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/download/$($state.tag)/$($state.base).zip"
@@ -480,20 +482,37 @@ jobs:
           $webCode = (& curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: Bearer $env:GITHUB_TOKEN" $webUrl)
           "api.github.com releases/tags/$($state.tag) with workflow token: HTTP $apiCode" | Out-File -FilePath $evidence -Append -Encoding utf8
           "github.com releases/download with workflow token: HTTP $webCode" | Out-File -FilePath $evidence -Append -Encoding utf8
+          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$env:GITHUB_TOKEN"))
+          $candidates = @(
+            @{ name = 'codeload+basic';  url = "https://codeload.github.com/pupontech/windows-performance-diagnostics-toolkit/zip/refs/tags/$($state.tag)"; hdr = "Basic $basic" },
+            @{ name = 'archive+basic';   url = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/archive/refs/tags/$($state.tag).zip"; hdr = "Basic $basic" },
+            @{ name = 'codeload+bearer'; url = "https://codeload.github.com/pupontech/windows-performance-diagnostics-toolkit/zip/refs/tags/$($state.tag)"; hdr = "Bearer $env:GITHUB_TOKEN" },
+            @{ name = 'archive+bearer';  url = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/archive/refs/tags/$($state.tag).zip"; hdr = "Bearer $env:GITHUB_TOKEN" }
+          )
           $method = $null
-          $codeloadUrl = "https://codeload.github.com/pupontech/windows-performance-diagnostics-toolkit/zip/refs/tags/$($state.tag)"
-          try {
-            Invoke-WebRequest -Uri $codeloadUrl -OutFile $state.zipPath -UseBasicParsing -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
-            if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'iwr-5.1-codeload' }
-          } catch { "IWR codeload download failed: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+          foreach ($c in $candidates) {
+            if ($method) { break }
+            $code = (& curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: $($c.hdr)" $c.url)
+            "probe $($c.name): HTTP $code" | Out-File -FilePath $evidence -Append -Encoding utf8
+            if ($code -eq '200') {
+              try {
+                Invoke-WebRequest -Uri $c.url -OutFile $state.zipPath -UseBasicParsing -Headers @{ Authorization = $c.hdr }
+                $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
+                if ($zi) { $method = $c.name }
+                else { "download OK via $($c.name) but NO Zone.Identifier stamp" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+              } catch { "IWR $($c.name) failed: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+            }
+          }
           if (-not $method) {
-            "IWR did not stamp Zone.Identifier; trying curl.exe" | Out-File -FilePath $evidence -Append -Encoding utf8
-            if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
-            & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: Bearer $env:GITHUB_TOKEN" $codeloadUrl
-            if ($LASTEXITCODE -eq 0) {
-              if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'curl-codeload' }
-              else { "curl.exe downloaded zip but NO Zone.Identifier stamp" | Out-File -FilePath $evidence -Append -Encoding utf8 }
-            } else { "curl.exe codeload download failed (exit $LASTEXITCODE)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+            "No MOTW-stamped IWR download; trying curl.exe over all candidates" | Out-File -FilePath $evidence -Append -Encoding utf8
+            foreach ($c in $candidates) {
+              if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
+              & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: $($c.hdr)" $c.url
+              if ($LASTEXITCODE -eq 0) {
+                if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = "curl-$($c.name)"; break }
+                else { "curl $($c.name) downloaded zip but NO Zone.Identifier stamp" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+              } else { "curl $($c.name) failed (exit $LASTEXITCODE)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+            }
           }
           if ($method) {
             $zoneId = ((Get-Content -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^ZoneId=' }) -join ';'
@@ -501,8 +520,10 @@ jobs:
           } else {
             "MOTW: zip download did not produce Zone.Identifier - scenario not reproducible on this runner" | Out-File -FilePath $evidence -Append -Encoding utf8
           }
-          $zip = Get-Item -LiteralPath $state.zipPath
-          "Zip size: $($zip.Length) bytes (codeload tag archive; file contents byte-identical to the release zip)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          if (Test-Path -LiteralPath $state.zipPath) {
+            $zip = Get-Item -LiteralPath $state.zipPath
+            "Zip size: $($zip.Length) bytes (tag archive; file contents byte-identical to the release zip)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          }
           "--- Defender status ---" | Out-File -FilePath $evidence -Append -Encoding utf8
           try {
             Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMProductVersion | Format-List | Out-String | Out-File -FilePath $evidence -Append -Encoding utf8
@@ -514,7 +535,8 @@ jobs:
             "DisableRealtimeMonitoring: $($pref.DisableRealtimeMonitoring)" | Out-File -FilePath $evidence -Append -Encoding utf8
           } catch { "Get-MpPreference unavailable: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
           Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11ENV: $_" }
-          if (-not $method) { throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner (iwr-5.1 + curl both unstamped)' }
+          if (-not (Test-Path -LiteralPath $state.zipPath)) { throw 'WPD-11 FAIL: tag zip could not be downloaded on this runner (all candidate URLs/auth failed; see wpd-11-evidence.log)' }
+          if (-not $method) { throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner (all download methods unstamped)' }
 
       - name: WPD-11 - reconstruct release zip from tag; hash must match the published .sha256 value
         shell: pwsh

@@ -139,7 +139,15 @@ Expected: FAILS before any collection with
 `WPR capture requires -ConfirmWprCapture. No diagnostic data was collected.`
 No trace started, no `wpr-trace.etl`.
 
-Result: PASS / FAIL / N/A — Evidence (console output):
+Result: **PASS** — executed 2026-08-27 on GitHub-hosted Windows runners
+(windows-2022 + windows-2025, elevated, Windows PowerShell 5.1) via the
+`wpd-live-gates` CI job (commit d92a5e3+). Script refused with the exact
+consent message, exit code 1, and the output folder contained zero artifacts
+(no csv/json/manifest/etl). Evidence: CI job logs
+(https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/runs/33108588131),
+`C:\WPD\WPD-08` empty in uploaded artifact `wpd-gates-windows-2022/2025`.
+Note: this is the parameter-consent gate (identical on any SKU); no lab
+interaction required.
 
 ---
 
@@ -153,7 +161,20 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Invoke-WindowsPerf
 Expected: collection completes; manifest `wpr.status` is
 `skipped-elevation-required`; NO UAC prompt appears; no auto-elevation.
 
-Result: PASS / FAIL / N/A — Evidence (manifest `wpr` block + console output):
+Result: **PASS** — executed 2026-08-27 on the same runners by creating a
+local **standard** account (`wpdstd`) and starting the collector under that
+identity via `ProcessStartInfo` + `PSCredential` (no admin token; no UAC can
+appear because the script never calls `Start-Process -Verb RunAs` and the
+runner console itself is elevated). On both OS legs: collection completed
+(exit 0), manifest `wpr.status` = `skipped-elevation-required`, a
+`wpr-capture` collectionErrors entry
+(`requires an elevated (Administrator) console; WPR capture skipped`) was
+recorded, and no `wpr-trace.etl` was produced — i.e. the gate skipped cleanly
+without attempting elevation. Evidence: CI job logs (run 33108588131),
+manifests in artifact `wpd-gates-windows-2022/2025` (`WPD-09\diagnostic-manifest.json`).
+Owner may still spot-check the visual "no UAC prompt" on a physical standard
+login; the automation verifies the token is non-elevated and no elevation is
+attempted.
 
 ---
 
@@ -164,7 +185,21 @@ with `-OutputDirectory C:\WPD\WPD-10`. Expected: `wpr-trace.etl` exists and is
 non-empty; manifest `wpr.status` is `completed`; the ETL is listed in the
 manifest hashes.
 
-Result: PASS / FAIL / N/A — Evidence (`wpr-trace.etl`, manifest):
+Result: **PASS** — executed 2026-08-27 on both runners (elevated console,
+real `wpr.exe`). `wpr-trace.etl` produced and non-empty
+(windows-2022: 49,283,072 B, sha256 CC3BE679…; windows-2025: 50,331,648 B,
+sha256 E56702C4…); manifest `wpr.status` = `completed`, `startExitCode` 0,
+`stopExitCode` 0; ETL listed in manifest `artifacts` with SHA-256 + size.
+Evidence: CI job logs (run 33108588131) + `WPD-10\diagnostic-manifest.json`
+and `wpr-trace.etl` in artifact `wpd-gates-windows-2022/2025`.
+
+> **Bug found and fixed during this test (v0.4.0, commit b62fb83):** the
+> collector's WPR profile default was `'General'`, but `wpr.exe -profiles`
+> exposes the built-in profile as **`GeneralProfile`** — so `-start General`
+> failed with 0x80070002 on every Windows SKU. The script now defaults to
+> `GeneralProfile` (real built-ins selectable via `-WprProfile`), checks the
+> start exit code, and verifies ETL existence/size before reporting
+> `completed`.
 
 ---
 

@@ -41,12 +41,13 @@ if not stage or not zip_path:
     sys.exit(1)
 
 stage = stage.rstrip("/") + "/"
+parent = os.path.dirname(stage) + "/"
 entries = []
 for root, dirs, files in os.walk(stage):
     dirs.sort()
     for f in files:
         full = os.path.join(root, f)
-        arcname = full[len(stage):]
+        arcname = full[len(parent):]
         entries.append((arcname, full))
 
 entries.sort(key=lambda e: e[0])

@@ -185,7 +185,7 @@ def test_plan_mode_with_wpr_and_defender_lists_both_capture_actions(tmp_path):
 
     assert "capture-wpr-etl-after-explicit-consent" in manifest["plannedActions"]
     assert "capture-defender-performance-etl-after-explicit-consent" in manifest["plannedActions"]
-    assert manifest["wpr"]["profile"] == "General"
+    assert manifest["wpr"]["profile"] == "GeneralProfile"
     assert manifest["defender"]["durationSeconds"] == 30
 
 

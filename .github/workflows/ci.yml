@@ -555,16 +555,61 @@ jobs:
           if ($state.tag -ne $env:WPD11_PIN_TAG) {
             throw "WPD-11 FAIL: latest release is $($state.tag) but WPD11_PIN_TAG=$env:WPD11_PIN_TAG. Bump WPD11_PIN_TAG + WPD11_PIN_SHA256 in ci.yml (verify the hash against the published .sha256 asset)."
           }
-          # The release zip is byte-deterministic: make-deploy-bundle.sh reproduces the
-          # exact release bytes from the tag (explicit entry timestamps/modes; verified
-          # rebuild == published asset). Check out the tag and rebuild it.
+          # The release zip is byte-deterministic: same entries (git archive of the
+          # tag), same explicit entry timestamps (commit time in the release build
+          # timezone UTC+2) and modes (0664) - see make-deploy-bundle.sh on main.
+          # The tag predates the deterministic bundler, so the bundler logic is
+          # embedded here; it must stay in sync with make-deploy-bundle.sh.
           git fetch --depth 1 origin "refs/tags/$($state.tag):refs/tags/$($state.tag)"
           if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: git fetch tag $($state.tag) failed" }
           git switch --detach $state.tag
           if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: git switch --detach $($state.tag) failed" }
-          bash ./make-deploy-bundle.sh
-          if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: make-deploy-bundle.sh (tag $($state.tag)) failed" }
-          $built = Join-Path $env:GITHUB_WORKSPACE ("dist\$($state.base).zip")
+          $stage = Join-Path $env:WPD11_WORK "stage\$($state.base)"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $tarFile = Join-Path $env:WPD11_WORK 'tree.tar'
+          git archive --format=tar HEAD -o $tarFile
+          if ($LASTEXITCODE -ne 0) { throw 'WPD-11 FAIL: git archive failed' }
+          tar -xf $tarFile -C $stage
+          if ($LASTEXITCODE -ne 0) { throw 'WPD-11 FAIL: tar extraction failed' }
+          $bundler = @'
+          import os, zipfile, sys, subprocess, datetime
+          stage = os.environ.get("STAGE_DIR", "")
+          zip_path = os.environ.get("ZIP_FILE", "")
+          if not stage or not zip_path:
+              print("ERROR: STAGE_DIR or ZIP_FILE not set", file=sys.stderr)
+              sys.exit(1)
+          commit_ts = int(subprocess.check_output(["git", "show", "-s", "--format=%ct", "HEAD"]).decode().strip())
+          base_dt = datetime.datetime.fromtimestamp(commit_ts, tz=datetime.timezone(datetime.timedelta(hours=2)))
+          entry_dt = (base_dt.year, base_dt.month, base_dt.day, base_dt.hour, base_dt.minute, base_dt.second)
+          FILE_ATTR = (0o100664 << 16)
+          stage = stage.rstrip("/") + "/"
+          parent = os.path.dirname(stage.rstrip("/")) + "/"
+          entries = []
+          for root, dirs, files in os.walk(stage):
+              dirs.sort()
+              for f in files:
+                  full = os.path.join(root, f)
+                  entries.append((full[len(parent):], full))
+          entries.sort(key=lambda e: e[0])
+          os.makedirs(os.path.dirname(zip_path) or ".", exist_ok=True)
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+              for arcname, full in entries:
+                  info = zipfile.ZipInfo(arcname, date_time=entry_dt)
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = FILE_ATTR
+                  with open(full, "rb") as fh:
+                      zf.writestr(info, fh.read())
+          print("bundler: %d entries, timestamp %s" % (len(entries), entry_dt))
+          '@
+          $bundlePy = Join-Path $env:WPD11_WORK 'bundle.py'
+          Set-Content -LiteralPath $bundlePy -Value $bundler -Encoding utf8
+          $py = (Get-Command python3 -ErrorAction SilentlyContinue) ?? (Get-Command python -ErrorAction SilentlyContinue)
+          if (-not $py) { throw 'WPD-11 FAIL: python not found on runner' }
+          $built = Join-Path $env:WPD11_WORK "$($state.base).zip"
+          $env:STAGE_DIR = $stage
+          $env:ZIP_FILE = $built
+          & $py.Source $bundlePy
+          if ($LASTEXITCODE -ne 0) { throw 'WPD-11 FAIL: deterministic bundler failed' }
           if (-not (Test-Path -LiteralPath $built)) { throw "WPD-11 FAIL: rebuilt zip not found at $built" }
           $builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash.ToLower()
           $expected = $env:WPD11_PIN_SHA256.ToLower()

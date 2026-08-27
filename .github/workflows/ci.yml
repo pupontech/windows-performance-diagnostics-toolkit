@@ -393,3 +393,264 @@ jobs:
             !C:\WPD\**\*.etl
             !C:\WPD\**\*.NGENPDB
           if-no-files-found: error
+
+  # WPD-11: release zip + Mark-of-the-Web (MOTW) + launcher end-to-end
+  # (windows-live-test-matrix.md WPD-11). Runs on the owner's GitHub-hosted
+  # Windows runners (real Windows VMs; Server SKUs - client-specific Defender
+  # real-time-protection quarantine behavior remains an owner spot-check on a
+  # Win10/11 client per the live-test runbook). Flow: download the release zip
+  # (MOTW stamped), verify hash vs the .sha256 asset, extract WITHOUT unblock
+  # and observe MOTW inheritance + Defender action, exercise the recovery leg
+  # (Protection-history restore equivalent) when Defender quarantines, then
+  # Unblock-File, re-extract clean, verify per-file hashes against the tag
+  # source, and confirm the launcher runs from the extracted folder.
+  wpd-release-flow:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-2022, windows-2025]
+    env:
+      WPD11_WORK: C:\WPD11
+    steps:
+      - name: WPD-11 - resolve latest release (tag + assets)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ 'User-Agent' = 'wpd-11-ci'; Authorization = "Bearer $env:GITHUB_TOKEN" }
+          $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/pupontech/windows-performance-diagnostics-toolkit/releases/latest' -Headers $headers
+          if (-not $rel.tag_name) { throw 'WPD-11 FAIL: could not resolve latest release' }
+          $tag = $rel.tag_name
+          $ver = $tag.TrimStart('v')
+          $base = "windows-performance-diagnostics-toolkit-$ver"
+          $zipUrl = ($rel.assets | Where-Object { $_.name -eq "$base.zip" } | Select-Object -First 1).browser_download_url
+          $shaUrl = ($rel.assets | Where-Object { $_.name -eq "$base.sha256" } | Select-Object -First 1).browser_download_url
+          if (-not $zipUrl -or -not $shaUrl) { throw "WPD-11 FAIL: release $tag is missing $base.zip / $base.sha256 assets" }
+          New-Item -ItemType Directory -Force -Path $env:WPD11_WORK | Out-Null
+          $state = [ordered]@{
+            tag = $tag
+            ver = $ver
+            base = $base
+            zipUrl = $zipUrl
+            shaUrl = $shaUrl
+            zipPath = Join-Path $env:WPD11_WORK "$base.zip"
+            shaPath = Join-Path $env:WPD11_WORK "$base.sha256"
+          }
+          $state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Encoding utf8
+          Write-Output "WPD-11 resolved: $tag -> $base.zip"
+
+      - name: WPD-11 - download zip (MOTW) + record Defender environment evidence
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
+          $evidence = Join-Path $env:WPD11_WORK 'wpd-11-evidence.log'
+          "=== WPD-11 environment evidence ($env:COMPUTERNAME) ===" | Out-File -FilePath $evidence -Encoding utf8
+          "OS: $([System.Environment]::OSVersion.VersionString) (build $([System.Environment]::OSVersion.Version))" | Out-File -FilePath $evidence -Append -Encoding utf8
+          "Release under test: $($state.tag)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          # Windows PowerShell 5.1 Invoke-WebRequest stamps Zone.Identifier (MOTW);
+          # pwsh 7 does not. BITS is the documented fallback that always stamps.
+          $method = $null
+          try {
+            Invoke-WebRequest -Uri $state.zipUrl -OutFile $state.zipPath -UseBasicParsing
+            $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
+            if ($zi) { $method = 'iwr-5.1' }
+          } catch { Write-Output "IWR failed: $($_.Exception.Message)" }
+          if (-not $method) {
+            Write-Output 'IWR 5.1 did not stamp Zone.Identifier; trying Start-BitsTransfer'
+            if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
+            Start-BitsTransfer -Source $state.zipUrl -Destination $state.zipPath -ErrorAction Stop
+            $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
+            if ($zi) { $method = 'bits' }
+          }
+          Invoke-WebRequest -Uri $state.shaUrl -OutFile $state.shaPath -UseBasicParsing
+          if ($method) {
+            $zoneId = ((Get-Content -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^ZoneId=' }) -join ';'
+            "MOTW: Zone.Identifier present on downloaded zip ($method download) [$zoneId]" | Out-File -FilePath $evidence -Append -Encoding utf8
+          } else {
+            "MOTW: NO Zone.Identifier after iwr-5.1 and BITS - scenario not reproducible on this runner" | Out-File -FilePath $evidence -Append -Encoding utf8
+          }
+          $zip = Get-Item -LiteralPath $state.zipPath
+          "Zip size: $($zip.Length) bytes" | Out-File -FilePath $evidence -Append -Encoding utf8
+          "--- Defender status ---" | Out-File -FilePath $evidence -Append -Encoding utf8
+          try {
+            Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMProductVersion | Format-List | Out-String | Out-File -FilePath $evidence -Append -Encoding utf8
+          } catch { "Get-MpComputerStatus unavailable: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+          try {
+            $pref = Get-MpPreference
+            "ExclusionPath: $($pref.ExclusionPath -join '; ')" | Out-File -FilePath $evidence -Append -Encoding utf8
+            "ExclusionProcess: $($pref.ExclusionProcess -join '; ')" | Out-File -FilePath $evidence -Append -Encoding utf8
+            "DisableRealtimeMonitoring: $($pref.DisableRealtimeMonitoring)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          } catch { "Get-MpPreference unavailable: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+          Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11ENV: $_" }
+          if (-not $method) { throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner (iwr-5.1 + BITS both unstamped)' }
+
+      - name: WPD-11 - zip hash must match the .sha256 asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
+          $assetText = Get-Content -LiteralPath $state.shaPath -Raw
+          if ($assetText -notmatch '([0-9a-fA-F]{64})') { throw "WPD-11 FAIL: .sha256 asset unparseable: $assetText" }
+          $expected = $Matches[1].ToLower()
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $state.zipPath).Hash.ToLower()
+          Write-Output "WPD-11 hash: asset=$expected actual=$actual"
+          if ($actual -ne $expected) { throw "WPD-11 FAIL: zip hash mismatch (asset $expected vs downloaded $actual)" }
+          Write-Output 'WPD-11 PASS: downloaded zip hash matches the published .sha256 asset'
+
+      - name: WPD-11 - extract WITHOUT unblock; observe MOTW inheritance + Defender action
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try { Add-Type -AssemblyName System.IO.Compression.FileSystem } catch { }
+          $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
+          $evidence = Join-Path $env:WPD11_WORK 'wpd-11-extract.log'
+          $zipAbs = (Resolve-Path -LiteralPath $state.zipPath).Path
+          $extract1 = Join-Path $env:WPD11_WORK 'extract-motw'
+          New-Item -ItemType Directory -Force -Path $extract1 | Out-Null
+          # Explorer-equivalent extraction (Shell.Application CopyHere mirrors the documented
+          # user flow "right-click zip -> Extract All", including MOTW propagation).
+          $shell = New-Object -ComObject Shell.Application
+          $src = $shell.Namespace($zipAbs)
+          $dst = $shell.Namespace($extract1)
+          $dst.CopyHere($src.Items(), 0x14)
+          $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($zipAbs)
+          $expectedCount = $zipArchive.Entries.Count
+          $zipArchive.Dispose()
+          $deadline = (Get-Date).AddSeconds(90)
+          do {
+            Start-Sleep -Milliseconds 500
+            $actualCount = @(Get-ChildItem -LiteralPath $extract1 -Recurse -File).Count
+          } while ($actualCount -lt $expectedCount -and (Get-Date) -lt $deadline)
+          if ($actualCount -lt $expectedCount) { throw "WPD-11 FAIL: extraction incomplete ($actualCount/$expectedCount files)" }
+          $root = Join-Path $extract1 $state.base
+          $ps1 = Join-Path $root 'src\Invoke-WindowsPerformanceDiagnostics.ps1'
+          "Extracted $actualCount files to $extract1 (zip has $expectedCount entries)" | Out-File -FilePath $evidence -Encoding utf8
+          $ps1Item = Get-Item -LiteralPath $ps1 -ErrorAction SilentlyContinue
+          if ($ps1Item) {
+            $zi = Get-Item -LiteralPath $ps1 -Stream Zone.Identifier -ErrorAction SilentlyContinue
+            if ($zi) {
+              $zoneId = ((Get-Content -LiteralPath $ps1 -Stream Zone.Identifier -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^ZoneId=' }) -join ';'
+              "MOTW inheritance: extracted .ps1 HAS Zone.Identifier [$zoneId]; Defender did not remove it" | Out-File -FilePath $evidence -Append -Encoding utf8
+            } else {
+              "MOTW inheritance: extracted .ps1 has NO Zone.Identifier (shell CopyHere did not propagate the ADS on this platform)" | Out-File -FilePath $evidence -Append -Encoding utf8
+            }
+          } else {
+            "DEFENDER ACTION: extracted .ps1 is MISSING after MOTW extraction - Defender quarantined it" | Out-File -FilePath $evidence -Append -Encoding utf8
+          }
+          "--- extracted root listing ---" | Out-File -FilePath $evidence -Append -Encoding utf8
+          Get-ChildItem -LiteralPath $root | Select-Object Name,Length | Out-String | Out-File -FilePath $evidence -Append -Encoding utf8
+          Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11X: $_" }
+
+      - name: WPD-11 - Defender quarantine / Protection-history recovery leg
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
+          $evidence = Join-Path $env:WPD11_WORK 'wpd-11-defender.log'
+          $root = Join-Path (Join-Path $env:WPD11_WORK 'extract-motw') $state.base
+          $ps1 = Join-Path $root 'src\Invoke-WindowsPerformanceDiagnostics.ps1'
+          $missing = -not (Test-Path -LiteralPath $ps1)
+          "ps1 missing after MOTW extraction: $missing" | Out-File -FilePath $evidence -Encoding utf8
+          try {
+            $threats = @(Get-MpThreat -ErrorAction Stop)
+            "Threats detected by Defender: $($threats.Count)" | Out-File -FilePath $evidence -Append -Encoding utf8
+            $threats | Select-Object ThreatID,ThreatName,@{n='Resources';e={$_.Resources -join ';'}} | Out-String | Out-File -FilePath $evidence -Append -Encoding utf8
+            if ($missing -and $threats.Count -gt 0) {
+              # CLI equivalent of Windows Security -> Protection history -> Restore:
+              # Remove-MpThreat without -Remove restores the quarantined item.
+              foreach ($t in $threats) { Remove-MpThreat -ThreatID $t.ThreatID -ErrorAction Continue | Out-Null }
+              Start-Sleep -Seconds 3
+              if (Test-Path -LiteralPath $ps1) {
+                "RECOVERY: .ps1 restored via Remove-MpThreat (Protection-history Restore equivalent)" | Out-File -FilePath $evidence -Append -Encoding utf8
+              } else {
+                "RECOVERY: .ps1 still missing after Remove-MpThreat - owner must use the GUI Protection-history Restore" | Out-File -FilePath $evidence -Append -Encoding utf8
+              }
+            }
+          } catch {
+            "Get-MpThreat unavailable: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          }
+          if (-not $missing) {
+            "Defender did not quarantine the .ps1 on this runner (see wpd-11-evidence.log: RealTimeProtectionEnabled=$((Get-MpComputerStatus -ErrorAction SilentlyContinue).RealTimeProtectionEnabled), exclusions)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          }
+          Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11D: $_" }
+
+      - name: WPD-11 - Unblock-File, re-extract clean, verify hashes vs tag sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
+          $evidence = Join-Path $env:WPD11_WORK 'wpd-11-unblock-hash.log'
+          # Unblock the zip exactly as documented in README-FIRST.txt
+          # (Properties -> Unblock is the GUI; Unblock-File is the CLI equivalent).
+          Unblock-File -Path $state.zipPath
+          $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
+          if ($zi) { throw 'WPD-11 FAIL: Unblock-File did not clear Zone.Identifier from the zip' }
+          "Unblock-File cleared Zone.Identifier from the zip" | Out-File -FilePath $evidence -Encoding utf8
+          $extract2 = Join-Path $env:WPD11_WORK 'extract-clean'
+          Expand-Archive -LiteralPath $state.zipPath -DestinationPath $extract2 -Force
+          $root = Join-Path $extract2 $state.base
+          # WPD-11 required files present?
+          $required = @('START-HERE.bat','Run-Diagnostics.bat','README-FIRST.txt','src\Invoke-WindowsPerformanceDiagnostics.ps1')
+          foreach ($rel in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $root $rel))) { throw "WPD-11 FAIL: $rel missing from clean extraction" }
+          }
+          $ps1 = Join-Path $root 'src\Invoke-WindowsPerformanceDiagnostics.ps1'
+          # README-FIRST.txt one-time unblock of the extracted script
+          Unblock-File -Path $ps1
+          $ps1zi = Get-Item -LiteralPath $ps1 -Stream Zone.Identifier -ErrorAction SilentlyContinue
+          if ($ps1zi) { throw 'WPD-11 FAIL: extracted .ps1 still has Zone.Identifier after Unblock-File' }
+          "Required files present; extracted .ps1 unblocked (no Zone.Identifier)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          # Per-file hash verification against the tag source on GitHub (the zip is
+          # built with `git archive HEAD` at the tag, so bytes must match exactly).
+          $files = @('src\Invoke-WindowsPerformanceDiagnostics.ps1','Run-Diagnostics.bat','START-HERE.bat','README-FIRST.txt','VERSION')
+          foreach ($rel in $files) {
+            $extracted = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $root $rel)
+            $rawUrl = "https://raw.githubusercontent.com/pupontech/windows-performance-diagnostics-toolkit/$($state.tag)/$($rel -replace '\\','/')"
+            $tmp = Join-Path $env:WPD11_WORK ('raw-' + ($rel -replace '[\\/]','-'))
+            Invoke-WebRequest -Uri $rawUrl -OutFile $tmp -UseBasicParsing
+            $rawHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash
+            $match = ($extracted.Hash -eq $rawHash)
+            "$rel : extracted=$($extracted.Hash) tag@$($state.tag)=$rawHash match=$match" | Out-File -FilePath $evidence -Append -Encoding utf8
+            if (-not $match) { throw "WPD-11 FAIL: $rel hash differs from tag $($state.tag) source" }
+          }
+          $verFile = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
+          if ($verFile -ne $state.ver) { throw "WPD-11 FAIL: VERSION in zip ($verFile) != release version ($($state.ver))" }
+          "VERSION in zip matches release tag: $verFile" | Out-File -FilePath $evidence -Append -Encoding utf8
+          Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11U: $_" }
+          Write-Output "WPD-11 PASS: unblock + clean extraction + per-file hashes vs tag $($state.tag) all match"
+
+      - name: WPD-11 - launcher end-to-end from the extracted (unblocked) folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
+          $root = Join-Path (Join-Path $env:WPD11_WORK 'extract-clean') $state.base
+          Push-Location $root
+          try {
+            cmd.exe /c "call Run-Diagnostics.bat"
+            $exit = $LASTEXITCODE
+          } finally {
+            Pop-Location
+          }
+          if ($exit -ne 0) { throw "WPD-11 FAIL: Run-Diagnostics.bat exited $exit" }
+          $manifestPath = 'C:\Temp\WPD-Case\diagnostic-manifest.json'
+          if (-not (Test-Path -LiteralPath $manifestPath)) { throw "WPD-11 FAIL: launcher produced no $manifestPath" }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.mode -ne 'Collect') { throw "WPD-11 FAIL: manifest mode=$($manifest.mode) (expected Collect)" }
+          if ($manifest.toolVersion -ne $state.ver) { throw "WPD-11 FAIL: manifest toolVersion=$($manifest.toolVersion) (expected $($state.ver))" }
+          foreach ($a in @('performance-samples.csv','top-processes.json','system-events-last-24-hours.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path 'C:\Temp\WPD-Case' $a))) { throw "WPD-11 FAIL: launcher produced no $a" }
+            if (@($manifest.artifacts | Where-Object { $_.Name -eq $a }).Count -ne 1) { throw "WPD-11 FAIL: $a missing from manifest hashes" }
+          }
+          Write-Output "WPD-11 PASS: Run-Diagnostics.bat from extracted folder -> $manifestPath (toolVersion $($manifest.toolVersion), mode $($manifest.mode), artifacts hashed)"
+
+      - name: Upload WPD-11 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpd-11-${{ matrix.os }}
+          path: |
+            C:\WPD11
+            C:\Temp\WPD-Case\diagnostic-manifest.json
+          if-no-files-found: warn

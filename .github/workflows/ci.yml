@@ -310,30 +310,45 @@ jobs:
           $pass = 'Wpd#2026!Test'
           net user $user $pass /add | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'WPD-09 FAIL: net user /add failed' }
+          # grant the standard user write access to the staging area
           icacls $base /grant "${user}:(OI)(CI)M" | Out-Null
           Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE\src\Invoke-WindowsPerformanceDiagnostics.ps1" `
             -Destination (Join-Path $base 'Invoke-WindowsPerformanceDiagnostics.ps1') -Force
           icacls (Join-Path $base 'Invoke-WindowsPerformanceDiagnostics.ps1') /grant "${user}:R" | Out-Null
-          $runner = Join-Path $base 'wpd09.cmd'
+          # grant "Log on as a batch job" so a password-based process start works
+          $sid = (New-Object System.Security.Principal.NTAccount($user)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          $secCfg = Join-Path $base 'sec.cfg'
+          secedit /export /cfg $secCfg /areas USER_RIGHTS | Out-Null
+          $cfg = Get-Content -LiteralPath $secCfg -Raw
+          if ($cfg -match 'SeBatchLogonRight\s*=\s*[^\r\n]*') {
+            $cfg = $cfg -replace 'SeBatchLogonRight\s*=\s*[^\r\n]*', "SeBatchLogonRight = *S-1-5-32-544,*S-1-5-32-551,*$sid"
+          } else {
+            $cfg = $cfg + "`r`nSeBatchLogonRight = *S-1-5-32-544,*S-1-5-32-551,*$sid`r`n"
+          }
+          Set-Content -LiteralPath $secCfg -Value $cfg -Encoding Ascii
+          secedit /configure /db secedit.sdb /cfg $secCfg /areas USER_RIGHTS | Out-Null
           $consoleLog = Join-Path $logsDir 'WPD-09-console.log'
-          $exitFile = Join-Path $logsDir 'WPD-09-exitcode.txt'
-          $cmdLines = @(
-            '@echo off',
-            '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "C:\WPD\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CaptureWpr -ConfirmWprCapture -DurationSeconds 5 -OutputDirectory "C:\WPD\WPD-09" > "' + $consoleLog + '" 2>&1',
-            'echo %errorlevel% > "' + $exitFile + '"'
-          )
-          $cmdLines | Set-Content -LiteralPath $runner -Encoding Ascii
-          schtasks /create /tn wpd09 /tr "cmd.exe /c C:\WPD\wpd09.cmd" /sc once /st 23:59 /ru $user /rp $pass /f | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'WPD-09 FAIL: schtasks /create failed' }
-          schtasks /run /tn wpd09 | Out-Null
-          $deadline = (Get-Date).AddSeconds(120)
-          while (-not (Test-Path -LiteralPath $exitFile) -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 2
+          $cred = New-Object System.Management.Automation.PSCredential($user, (ConvertTo-SecureString $pass -AsPlainText -Force))
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $base + '\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CaptureWpr -ConfirmWprCapture -DurationSeconds 5 -OutputDirectory "' + $outDir + '"'
+          $psi.UseShellExecute = $false
+          $psi.UserName = $user
+          $psi.Domain = $env:COMPUTERNAME
+          $psi.Password = (ConvertTo-SecureString $pass -AsPlainText -Force)
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+          $stderrTask = $proc.StandardError.ReadToEndAsync()
+          if (-not $proc.WaitForExit(120000)) {
+            try { $proc.Kill() } catch { }
+            throw 'WPD-09 FAIL: standard-user process did not finish within 120s'
           }
-          if (-not (Test-Path -LiteralPath $exitFile)) {
-            throw 'WPD-09 FAIL: standard-user task did not finish within 120s'
-          }
-          $exit = [int](Get-Content -LiteralPath $exitFile -Raw).Trim()
+          $exit = $proc.ExitCode
+          $stdoutTask.Wait(5000) | Out-Null
+          $stderrTask.Wait(5000) | Out-Null
+          ("--- stdout ---`n" + $stdoutTask.Result + "`n--- stderr ---`n" + $stderrTask.Result) | Set-Content -LiteralPath $consoleLog -Encoding utf8
           if ($exit -ne 0) { throw "WPD-09 FAIL: script exit code $exit; see $consoleLog" }
           $manifest = Get-Content -LiteralPath (Join-Path $outDir 'diagnostic-manifest.json') -Raw | ConvertFrom-Json
           if ($manifest.wpr.status -ne 'skipped-elevation-required') {
@@ -353,5 +368,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wpd-gates-${{ matrix.os }}
-          path: C:\WPD
+          path: |
+            C:\WPD
+            !C:\WPD\**\*.etl
+            !C:\WPD\**\*.NGENPDB
           if-no-files-found: error

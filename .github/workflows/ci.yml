@@ -407,6 +407,7 @@ jobs:
   wpd-release-flow:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-2022, windows-2025]
     env:
@@ -416,15 +417,22 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $headers = @{ 'User-Agent' = 'wpd-11-ci'; Authorization = "Bearer $env:GITHUB_TOKEN" }
-          $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/pupontech/windows-performance-diagnostics-toolkit/releases/latest' -Headers $headers
-          if (-not $rel.tag_name) { throw 'WPD-11 FAIL: could not resolve latest release' }
-          $tag = $rel.tag_name
-          $ver = $tag.TrimStart('v')
+          # Resolve the latest semver tag without the API (auth-free): asset URLs are
+          # deterministic (https://github.com/<owner>/<repo>/releases/download/<tag>/...).
+          $repo = 'https://github.com/pupontech/windows-performance-diagnostics-toolkit.git'
+          $lines = @(git ls-remote --tags --refs $repo)
+          if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0) { throw 'WPD-11 FAIL: git ls-remote failed to enumerate release tags' }
+          $versions = foreach ($l in $lines) {
+            $t = ($l -split 'refs/tags/')[-1].Trim()
+            if ($t -match '^v\d+\.\d+\.\d+$') { [pscustomobject]@{ tag = $t; ver = [version]$t.TrimStart('v') } }
+          }
+          if (-not $versions) { throw 'WPD-11 FAIL: no semver tags found via git ls-remote' }
+          $latest = $versions | Sort-Object ver | Select-Object -Last 1
+          $tag = $latest.tag
+          $ver = $latest.ver.ToString()
           $base = "windows-performance-diagnostics-toolkit-$ver"
-          $zipUrl = ($rel.assets | Where-Object { $_.name -eq "$base.zip" } | Select-Object -First 1).browser_download_url
-          $shaUrl = ($rel.assets | Where-Object { $_.name -eq "$base.sha256" } | Select-Object -First 1).browser_download_url
-          if (-not $zipUrl -or -not $shaUrl) { throw "WPD-11 FAIL: release $tag is missing $base.zip / $base.sha256 assets" }
+          $zipUrl = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/download/$tag/$base.zip"
+          $shaUrl = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/download/$tag/$base.sha256"
           New-Item -ItemType Directory -Force -Path $env:WPD11_WORK | Out-Null
           $state = [ordered]@{
             tag = $tag

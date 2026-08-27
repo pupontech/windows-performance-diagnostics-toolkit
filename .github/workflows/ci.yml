@@ -457,27 +457,31 @@ jobs:
           "=== WPD-11 environment evidence ($env:COMPUTERNAME) ===" | Out-File -FilePath $evidence -Encoding utf8
           "OS: $([System.Environment]::OSVersion.VersionString) (build $([System.Environment]::OSVersion.Version))" | Out-File -FilePath $evidence -Append -Encoding utf8
           "Release under test: $($state.tag)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          # Windows PowerShell 5.1 Invoke-WebRequest stamps Zone.Identifier (MOTW);
-          # pwsh 7 does not. BITS is the documented fallback that always stamps.
+          # This repo is PRIVATE: release assets require authentication (anonymous
+          # downloads 404). The workflow GITHUB_TOKEN has Contents:read. Windows
+          # PowerShell 5.1 Invoke-WebRequest stamps Zone.Identifier (MOTW); pwsh 7
+          # does not, so the download runs under Windows PowerShell 5.1.
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
           $method = $null
           try {
-            Invoke-WebRequest -Uri $state.zipUrl -OutFile $state.zipPath -UseBasicParsing
+            Invoke-WebRequest -Uri $state.zipUrl -OutFile $state.zipPath -UseBasicParsing -Headers $headers
             $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
             if ($zi) { $method = 'iwr-5.1' }
           } catch { Write-Output "IWR failed: $($_.Exception.Message)" }
           if (-not $method) {
-            Write-Output 'IWR 5.1 did not stamp Zone.Identifier; trying Start-BitsTransfer'
+            Write-Output 'IWR 5.1 did not yield a MOTW-stamped zip; trying curl.exe with token'
             if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
-            Start-BitsTransfer -Source $state.zipUrl -Destination $state.zipPath -ErrorAction Stop
+            & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: Bearer $env:GITHUB_TOKEN" $state.zipUrl
+            if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: curl.exe download failed (exit $LASTEXITCODE)" }
             $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
-            if ($zi) { $method = 'bits' }
+            if ($zi) { $method = 'curl' }
           }
-          Invoke-WebRequest -Uri $state.shaUrl -OutFile $state.shaPath -UseBasicParsing
+          Invoke-WebRequest -Uri $state.shaUrl -OutFile $state.shaPath -UseBasicParsing -Headers $headers
           if ($method) {
             $zoneId = ((Get-Content -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^ZoneId=' }) -join ';'
             "MOTW: Zone.Identifier present on downloaded zip ($method download) [$zoneId]" | Out-File -FilePath $evidence -Append -Encoding utf8
           } else {
-            "MOTW: NO Zone.Identifier after iwr-5.1 and BITS - scenario not reproducible on this runner" | Out-File -FilePath $evidence -Append -Encoding utf8
+            "MOTW: NO Zone.Identifier after iwr-5.1 and curl - scenario not reproducible on this runner" | Out-File -FilePath $evidence -Append -Encoding utf8
           }
           $zip = Get-Item -LiteralPath $state.zipPath
           "Zip size: $($zip.Length) bytes" | Out-File -FilePath $evidence -Append -Encoding utf8
@@ -492,7 +496,7 @@ jobs:
             "DisableRealtimeMonitoring: $($pref.DisableRealtimeMonitoring)" | Out-File -FilePath $evidence -Append -Encoding utf8
           } catch { "Get-MpPreference unavailable: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
           Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11ENV: $_" }
-          if (-not $method) { throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner (iwr-5.1 + BITS both unstamped)' }
+          if (-not $method) { throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner (iwr-5.1 + curl both unstamped)' }
 
       - name: WPD-11 - zip hash must match the .sha256 asset
         shell: pwsh
@@ -612,13 +616,15 @@ jobs:
           if ($ps1zi) { throw 'WPD-11 FAIL: extracted .ps1 still has Zone.Identifier after Unblock-File' }
           "Required files present; extracted .ps1 unblocked (no Zone.Identifier)" | Out-File -FilePath $evidence -Append -Encoding utf8
           # Per-file hash verification against the tag source on GitHub (the zip is
-          # built with `git archive HEAD` at the tag, so bytes must match exactly).
+          # built with `git archive HEAD` at the tag, so bytes must match exactly;
+          # private repo, so raw fetches carry the workflow token).
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
           $files = @('src\Invoke-WindowsPerformanceDiagnostics.ps1','Run-Diagnostics.bat','START-HERE.bat','README-FIRST.txt','VERSION')
           foreach ($rel in $files) {
             $extracted = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $root $rel)
             $rawUrl = "https://raw.githubusercontent.com/pupontech/windows-performance-diagnostics-toolkit/$($state.tag)/$($rel -replace '\\','/')"
             $tmp = Join-Path $env:WPD11_WORK ('raw-' + ($rel -replace '[\\/]','-'))
-            Invoke-WebRequest -Uri $rawUrl -OutFile $tmp -UseBasicParsing
+            Invoke-WebRequest -Uri $rawUrl -OutFile $tmp -UseBasicParsing -Headers $headers
             $rawHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash
             $match = ($extracted.Hash -eq $rawHash)
             "$rel : extracted=$($extracted.Hash) tag@$($state.tag)=$rawHash match=$match" | Out-File -FilePath $evidence -Append -Encoding utf8

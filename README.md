@@ -2,9 +2,11 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.2.0
+**Version:** 0.2.1
 
 **Status:** Read-only collection MVP plus consent-gated WPR capture. It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
+
+[![CI](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml)
 
 ## Purpose
 
@@ -100,6 +102,13 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - 🔜 Defender performance captures behind their own consent gate
 - 🔜 WPA-oriented analysis guidance for the captured ETL
 - 🔜 Windows lab test matrix execution before any live remediation capability
+
+## Development workflow
+
+Every change flows through the Kanban board (`wpd-toolkit`) → implementation →
+GitHub VM CI (Linux pytest/parse + real `Run-Diagnostics.bat` execution on
+windows-2022/2025) → release with byte-verified zip. Full pipeline in
+[docs/development-workflow.md](docs/development-workflow.md).
 
 ## Repository layout
 

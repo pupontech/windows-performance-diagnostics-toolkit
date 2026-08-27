@@ -759,20 +759,29 @@ jobs:
           Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11U: $_" }
           Write-Output "WPD-11 PASS: unblock + clean extraction + per-file hashes vs tag $($state.tag) all match"
 
-      - name: WPD-11 - launcher end-to-end from the extracted (unblocked) folder
+      - name: WPD-11 - launcher end-to-end (stage launch dir)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
           $root = Join-Path (Join-Path $env:WPD11_WORK 'extract-clean') $state.base
-          Push-Location $root
-          try {
-            cmd.exe /c "call Run-Diagnostics.bat"
-            $exit = $LASTEXITCODE
-          } finally {
-            Pop-Location
-          }
-          if ($exit -ne 0) { throw "WPD-11 FAIL: Run-Diagnostics.bat exited $exit" }
+          if (-not (Test-Path -LiteralPath (Join-Path $root 'Run-Diagnostics.bat'))) { throw "WPD-11 FAIL: extracted launcher missing at $root" }
+          "WPD11_LAUNCH_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "WPD-11 launch dir: $root"
+
+      # Run the launcher under the runner's native cmd shell (same pattern as the
+      # windows-verify job): launching powershell.exe from a pwsh parent breaks
+      # Windows PowerShell module autoloading in the child (observed:
+      # 'Get-FileHash' not recognized), while a cmd parent works.
+      - name: WPD-11 - run launcher from the extracted (unblocked) folder
+        shell: cmd
+        run: call "%WPD11_LAUNCH_DIR%\Run-Diagnostics.bat"
+
+      - name: WPD-11 - assert launcher output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
           $manifestPath = 'C:\Temp\WPD-Case\diagnostic-manifest.json'
           if (-not (Test-Path -LiteralPath $manifestPath)) { throw "WPD-11 FAIL: launcher produced no $manifestPath" }
           $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json

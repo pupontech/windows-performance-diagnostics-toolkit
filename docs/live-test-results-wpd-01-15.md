@@ -1,4 +1,4 @@
-# Live Lab Test Runbook + Results — WPD-01..11 (release v0.2.1)
+# Live Lab Test Runbook + Results — WPD-01..15 (release v0.3.0)
 
 Fill this in on a real Windows 10/11 lab machine (owner runs this; agents do not
 set up VMs). One row per test case, mark PASS / FAIL / N/A, add evidence paths
@@ -7,18 +7,18 @@ board.
 
 ## Release under test
 
-- Tag:        v0.2.1
-- Release:    https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/tag/v0.2.1
-- Zip asset:  windows-performance-diagnostics-toolkit-0.2.1.zip
-- Hash asset: windows-performance-diagnostics-toolkit-0.2.1.sha256
+- Tag:        v0.3.0
+- Release:    https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/tag/v0.3.0
+- Zip asset:  windows-performance-diagnostics-toolkit-0.3.0.zip
+- Hash asset: windows-performance-diagnostics-toolkit-0.3.0.sha256
 - Expected SHA-256 (build-verified on 2026-08-27):
-  `a4f942ba6b1309d1f6f9f96adc2c3f5893572873e26de634178a6be48ee0f077`
+  `1c9fc350d52794e306fa819ffaf1d0af7fc62ee26d144805a49411e3cea9eda9`
 
 ## Preparation (do once)
 
 1. Download the zip to the lab machine. Do NOT extract yet.
 2. Verify the download:
-   `Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.2.1.zip`
+   `Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.3.0.zip`
    — must equal the expected hash above.
 3. RIGHT-CLICK the zip → Properties → General tab → check **Unblock** → OK
    (clears Mark-of-the-Web; per the card, unblock before extracting).
@@ -173,19 +173,83 @@ Result: PASS / FAIL / N/A — Evidence (`wpr-trace.etl`, manifest):
 This is the full release-flow check (Preparation steps 1–5 above already cover
 the zip hash + Unblock + Protection-history recovery).
 
-1. Confirm the extraction folder contains `Run-Diagnostics.bat` and
-   `src\Invoke-WindowsPerformanceDiagnostics.ps1`.
+1. Confirm the extraction folder contains `START-HERE.bat`, `Run-Diagnostics.bat`,
+   `README-FIRST.txt`, and `src\Invoke-WindowsPerformanceDiagnostics.ps1`.
 2. Verify file hashes against the `.sha256` asset:
    `Get-FileHash -Algorithm SHA256 .\src\Invoke-WindowsPerformanceDiagnostics.ps1`
 3. If the `.ps1` was removed by Defender at any point, confirm the
    README-FIRST.txt recovery path worked (Unblock → re-extract → Protection
    history → Restore).
-4. Launch via the recommended entry point — double-click `Run-Diagnostics.bat`
+4. Launch via the recommended basic entry point — double-click `Run-Diagnostics.bat`
    (or run it from `cmd`). Expected: it collects ~30 s and writes
    `C:\Temp\WPD-Case\diagnostic-manifest.json` (plus csv/json artifacts).
 
 Result: PASS / FAIL / N/A — Evidence (folder listing, `Get-FileHash` output,
 `C:\Temp\WPD-Case` contents):
+
+---
+
+## WPD-12 — Defender gate: capture without consent refused
+
+Command:
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -ConfirmLocalCollection -CaptureDefender -DurationSeconds 5 -OutputDirectory C:\WPD\WPD-12
+```
+
+Expected: FAILS before any collection with
+`Defender performance capture requires -ConfirmDefenderCapture. No diagnostic data was collected.`
+No recording started, no `defender-performance.etl`.
+
+Result: PASS / FAIL / N/A — Evidence (console output):
+
+---
+
+## WPD-13 — Defender on standard (non-admin) console
+
+Log in as standard user; run:
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -ConfirmLocalCollection -CaptureDefender -ConfirmDefenderCapture -DurationSeconds 5 -OutputDirectory C:\WPD\WPD-13
+```
+
+Expected: collection completes; manifest `defender.status` is
+`skipped-elevation-required`; NO UAC prompt appears; no auto-elevation.
+Note: if the `DefenderPerformance` module is not installed at all (Defender
+platform older than 4.18.2108.7), the status is `skipped-defender-module-not-found`
+with a `collectionErrors` entry — record the platform version and mark the case
+N/A on that machine.
+
+Result: PASS / FAIL / N/A — Evidence (manifest `defender` block + console output):
+
+---
+
+## WPD-14 — Defender recording from elevated console
+
+From an already-elevated (Administrator) console on a machine with Defender
+platform 4.18.2108.7+ (`Get-Module -ListAvailable -Name DefenderPerformance`
+must return a module), run the same WPD-13 command with
+`-OutputDirectory C:\WPD\WPD-14`. Expected: `defender-performance.etl` exists
+and is non-empty; manifest `defender.status` is `completed`; the ETL is listed
+in the manifest hashes; the DefenderPerformance module version is recorded.
+
+Result: PASS / FAIL / N/A — Evidence (`defender-performance.etl`, manifest):
+
+---
+
+## WPD-15 — START-HERE.bat UAC flow (full collection)
+
+From a STANDARD (non-admin) account, double-click `START-HERE.bat` in the
+extracted folder.
+
+Expected:
+1. A UAC prompt appears ("Windows Performance Diagnostics Toolkit" / consent
+   dialog for the bat). Screenshot it.
+2. After accepting, an elevated console runs the full collection: performance
+   samples, top processes, System events, AND a 30-second WPR trace.
+3. Output lands in `C:\Temp\WPD-Case`: `diagnostic-manifest.json`,
+   `wpr-trace.etl` present; manifest `wpr.status` is `completed`.
+
+Result: PASS / FAIL / N/A — Evidence (UAC screenshot, console output,
+`C:\Temp\WPD-Case` contents, manifest):
 
 ---
 
@@ -200,6 +264,7 @@ so the maintainer can confirm which build you ran.
 
 - Tester: ____________
 - Machine: Windows 10 / 11, build ____________
-- Admin account used for WPD-03/04/06/07/10: yes / no
-- Standard account used for WPD-05/09: yes / no
+- Defender platform version: `(Get-MpComputerStatus).AMProductVersion` ____________
+- Admin account used for WPD-03/04/06/07/10/14: yes / no
+- Standard account used for WPD-05/09/13/15: yes / no
 - Date: ____________

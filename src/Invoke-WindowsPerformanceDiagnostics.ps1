@@ -27,7 +27,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.1'
+$ScriptVersion = '0.4.0'
 
 function Write-JsonFile {
     param(
@@ -62,6 +62,121 @@ function Get-ArtifactMetadata {
     return $artifacts
 }
 
+function Get-EventsSafe {
+    <#
+      Reads a log record-by-record via the low-level .NET reader instead of
+      Get-WinEvent -FilterHashtable. Get-WinEvent eagerly formats every record's
+      message text as it enumerates, and if even ONE record's provider has a
+      missing/mismatched message-resource DLL it throws "EventLogException: The
+      specified resource type cannot be found in the image file" and the ENTIRE
+      query comes back empty - discarding thousands of good records along with
+      the one bad one. Record-by-record lets us skip just the bad one.
+      Returns the NEWEST up to MaxEvents records (sliding buffer).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogName,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$StartTime,
+
+        [int]$MaxEvents = 200
+    )
+
+    $isoTime = $StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+    $xpath = "*[System[TimeCreated[@SystemTime>='$isoTime']]]"
+    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($LogName, [System.Diagnostics.Eventing.Reader.PathType]::LogName, $xpath)
+    $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
+    $buffer = New-Object System.Collections.ArrayList
+    $skipped = 0
+    try {
+        $rec = $reader.ReadEvent()
+        while ($null -ne $rec) {
+            try {
+                $msg = $null
+                try {
+                    $msg = $rec.FormatDescription()
+                }
+                catch {
+                    $msg = "[message text unavailable: $($_.Exception.Message)]"
+                    $skipped++
+                }
+                $level = $null
+                try {
+                    $level = $rec.LevelDisplayName
+                }
+                catch {
+                    $level = "Level$($rec.Level)"
+                }
+                [void]$buffer.Add([pscustomobject]@{
+                    TimeCreated = $rec.TimeCreated
+                    LevelDisplayName = $level
+                    Id = $rec.Id
+                    ProviderName = $rec.ProviderName
+                    Message = $msg
+                })
+                if ($buffer.Count -gt $MaxEvents) {
+                    $buffer.RemoveAt(0)
+                }
+            }
+            finally {
+                $rec.Dispose()
+            }
+            $rec = $reader.ReadEvent()
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+    return [pscustomobject]@{
+        Events = @($buffer)
+        SkippedMessageCount = $skipped
+    }
+}
+
+function Get-CrashAnalysis {
+    <#
+      Decodes BSOD/bugcheck evidence and flags unexplained abrupt shutdowns:
+      Kernel-Power 41 without a matching BugCheck event (usually a hard freeze,
+      power loss, or thermal cutout rather than a Windows-detected crash).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Events
+    )
+
+    $bugchecks = @(
+        $Events | Where-Object { $_.ProviderName -eq 'BugCheck' -and $_.Id -eq 1001 } | ForEach-Object {
+            $code = $null
+            if ($_.Message -match '0x[0-9A-Fa-f]{8}') {
+                $code = $matches[0]
+            }
+            [pscustomobject]@{
+                TimeCreated = $_.TimeCreated
+                BugcheckCode = $code
+                Message = $_.Message
+            }
+        }
+    )
+
+    $unexplained = @(
+        $Events | Where-Object { $_.ProviderName -match 'Kernel-Power' -and $_.Id -eq 41 } | Where-Object {
+            $crashTime = $_.TimeCreated
+            -not ($bugchecks | Where-Object { [math]::Abs(($_.TimeCreated - $crashTime).TotalMinutes) -le 5 })
+        } | ForEach-Object {
+            [pscustomobject]@{
+                TimeCreated = $_.TimeCreated
+                Message = $_.Message
+            }
+        }
+    )
+
+    return [ordered]@{
+        bugchecks = $bugchecks
+        unexplainedShutdowns = $unexplained
+    }
+}
+
 try {
     $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
     New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
@@ -89,6 +204,7 @@ $planManifest = [ordered]@{
         'write-local-plan-manifest',
         'collect-read-only-system-snapshots-after-explicit-consent',
         'export-bounded-system-event-summary-after-explicit-consent',
+        'analyze-crash-evidence-after-explicit-consent',
         'write-local-artifact-hashes-after-explicit-consent'
     )
 }
@@ -203,14 +319,30 @@ catch {
     Add-CollectionError -Stage 'process-snapshot' -ErrorRecord $_
 }
 
+$systemLogInfo = $null
+$safeEvents = $null
 try {
     $eventStartTime = (Get-Date).AddHours(-24)
-    $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $eventStartTime } -MaxEvents $MaxEventCount |
-        Select-Object -Property TimeCreated, Id, LevelDisplayName, ProviderName, Message
+    $systemLogInfo = Get-WinEvent -ListLog 'System' -ErrorAction Stop
+    $safeEvents = Get-EventsSafe -LogName 'System' -StartTime $eventStartTime -MaxEvents $MaxEventCount
+    $events = $safeEvents.Events
     Write-JsonFile -InputObject $events -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'system-events-last-24-hours.json')
 }
 catch {
     Add-CollectionError -Stage 'system-event-summary' -ErrorRecord $_
+}
+
+$crashAnalysis = [ordered]@{
+    bugchecks = @()
+    unexplainedShutdowns = @()
+}
+try {
+    if ($safeEvents -and $safeEvents.Events.Count -gt 0) {
+        $crashAnalysis = Get-CrashAnalysis -Events $safeEvents.Events
+    }
+}
+catch {
+    Add-CollectionError -Stage 'crash-analysis' -ErrorRecord $_
 }
 
 $wprStatus = $null
@@ -349,8 +481,24 @@ $collectionManifest = [ordered]@{
     }
     safety = $planManifest.safety
     system = $systemSummary
+    systemEventLog = [ordered]@{
+        enabled = $null
+        recordCount = $null
+        pulledCount = $null
+        skippedUnrenderableCount = $null
+    }
+    crashAnalysis = $crashAnalysis
     collectionErrors = $collectionErrors
     artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory
+}
+
+if ($systemLogInfo -and $safeEvents) {
+    $collectionManifest.systemEventLog = [ordered]@{
+        enabled = $systemLogInfo.IsEnabled
+        recordCount = $systemLogInfo.RecordCount
+        pulledCount = $safeEvents.Events.Count
+        skippedUnrenderableCount = $safeEvents.SkippedMessageCount
+    }
 }
 
 if ($CaptureWpr) {

@@ -157,6 +157,65 @@
       "type": "object",
       "additionalProperties": true
     },
+    "systemEventLog": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": ["boolean", "null"]
+        },
+        "recordCount": {
+          "type": ["integer", "null"]
+        },
+        "pulledCount": {
+          "type": ["integer", "null"]
+        },
+        "skippedUnrenderableCount": {
+          "type": ["integer", "null"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "crashAnalysis": {
+      "type": "object",
+      "properties": {
+        "bugchecks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "TimeCreated": {
+                "type": ["string", "null"],
+                "format": "date-time"
+              },
+              "BugcheckCode": {
+                "type": ["string", "null"]
+              },
+              "Message": {
+                "type": ["string", "null"]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "unexplainedShutdowns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "TimeCreated": {
+                "type": ["string", "null"],
+                "format": "date-time"
+              },
+              "Message": {
+                "type": ["string", "null"]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "collectionErrors": {
       "type": "array",
       "items": {

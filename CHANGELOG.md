@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 — 2026-08-27
+
+Crash evidence analysis + resilient event reading (patterns adopted from the field-tested RemoteDiagnostics kit).
+
+- **Resilient event reader (`Get-EventsSafe`)**: replaces `Get-WinEvent -FilterHashtable` for the System log. Get-WinEvent silently returns **zero events for the entire log** if even one record's provider has an unrenderable message-resource DLL; the new record-by-record .NET reader skips just the bad record and keeps everything else. `skippedUnrenderableCount` is reported in the manifest.
+- **Crash analysis (`Get-CrashAnalysis`)**: decodes BugCheck 1001 events into bugcheck codes and flags **unexplained abrupt shutdowns** — Kernel-Power 41 events with no bugcheck within 5 minutes (typically hard freeze / power loss / thermal cutout, not a Windows-detected crash). Emitted as `crashAnalysis` in the manifest (`bugchecks` / `unexplainedShutdowns`).
+- **Log availability pre-check**: `Get-WinEvent -ListLog System` before the pull — the manifest's `systemEventLog` block now carries `enabled`, `recordCount`, `pulledCount`, `skippedUnrenderableCount`, so an empty result is distinguishable from a failed read.
+- Plan mode advertises `analyze-crash-evidence-after-explicit-consent`; report schema covers `systemEventLog` and `crashAnalysis`; unit tests exercise `Get-CrashAnalysis` on Linux; windows-verify exercises the safe reader end-to-end on windows-2022/2025.
+- Safety contract unchanged: read-only, local-only, no auto-elevation, no remediation.
+
 ## 0.3.1 — 2026-08-27
 
 START-HERE.bat rebuilt as a console menu (the "GUI" of the toolkit) and now tested in GitHub VMs.

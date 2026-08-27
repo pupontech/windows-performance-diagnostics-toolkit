@@ -96,3 +96,30 @@ itself) has a corresponding entry in the `artifacts` array with a SHA-256 hash.
 The manifest file is never self-referenced. This allows consumers to verify
 integrity of all collected files by recomputing hashes and comparing against the
 manifest.
+
+## System Event Log Block
+
+The `systemEventLog` object reports the System log's availability and the pull
+result so an empty result is never mistaken for "nothing happened":
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | Whether the System log is enabled on the target. |
+| `recordCount` | Total records on the target at pull time (from `Get-WinEvent -ListLog`). |
+| `pulledCount` | Records actually written to `system-events-last-24-hours.json` (bounded by `-MaxEventCount`). |
+| `skippedUnrenderableCount` | Records skipped because their provider's message-resource DLL could not be rendered (the record-by-record reader keeps everything else). |
+
+## Crash Analysis Block
+
+The `crashAnalysis` object summarizes crash evidence from the pulled System
+events:
+
+| Field | Meaning |
+|-------|---------|
+| `bugchecks` | BugCheck 1001 events decoded to their `0x…` bugcheck codes (e.g. `0x0000001A`). |
+| `unexplainedShutdowns` | Kernel-Power 41 events with **no** bugcheck within 5 minutes — typically a hard freeze, power loss, or thermal cutout rather than a Windows-detected crash. |
+
+Both arrays are empty when no matching evidence is in the window. Correlation
+is evidence, not causation: a bugcheck code names the crash *type*, but naming
+the exact driver usually needs WinDbg `!analyze -v` against the matching
+minidump.

@@ -257,6 +257,54 @@ def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
 
 
+def test_plan_mode_lists_crash_analysis_action(tmp_path):
+    """Plan mode must advertise crash-evidence analysis without running it."""
+    output_directory = tmp_path / "plan-crash"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "analyze-crash-evidence-after-explicit-consent" in manifest["plannedActions"]
+
+
+def test_crash_analysis_decodes_bugchecks_and_flags_unexplained_shutdowns():
+    """Get-CrashAnalysis (pure function, dot-sourced from the collector) must
+    decode BugCheck 1001 codes and flag Kernel-Power 41 without a nearby
+    bugcheck as an unexplained shutdown."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-crash-test; "
+        "$r = Get-CrashAnalysis -Events @("
+        # bugcheck 3 minutes before the first Kernel-Power 41 -> within the
+        # 5-minute window, so that 41 is explained; the -30min one is not
+        "[pscustomobject]@{ProviderName='BugCheck';Id=1001;TimeCreated=(Get-Date).AddMinutes(-3);"
+        "Message='The bugcheck was: 0x0000001A (0x0000000000041790, 0x0000000000000001, 0x0000000000000000, 0x0000000000000000)'},"
+        "[pscustomobject]@{ProviderName='Microsoft-Windows-Kernel-Power';Id=41;TimeCreated=(Get-Date).AddMinutes(-2);"
+        "Message='The system has rebooted without cleanly shutting down first.'},"
+        "[pscustomobject]@{ProviderName='Microsoft-Windows-Kernel-Power';Id=41;TimeCreated=(Get-Date).AddMinutes(-30);"
+        "Message='The system has rebooted without cleanly shutting down first.'}"
+        "); $r | ConvertTo-Json -Depth 6"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    analysis = json.loads(result.stdout)
+
+    assert len(analysis["bugchecks"]) == 1
+    assert analysis["bugchecks"][0]["BugcheckCode"] == "0x0000001A"
+    # the -2min Kernel-Power 41 has a matching bugcheck -> not unexplained;
+    # the -30min one has none -> unexplained
+    assert len(analysis["unexplainedShutdowns"]) == 1
+
+
 def test_start_here_bat_is_elevation_safe_and_quote_safe():
     """START-HERE.bat must self-elevate via UAC, present a console menu, run the
     selected collection with the WPR/Defender consent flags, and stay CI-safe

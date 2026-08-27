@@ -1,7 +1,7 @@
 WINDOWS PERFORMANCE DIAGNOSTICS TOOLKIT
 =======================================
 Read-Only Diagnostics Collector for Windows 10/11
-Version 0.2.0
+Version 0.3.0
 
 This toolkit collects read-only Windows performance diagnostics to help
 troubleshoot performance issues. It does NOT upload data, remediate problems,
@@ -14,16 +14,26 @@ WHAT THIS TOOL COLLECTS
 - System event log entries (recent)
 - Optional WPR (Windows Performance Recorder) trace
   (requires explicit consent and elevated console)
+- Optional Microsoft Defender performance recording
+  (requires explicit consent, elevated console, and the
+  DefenderPerformance module - Defender platform 4.18.2108.7 or later)
 
 All collection is gated by explicit consent prompts. Nothing runs silently.
 
 QUICK START
 -----------
-Option A (easiest):
+Option A (full collection, recommended - includes WPR trace):
+  Double-click START-HERE.bat in the extracted folder.
+  Accept the UAC (administrator) prompt. The elevated run collects
+  performance samples, processes, System events, AND a 30-second WPR
+  trace into C:\Temp\WPD-Case.
+
+Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.
   The script will ask for explicit consent before collecting anything.
+  Output goes to C:\Temp\WPD-Case (no WPR trace).
 
-Option B (manual):
+Option C (manual):
   Open PowerShell and run:
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass `
@@ -64,7 +74,7 @@ HASH VERIFICATION
 -----------------
 Verify the downloaded zip against the published SHA-256 hash:
 
-    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.2.0.zip
+    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.3.0.zip
 
 Compare the output hash to the value in the .sha256 file published alongside
 the release. They must match exactly.
@@ -81,7 +91,9 @@ SAFETY SUMMARY
 
 FILE LAYOUT
 -----------
-  Run-Diagnostics.bat            - Double-click launcher (safe from Defender)
+  Run-Diagnostics.bat            - Double-click launcher (basic, no admin)
+  START-HERE.bat                 - Double-click launcher (full + WPR trace,
+                                   self-elevates via UAC)
   src/
     Invoke-WindowsPerformanceDiagnostics.ps1  - Main diagnostics script
   docs/

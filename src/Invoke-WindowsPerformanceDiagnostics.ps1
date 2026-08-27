@@ -18,12 +18,16 @@ param(
     [switch]$ConfirmWprCapture,
 
     [ValidateSet('General')]
-    [string]$WprProfile = 'General'
+    [string]$WprProfile = 'General',
+
+    [switch]$CaptureDefender,
+
+    [switch]$ConfirmDefenderCapture
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.2.1'
+$ScriptVersion = '0.3.0'
 
 function Write-JsonFile {
     param(
@@ -97,6 +101,13 @@ if ($CaptureWpr) {
     }
 }
 
+if ($CaptureDefender) {
+    $planManifest.plannedActions += 'capture-defender-performance-etl-after-explicit-consent'
+    $planManifest.defender = [ordered]@{
+        durationSeconds = $DurationSeconds
+    }
+}
+
 if ($Mode -eq 'Plan') {
     $planPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-plan.json'
     Write-JsonFile -InputObject $planManifest -Path $planPath
@@ -110,6 +121,10 @@ if (-not $ConfirmLocalCollection) {
 
 if (-not $ConfirmWprCapture -and $CaptureWpr) {
     throw 'WPR capture requires -ConfirmWprCapture. No diagnostic data was collected.'
+}
+
+if (-not $ConfirmDefenderCapture -and $CaptureDefender) {
+    throw 'Defender performance capture requires -ConfirmDefenderCapture. No diagnostic data was collected.'
 }
 
 if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
@@ -265,6 +280,59 @@ if ($CaptureWpr) {
     }
 }
 
+$defenderStatus = $null
+$defenderStartedAtUtc = $null
+$defenderCompletedAtUtc = $null
+$defenderEtlFilePath = $null
+$defenderModuleVersion = $null
+
+if ($CaptureDefender) {
+    $defenderStatus = 'skipped-defender-module-not-found'
+    try {
+        $defenderModule = Get-Module -ListAvailable -Name DefenderPerformance
+        if ($null -eq $defenderModule) {
+            Add-CollectionError -Stage 'defender-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new('DefenderPerformance module not found; Defender performance capture skipped'),
+                'DefenderModuleNotFound',
+                [System.Management.Automation.ErrorCategory]::ObjectNotFound,
+                $null
+            ))
+        }
+        else {
+            $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $isElevated) {
+                Add-CollectionError -Stage 'defender-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                    [System.Exception]::new('requires an elevated (Administrator) console; Defender performance capture skipped'),
+                    'DefenderElevationRequired',
+                    [System.Management.Automation.ErrorCategory]::PermissionDenied,
+                    $null
+                ))
+                $defenderStatus = 'skipped-elevation-required'
+            }
+            else {
+                $defenderStartedAtUtc = Get-UtcTimestamp
+                $defenderEtlPath = Join-Path $resolvedOutputDirectory 'defender-performance.etl'
+                try {
+                    Import-Module -Name DefenderPerformance -ErrorAction Stop
+                    New-MpPerformanceRecording -RecordTo $defenderEtlPath -Seconds $DurationSeconds -ErrorAction Stop
+                    $defenderEtlFilePath = $defenderEtlPath
+                    $defenderModuleVersion = (Get-Module -Name DefenderPerformance).Version.ToString()
+                    $defenderStatus = 'completed'
+                }
+                catch {
+                    Add-CollectionError -Stage 'defender-capture' -ErrorRecord $_
+                    $defenderStatus = 'failed'
+                }
+                $defenderCompletedAtUtc = Get-UtcTimestamp
+            }
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'defender-capture' -ErrorRecord $_
+        $defenderStatus = 'failed'
+    }
+}
+
 $completedAtUtc = Get-UtcTimestamp
 $collectionManifest = [ordered]@{
     schemaVersion = '1.0'
@@ -295,6 +363,17 @@ if ($CaptureWpr) {
         startExitCode = $wprStartExitCode
         stopExitCode = $wprStopExitCode
         status = $wprStatus
+    }
+}
+
+if ($CaptureDefender) {
+    $collectionManifest.defender = [ordered]@{
+        durationSeconds = $DurationSeconds
+        etlFilePath = $defenderEtlFilePath
+        startedAtUtc = $defenderStartedAtUtc
+        completedAtUtc = $defenderCompletedAtUtc
+        moduleVersion = $defenderModuleVersion
+        status = $defenderStatus
     }
 }
 

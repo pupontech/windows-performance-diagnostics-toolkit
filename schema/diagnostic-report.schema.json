@@ -101,6 +101,35 @@
       },
       "additionalProperties": false
     },
+    "defender": {
+      "type": "object",
+      "properties": {
+        "durationSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 300
+        },
+        "etlFilePath": {
+          "type": ["string", "null"]
+        },
+        "startedAtUtc": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "completedAtUtc": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "moduleVersion": {
+          "type": ["string", "null"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "skipped-defender-module-not-found", "skipped-elevation-required", "failed"]
+        }
+      },
+      "additionalProperties": false
+    },
     "startedAtUtc": {
       "type": "string",
       "format": "date-time"

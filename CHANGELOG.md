@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0 — 2026-08-27
+
+Consent-gated Microsoft Defender performance capture.
+
+- Added `-CaptureDefender` with its own `-ConfirmDefenderCapture` consent gate: a time-bounded
+  Defender performance recording via the official `DefenderPerformance` module cmdlet
+  `New-MpPerformanceRecording -RecordTo <etl> -Seconds <duration>` (Microsoft-Antimalware-Engine
+  and NT kernel process events), elevation-required (never auto-elevates; skips with a recorded
+  error on non-elevated consoles), and a `defender` status block in the manifest
+  (`completed` / `skipped-defender-module-not-found` / `skipped-elevation-required` / `failed`).
+- Plan mode advertises the Defender capture in `plannedActions` and the plan `defender` scope
+  without invoking anything. Both consent-gated captures (WPR and Defender) can be planned in the
+  same run.
+- Documented the `defender` manifest object and the `defender-performance.etl` artifact in
+  `docs/report-schema.md`, and added live test cases WPD-12..14 to
+  `docs/windows-live-test-matrix.md`.
+- Safety contract unchanged: read-only collection, local-only, no auto-elevation, no scans or
+  exclusion changes, no remediation, no upload, no log clearing.
+
 ## 0.2.1 — 2026-08-27
 
 Bug fix release: `Run-Diagnostics.bat` failed on real Windows with `Exception calling "GetFullPath" ... "Illegal characters in path."`

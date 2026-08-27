@@ -131,9 +131,101 @@ def test_collect_with_wpr_consent_still_refuses_non_windows_hosts(tmp_path):
     assert "supported only on Windows" in result.stderr
 
 
+def test_plan_mode_with_defender_lists_capture_action_and_scope(tmp_path):
+    """Plan mode must advertise the Defender capture action without invoking it."""
+    output_directory = tmp_path / "plan-defender"
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-CaptureDefender",
+        "-OutputDirectory",
+        str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "capture-defender-performance-etl-after-explicit-consent" in manifest["plannedActions"]
+    assert manifest["defender"]["durationSeconds"] == 30
+
+
+def test_plan_mode_without_defender_has_no_defender_section(tmp_path):
+    """Plan mode must not advertise Defender capture unless -CaptureDefender is requested."""
+    output_directory = tmp_path / "plan-plain-defender"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "defender" not in manifest
+    assert "capture-defender-performance-etl-after-explicit-consent" not in manifest["plannedActions"]
+
+
+def test_plan_mode_with_wpr_and_defender_lists_both_capture_actions(tmp_path):
+    """Both consent-gated captures can be planned in the same run."""
+    output_directory = tmp_path / "plan-both"
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-CaptureWpr",
+        "-CaptureDefender",
+        "-OutputDirectory",
+        str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "capture-wpr-etl-after-explicit-consent" in manifest["plannedActions"]
+    assert "capture-defender-performance-etl-after-explicit-consent" in manifest["plannedActions"]
+    assert manifest["wpr"]["profile"] == "General"
+    assert manifest["defender"]["durationSeconds"] == 30
+
+
+def test_defender_capture_refuses_without_defender_consent(tmp_path):
+    """Defender capture is a separate consent gate from local collection, checked before any run."""
+    result = run_tool(
+        "-Mode",
+        "Collect",
+        "-ConfirmLocalCollection",
+        "-CaptureDefender",
+        "-OutputDirectory",
+        str(tmp_path / "no-defender-consent"),
+    )
+
+    assert result.returncode != 0
+    assert "requires -ConfirmDefenderCapture" in result.stderr
+
+
+def test_collect_with_defender_consent_still_refuses_non_windows_hosts(tmp_path):
+    if platform.system() == "Windows":
+        return
+
+    result = run_tool(
+        "-Mode",
+        "Collect",
+        "-ConfirmLocalCollection",
+        "-ConfirmDefenderCapture",
+        "-CaptureDefender",
+        "-OutputDirectory",
+        str(tmp_path / "linux-defender-host"),
+    )
+
+    assert result.returncode != 0
+    assert "supported only on Windows" in result.stderr
+
+
 def test_release_packaging_files_present():
-    """The deploy bundle must ship a Defender-safe launcher and unblock guidance."""
+    """The deploy bundle must ship launchers and unblock guidance."""
     assert (REPO_ROOT / "Run-Diagnostics.bat").is_file()
+    assert (REPO_ROOT / "START-HERE.bat").is_file()
     assert (REPO_ROOT / "README-FIRST.txt").is_file()
     assert (REPO_ROOT / "make-deploy-bundle.sh").is_file()
 
@@ -162,4 +254,27 @@ def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
     text = bat.decode("ascii")
     assert "-Mode Collect" in text
     assert "-ConfirmLocalCollection" in text  # consent flag must be passed explicitly
+    assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
+
+
+def test_start_here_bat_is_elevation_safe_and_quote_safe():
+    """START-HERE.bat must self-elevate via UAC, run the full collection with
+    the WPR consent flags, and stay CI-safe and quote-safe like the other bat."""
+    bat = (REPO_ROOT / "START-HERE.bat").read_bytes()
+
+    assert b"\r\n" in bat  # CRLF line endings required for .bat files
+    assert b'\\"' not in bat, "backslash-immediately-before-quote hazard in START-HERE.bat"
+    assert all(b < 128 for b in bat), "START-HERE.bat must be pure ASCII"
+
+    text = bat.decode("ascii")
+    # UAC self-elevation: net session probe + re-launch with RunAs
+    assert "net session >nul 2>&1" in text
+    assert "-Verb RunAs" in text
+    # Full elevated run: explicit collection consent + WPR consent gates
+    assert "-Mode Collect" in text
+    assert "-ConfirmLocalCollection" in text
+    assert "-CaptureWpr" in text
+    assert "-ConfirmWprCapture" in text
+    # No trailing backslash before the closing quote of -OutputDirectory
+    assert '-OutputDirectory "C:\\Temp\\WPD-Case"' in text
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard

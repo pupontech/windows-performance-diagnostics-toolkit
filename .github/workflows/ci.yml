@@ -120,6 +120,24 @@ jobs:
             }
           }
 
+      - name: Collect with consent but no Defender consent must fail
+        shell: pwsh
+        run: |
+          try {
+            & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+              -Mode Collect `
+              -ConfirmLocalCollection `
+              -CaptureDefender `
+              -OutputDirectory (Join-Path $env:TEMP "wpd-no-defender")
+            Write-Error "Expected Collect without -ConfirmDefenderCapture to fail"
+            exit 1
+          } catch {
+            if ($_.Exception.Message -notmatch "requires -ConfirmDefenderCapture") {
+              Write-Error "Unexpected error: $($_.Exception.Message)"
+              exit 1
+            }
+          }
+
       - name: Invalid OutputDirectory yields a clear error
         shell: pwsh
         run: |

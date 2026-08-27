@@ -16,6 +16,7 @@ document defines the contract for those JSON files and their companion artifacts
 | `top-processes.json` | Snapshot of the top 20 processes sorted by CPU usage, including PID, memory, and handle count. |
 | `system-events-last-24-hours.json` | System event log entries from the preceding 24 hours (up to MaxEventCount). |
 | `wpr-trace.etl` | Windows Performance Recorder ETL trace, only present when `-CaptureWpr` and `-ConfirmWprCapture` are used. |
+| `defender-performance.etl` | Microsoft Defender Antivirus performance recording (Microsoft-Antimalware-Engine and NT kernel process events), only present when `-CaptureDefender` and `-ConfirmDefenderCapture` are used. |
 
 ## Schema Versioning
 
@@ -52,6 +53,27 @@ be used during collection.
 
 In Plan mode the `wpr` object may contain only `profile` and `durationSeconds`.
 After collection the remaining fields are populated.
+
+## Defender Object
+
+The optional `defender` object appears when `-CaptureDefender` is specified. It
+describes the Microsoft Defender Antivirus performance recording requested via
+the `DefenderPerformance` module's `New-MpPerformanceRecording` cmdlet
+(`-RecordTo` with the timed `-Seconds` parameter set).
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `durationSeconds` | integer | Range 5-300. Default is 30. |
+| `etlFilePath` | string | Populated after collection completes. |
+| `startedAtUtc` | string (date-time) | ISO 8601 timestamp of recording start. |
+| `completedAtUtc` | string (date-time) | ISO 8601 timestamp of recording end. |
+| `moduleVersion` | string | `DefenderPerformance` module version used, populated after collection. |
+| `status` | string enum | One of `completed`, `skipped-defender-module-not-found`, `skipped-elevation-required`, `failed`. |
+
+In Plan mode the `defender` object contains only `durationSeconds`. After
+collection the remaining fields are populated. Recording requires an elevated
+console and the `DefenderPerformance` module (Defender platform 4.18.2108.7 or
+later, per the performance analyzer prerequisites).
 
 ## Safety Object
 

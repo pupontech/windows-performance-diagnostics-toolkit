@@ -2,9 +2,9 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.2.1
+**Version:** 0.3.0
 
-**Status:** Read-only collection MVP plus consent-gated WPR capture. It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
+**Status:** Read-only collection MVP plus consent-gated WPR and Defender performance captures. It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
 
 [![CI](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml)
 
@@ -83,14 +83,27 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
 
-The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, an optional `wpr-trace.etl`, and a manifest with SHA-256 hashes. It does **not** start Procmon/Defender recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything. On a non-elevated console, WPR capture is skipped and recorded in the manifest rather than auto-elevating.
+Capture a **bounded Microsoft Defender performance recording** (elevated console + Defender platform 4.18.2108.7 or later, its own consent gate):
+
+```powershell
+powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Collect `
+  -ConfirmLocalCollection `
+  -CaptureDefender `
+  -ConfirmDefenderCapture `
+  -DurationSeconds 30 `
+  -OutputDirectory C:\Temp\WPD-Case-001
+```
+
+The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, and a manifest with SHA-256 hashes. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
 
 ## Deployment bundle
 
 `make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from a verified clean git tree. The bundle ships:
 
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
-- `Run-Diagnostics.bat` — double-click launcher (survives Defender's Mark-of-the-Web stripping far better than a bare `.ps1`)
+- `START-HERE.bat` — double-click launcher that self-elevates via UAC and runs the full collection **including the WPR trace** (accepting the UAC prompt is the consent for `-CaptureWpr`/`-ConfirmWprCapture`)
+- `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace)
 - `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)
 - `schema\`, `docs\`, `tests\` — report contract, source map, live test matrix
 
@@ -98,9 +111,9 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 
 - ✅ Machine-readable report schema (`schema/diagnostic-report.schema.json`, `docs/report-schema.md`)
 - ✅ Consent-gated, time-bounded WPR capture (`-CaptureWpr` + `-ConfirmWprCapture`, General profile)
+- ✅ Consent-gated, time-bounded Defender performance capture (`-CaptureDefender` + `-ConfirmDefenderCapture`, official `New-MpPerformanceRecording`)
 - ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)
-- 🔜 Defender performance captures behind their own consent gate
-- 🔜 WPA-oriented analysis guidance for the captured ETL
+- ✅ WPA-oriented analysis guidance (`docs/wpa-analysis-guide.md`)
 - 🔜 Windows lab test matrix execution before any live remediation capability
 
 ## Development workflow

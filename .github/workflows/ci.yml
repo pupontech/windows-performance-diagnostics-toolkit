@@ -457,31 +457,51 @@ jobs:
           "=== WPD-11 environment evidence ($env:COMPUTERNAME) ===" | Out-File -FilePath $evidence -Encoding utf8
           "OS: $([System.Environment]::OSVersion.VersionString) (build $([System.Environment]::OSVersion.Version))" | Out-File -FilePath $evidence -Append -Encoding utf8
           "Release under test: $($state.tag)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          # This repo is PRIVATE: release assets require authentication (anonymous
-          # downloads 404). The workflow GITHUB_TOKEN has Contents:read. Windows
-          # PowerShell 5.1 Invoke-WebRequest stamps Zone.Identifier (MOTW); pwsh 7
-          # does not, so the download runs under Windows PowerShell 5.1.
-          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
-          $method = $null
+          # PRIVATE repo: release assets require the workflow token. Observed: the web
+          # releases/download route 404s for this repo even for the owner, so the
+          # canonical API asset route is used. Windows PowerShell 5.1 Invoke-WebRequest
+          # stamps Zone.Identifier (MOTW); pwsh 7 does not, so this step is 5.1.
+          $zipAsset = $null
+          $shaAsset = $null
           try {
-            Invoke-WebRequest -Uri $state.zipUrl -OutFile $state.zipPath -UseBasicParsing -Headers $headers
-            $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
-            if ($zi) { $method = 'iwr-5.1' }
-          } catch { Write-Output "IWR failed: $($_.Exception.Message)" }
-          if (-not $method) {
-            Write-Output 'IWR 5.1 did not yield a MOTW-stamped zip; trying curl.exe with token'
-            if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
-            & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: Bearer $env:GITHUB_TOKEN" $state.zipUrl
-            if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: curl.exe download failed (exit $LASTEXITCODE)" }
-            $zi = Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue
-            if ($zi) { $method = 'curl' }
+            $assetLines = gh api "repos/pupontech/windows-performance-diagnostics-toolkit/releases/tags/$($state.tag)" --jq '.assets[] | .name + "|" + .url' 2>$null
+            foreach ($l in @($assetLines)) {
+              $p = $l.Split('|', 2)
+              if ($p[0] -eq "$($state.base).zip") { $zipAsset = $p[1] }
+              if ($p[0] -eq "$($state.base).sha256") { $shaAsset = $p[1] }
+            }
+            "API probe (gh api releases/tags/$($state.tag)): zipAsset=$([bool]$zipAsset) shaAsset=$([bool]$shaAsset)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          } catch {
+            "API probe (gh api) failed: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8
           }
-          Invoke-WebRequest -Uri $state.shaUrl -OutFile $state.shaPath -UseBasicParsing -Headers $headers
+          $method = $null
+          if ($zipAsset) {
+            try {
+              Invoke-WebRequest -Uri $zipAsset -OutFile $state.zipPath -UseBasicParsing -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/octet-stream' }
+              if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'iwr-5.1' }
+            } catch { "IWR api-asset download failed: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+          }
+          if (-not $method -and $zipAsset) {
+            "IWR did not yield a MOTW-stamped zip; trying curl.exe" | Out-File -FilePath $evidence -Append -Encoding utf8
+            if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
+            & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: Bearer $env:GITHUB_TOKEN" -H "Accept: application/octet-stream" $zipAsset
+            if ($LASTEXITCODE -eq 0) {
+              if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'curl' }
+              else { "curl.exe downloaded zip but NO Zone.Identifier stamp" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+            } else { "curl.exe api-asset download failed (exit $LASTEXITCODE)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+          }
+          if (-not (Test-Path -LiteralPath $state.zipPath)) {
+            "Falling back to gh release download (exact bytes, but NO MOTW stamp expected)" | Out-File -FilePath $evidence -Append -Encoding utf8
+            gh release download $state.tag -R pupontech/windows-performance-diagnostics-toolkit -p "$($state.base).zip" -p "$($state.base).sha256" -D $env:WPD11_WORK --clobber
+            $method = 'gh-release-download'
+          } elseif (-not (Test-Path -LiteralPath $state.shaPath)) {
+            gh release download $state.tag -R pupontech/windows-performance-diagnostics-toolkit -p "$($state.base).sha256" -D $env:WPD11_WORK --clobber
+          }
           if ($method) {
             $zoneId = ((Get-Content -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^ZoneId=' }) -join ';'
-            "MOTW: Zone.Identifier present on downloaded zip ($method download) [$zoneId]" | Out-File -FilePath $evidence -Append -Encoding utf8
+            "MOTW: zip downloaded via $method [Zone.Identifier: $zoneId]" | Out-File -FilePath $evidence -Append -Encoding utf8
           } else {
-            "MOTW: NO Zone.Identifier after iwr-5.1 and curl - scenario not reproducible on this runner" | Out-File -FilePath $evidence -Append -Encoding utf8
+            "MOTW: zip download did not produce Zone.Identifier - scenario not reproducible on this runner" | Out-File -FilePath $evidence -Append -Encoding utf8
           }
           $zip = Get-Item -LiteralPath $state.zipPath
           "Zip size: $($zip.Length) bytes" | Out-File -FilePath $evidence -Append -Encoding utf8
@@ -496,7 +516,10 @@ jobs:
             "DisableRealtimeMonitoring: $($pref.DisableRealtimeMonitoring)" | Out-File -FilePath $evidence -Append -Encoding utf8
           } catch { "Get-MpPreference unavailable: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
           Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11ENV: $_" }
-          if (-not $method) { throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner (iwr-5.1 + curl both unstamped)' }
+          if (-not (Test-Path -LiteralPath $state.zipPath)) { throw 'WPD-11 FAIL: release zip could not be acquired on this runner (IWR + curl + gh release download all failed; see wpd-11-evidence.log)' }
+          if (-not $method -or $method -eq 'gh-release-download') {
+            throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner; MOTW leg requires a real internet download'
+          }
 
       - name: WPD-11 - zip hash must match the .sha256 asset
         shell: pwsh

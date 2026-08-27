@@ -252,8 +252,14 @@ jobs:
             "start exit code: $LASTEXITCODE" | Out-File -FilePath $diag -Append -Encoding utf8
             & $wprExe -stop (Join-Path $logsDir 'wpr-diag-trace.etl') 2>&1 | Out-File -FilePath $diag -Append -Encoding utf8
             "stop exit code: $LASTEXITCODE" | Out-File -FilePath $diag -Append -Encoding utf8
+            "--- raw wpr -start GeneralProfile -filemode ---" | Out-File -FilePath $diag -Append -Encoding utf8
+            & $wprExe -start GeneralProfile -filemode 2>&1 | Out-File -FilePath $diag -Append -Encoding utf8
+            "start exit code: $LASTEXITCODE" | Out-File -FilePath $diag -Append -Encoding utf8
+            & $wprExe -stop (Join-Path $logsDir 'wpr-diag-generalprofile-trace.etl') 2>&1 | Out-File -FilePath $diag -Append -Encoding utf8
+            "stop exit code: $LASTEXITCODE" | Out-File -FilePath $diag -Append -Encoding utf8
           }
           Get-Content -LiteralPath $diag | ForEach-Object { Write-Output "WPRDIAG: $_" }
+          exit 0
 
       - name: WPD-10 - WPR capture from elevated console
         shell: pwsh

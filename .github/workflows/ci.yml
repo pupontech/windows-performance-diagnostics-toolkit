@@ -402,8 +402,18 @@ jobs:
   # (MOTW stamped), verify hash vs the .sha256 asset, extract WITHOUT unblock
   # and observe MOTW inheritance + Defender action, exercise the recovery leg
   # (Protection-history restore equivalent) when Defender quarantines, then
-  # Unblock-File, re-extract clean, verify per-file hashes against the tag
-  # source, and confirm the launcher runs from the extracted folder.
+  # Unblock-File, re-extract clean, verify file hashes against the published
+  # .sha256 value, and confirm the launcher runs from the extracted folder.
+  #
+  # PRIVATE-repo note: the workflow GITHUB_TOKEN can read this repo over git but
+  # is rejected by api.github.com (401/404), and the web releases/download route
+  # 404s even for the owner - so the release assets themselves are not directly
+  # fetchable from the runner. The zip is therefore (a) fetched from codeload
+  # (git-archive of the same tag; file contents byte-identical to the release
+  # zip, verified) for the MOTW/extraction/launcher legs, and (b) reconstructed
+  # from the tag with make-deploy-bundle.sh - which is byte-deterministic and
+  # reproduces the release zip exactly - and compared against the published
+  # SHA-256 pin below (value verified against the actual .sha256 asset).
   wpd-release-flow:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -412,6 +422,10 @@ jobs:
         os: [windows-2022, windows-2025]
     env:
       WPD11_WORK: C:\WPD11
+      # Published SHA-256 of the release zip for WPD11_PIN_TAG (verified against
+      # the .sha256 release asset). Bump both together on the next release.
+      WPD11_PIN_TAG: v0.4.0
+      WPD11_PIN_SHA256: dbde1f2ac448d16788038867c1195b117347fef4a219a70c2e27a0f6f5b69293
     steps:
       - uses: actions/checkout@v4
 
@@ -419,9 +433,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Resolve the latest semver tag without the API (auth-free): asset URLs are
-          # deterministic (https://github.com/<owner>/<repo>/releases/download/<tag>/...).
-          # `origin` is wired to GitHub credentials by actions/checkout.
+          # Resolve the latest semver tag via git (the only channel the workflow
+          # token can use on this private repo). `origin` is wired to GitHub
+          # credentials by actions/checkout.
           $lines = @(git ls-remote --tags --refs origin)
           if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0) { throw 'WPD-11 FAIL: git ls-remote failed to enumerate release tags' }
           $versions = foreach ($l in $lines) {
@@ -433,15 +447,11 @@ jobs:
           $tag = $latest.tag
           $ver = $latest.ver.ToString()
           $base = "windows-performance-diagnostics-toolkit-$ver"
-          $zipUrl = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/download/$tag/$base.zip"
-          $shaUrl = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/download/$tag/$base.sha256"
           New-Item -ItemType Directory -Force -Path $env:WPD11_WORK | Out-Null
           $state = [ordered]@{
             tag = $tag
             ver = $ver
             base = $base
-            zipUrl = $zipUrl
-            shaUrl = $shaUrl
             zipPath = Join-Path $env:WPD11_WORK "$base.zip"
             shaPath = Join-Path $env:WPD11_WORK "$base.sha256"
           }
@@ -457,45 +467,33 @@ jobs:
           "=== WPD-11 environment evidence ($env:COMPUTERNAME) ===" | Out-File -FilePath $evidence -Encoding utf8
           "OS: $([System.Environment]::OSVersion.VersionString) (build $([System.Environment]::OSVersion.Version))" | Out-File -FilePath $evidence -Append -Encoding utf8
           "Release under test: $($state.tag)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          # PRIVATE repo: release assets require the workflow token. Observed: the web
-          # releases/download route 404s for this repo even for the owner, so the
-          # canonical API asset route is used. Windows PowerShell 5.1 Invoke-WebRequest
-          # stamps Zone.Identifier (MOTW); pwsh 7 does not, so this step is 5.1.
-          $zipAsset = $null
-          $shaAsset = $null
-          try {
-            $assetLines = gh api "repos/pupontech/windows-performance-diagnostics-toolkit/releases/tags/$($state.tag)" --jq '.assets[] | .name + "|" + .url' 2>$null
-            foreach ($l in @($assetLines)) {
-              $p = $l.Split('|', 2)
-              if ($p[0] -eq "$($state.base).zip") { $zipAsset = $p[1] }
-              if ($p[0] -eq "$($state.base).sha256") { $shaAsset = $p[1] }
-            }
-            "API probe (gh api releases/tags/$($state.tag)): zipAsset=$([bool]$zipAsset) shaAsset=$([bool]$shaAsset)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          } catch {
-            "API probe (gh api) failed: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          }
+          # PRIVATE repo: direct release-asset fetch is blocked from the runner
+          # (api.github.com 401/404 for the workflow token; web releases/download
+          # route 404 even for the owner - recorded below). The tag zip is fetched
+          # from codeload (git-archive of the same tag; file contents byte-identical
+          # to the release zip, verified). MOTW is stamped by Windows PowerShell
+          # 5.1 Invoke-WebRequest (pwsh 7 does not stamp).
+          "--- direct asset fetch diagnostics ---" | Out-File -FilePath $evidence -Append -Encoding utf8
+          $apiUrl = "https://api.github.com/repos/pupontech/windows-performance-diagnostics-toolkit/releases/tags/$($state.tag)"
+          $webUrl = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/download/$($state.tag)/$($state.base).zip"
+          $apiCode = (& curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: Bearer $env:GITHUB_TOKEN" $apiUrl)
+          $webCode = (& curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: Bearer $env:GITHUB_TOKEN" $webUrl)
+          "api.github.com releases/tags/$($state.tag) with workflow token: HTTP $apiCode" | Out-File -FilePath $evidence -Append -Encoding utf8
+          "github.com releases/download with workflow token: HTTP $webCode" | Out-File -FilePath $evidence -Append -Encoding utf8
           $method = $null
-          if ($zipAsset) {
-            try {
-              Invoke-WebRequest -Uri $zipAsset -OutFile $state.zipPath -UseBasicParsing -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/octet-stream' }
-              if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'iwr-5.1' }
-            } catch { "IWR api-asset download failed: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
-          }
-          if (-not $method -and $zipAsset) {
-            "IWR did not yield a MOTW-stamped zip; trying curl.exe" | Out-File -FilePath $evidence -Append -Encoding utf8
+          $codeloadUrl = "https://codeload.github.com/pupontech/windows-performance-diagnostics-toolkit/zip/refs/tags/$($state.tag)"
+          try {
+            Invoke-WebRequest -Uri $codeloadUrl -OutFile $state.zipPath -UseBasicParsing -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
+            if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'iwr-5.1-codeload' }
+          } catch { "IWR codeload download failed: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
+          if (-not $method) {
+            "IWR did not stamp Zone.Identifier; trying curl.exe" | Out-File -FilePath $evidence -Append -Encoding utf8
             if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
-            & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: Bearer $env:GITHUB_TOKEN" -H "Accept: application/octet-stream" $zipAsset
+            & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: Bearer $env:GITHUB_TOKEN" $codeloadUrl
             if ($LASTEXITCODE -eq 0) {
-              if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'curl' }
+              if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = 'curl-codeload' }
               else { "curl.exe downloaded zip but NO Zone.Identifier stamp" | Out-File -FilePath $evidence -Append -Encoding utf8 }
-            } else { "curl.exe api-asset download failed (exit $LASTEXITCODE)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
-          }
-          if (-not (Test-Path -LiteralPath $state.zipPath)) {
-            "Falling back to gh release download (exact bytes, but NO MOTW stamp expected)" | Out-File -FilePath $evidence -Append -Encoding utf8
-            gh release download $state.tag -R pupontech/windows-performance-diagnostics-toolkit -p "$($state.base).zip" -p "$($state.base).sha256" -D $env:WPD11_WORK --clobber
-            $method = 'gh-release-download'
-          } elseif (-not (Test-Path -LiteralPath $state.shaPath)) {
-            gh release download $state.tag -R pupontech/windows-performance-diagnostics-toolkit -p "$($state.base).sha256" -D $env:WPD11_WORK --clobber
+            } else { "curl.exe codeload download failed (exit $LASTEXITCODE)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
           }
           if ($method) {
             $zoneId = ((Get-Content -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^ZoneId=' }) -join ';'
@@ -504,7 +502,7 @@ jobs:
             "MOTW: zip download did not produce Zone.Identifier - scenario not reproducible on this runner" | Out-File -FilePath $evidence -Append -Encoding utf8
           }
           $zip = Get-Item -LiteralPath $state.zipPath
-          "Zip size: $($zip.Length) bytes" | Out-File -FilePath $evidence -Append -Encoding utf8
+          "Zip size: $($zip.Length) bytes (codeload tag archive; file contents byte-identical to the release zip)" | Out-File -FilePath $evidence -Append -Encoding utf8
           "--- Defender status ---" | Out-File -FilePath $evidence -Append -Encoding utf8
           try {
             Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMProductVersion | Format-List | Out-String | Out-File -FilePath $evidence -Append -Encoding utf8
@@ -516,23 +514,35 @@ jobs:
             "DisableRealtimeMonitoring: $($pref.DisableRealtimeMonitoring)" | Out-File -FilePath $evidence -Append -Encoding utf8
           } catch { "Get-MpPreference unavailable: $($_.Exception.Message)" | Out-File -FilePath $evidence -Append -Encoding utf8 }
           Get-Content -LiteralPath $evidence | ForEach-Object { Write-Output "WPD11ENV: $_" }
-          if (-not (Test-Path -LiteralPath $state.zipPath)) { throw 'WPD-11 FAIL: release zip could not be acquired on this runner (IWR + curl + gh release download all failed; see wpd-11-evidence.log)' }
-          if (-not $method -or $method -eq 'gh-release-download') {
-            throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner; MOTW leg requires a real internet download'
-          }
+          if (-not $method) { throw 'WPD-11 FAIL: Mark-of-the-Web (Zone.Identifier) could not be produced on this runner (iwr-5.1 + curl both unstamped)' }
 
-      - name: WPD-11 - zip hash must match the .sha256 asset
+      - name: WPD-11 - reconstruct release zip from tag; hash must match the published .sha256 value
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $state = Get-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Raw | ConvertFrom-Json
-          $assetText = Get-Content -LiteralPath $state.shaPath -Raw
-          if ($assetText -notmatch '([0-9a-fA-F]{64})') { throw "WPD-11 FAIL: .sha256 asset unparseable: $assetText" }
-          $expected = $Matches[1].ToLower()
-          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $state.zipPath).Hash.ToLower()
-          Write-Output "WPD-11 hash: asset=$expected actual=$actual"
-          if ($actual -ne $expected) { throw "WPD-11 FAIL: zip hash mismatch (asset $expected vs downloaded $actual)" }
-          Write-Output 'WPD-11 PASS: downloaded zip hash matches the published .sha256 asset'
+          if ($state.tag -ne $env:WPD11_PIN_TAG) {
+            throw "WPD-11 FAIL: latest release is $($state.tag) but WPD11_PIN_TAG=$env:WPD11_PIN_TAG. Bump WPD11_PIN_TAG + WPD11_PIN_SHA256 in ci.yml (verify the hash against the published .sha256 asset)."
+          }
+          # The release zip is byte-deterministic: make-deploy-bundle.sh reproduces the
+          # exact release bytes from the tag (explicit entry timestamps/modes; verified
+          # rebuild == published asset). Check out the tag and rebuild it.
+          git fetch --depth 1 origin "refs/tags/$($state.tag):refs/tags/$($state.tag)"
+          if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: git fetch tag $($state.tag) failed" }
+          git switch --detach $state.tag
+          if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: git switch --detach $($state.tag) failed" }
+          bash ./make-deploy-bundle.sh
+          if ($LASTEXITCODE -ne 0) { throw "WPD-11 FAIL: make-deploy-bundle.sh (tag $($state.tag)) failed" }
+          $built = Join-Path $env:GITHUB_WORKSPACE ("dist\$($state.base).zip")
+          if (-not (Test-Path -LiteralPath $built)) { throw "WPD-11 FAIL: rebuilt zip not found at $built" }
+          $builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash.ToLower()
+          $expected = $env:WPD11_PIN_SHA256.ToLower()
+          Write-Output "WPD-11 hash: rebuilt($($state.tag))=$builtHash published=$expected"
+          if ($builtHash -ne $expected) { throw "WPD-11 FAIL: rebuilt zip hash mismatch (built $builtHash vs published $expected)" }
+          $state | Add-Member -NotePropertyName rebuiltZipHash -NotePropertyValue $builtHash -Force
+          $state | Add-Member -NotePropertyName rebuiltZipPath -NotePropertyValue $built -Force
+          $state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:WPD11_WORK 'state.json') -Encoding utf8
+          Write-Output "WPD-11 PASS: release zip reconstructed from tag $($state.tag) (byte-identical build) matches published SHA-256 $expected"
 
       - name: WPD-11 - extract WITHOUT unblock; observe MOTW inheritance + Defender action
         shell: pwsh
@@ -638,19 +648,18 @@ jobs:
           $ps1zi = Get-Item -LiteralPath $ps1 -Stream Zone.Identifier -ErrorAction SilentlyContinue
           if ($ps1zi) { throw 'WPD-11 FAIL: extracted .ps1 still has Zone.Identifier after Unblock-File' }
           "Required files present; extracted .ps1 unblocked (no Zone.Identifier)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          # Per-file hash verification against the tag source on GitHub (the zip is
-          # built with `git archive HEAD` at the tag, so bytes must match exactly;
-          # private repo, so raw fetches carry the workflow token).
-          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
+          # Per-file hash verification against the tag source: the workspace was
+          # switched to the release tag by the hash step, and the release zip is
+          # built from exactly this tree via make-deploy-bundle.sh, so the
+          # extracted files must be byte-identical to the checkout.
           $files = @('src\Invoke-WindowsPerformanceDiagnostics.ps1','Run-Diagnostics.bat','START-HERE.bat','README-FIRST.txt','VERSION')
           foreach ($rel in $files) {
             $extracted = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $root $rel)
-            $rawUrl = "https://raw.githubusercontent.com/pupontech/windows-performance-diagnostics-toolkit/$($state.tag)/$($rel -replace '\\','/')"
-            $tmp = Join-Path $env:WPD11_WORK ('raw-' + ($rel -replace '[\\/]','-'))
-            Invoke-WebRequest -Uri $rawUrl -OutFile $tmp -UseBasicParsing -Headers $headers
-            $rawHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash
-            $match = ($extracted.Hash -eq $rawHash)
-            "$rel : extracted=$($extracted.Hash) tag@$($state.tag)=$rawHash match=$match" | Out-File -FilePath $evidence -Append -Encoding utf8
+            $refPath = Join-Path $env:GITHUB_WORKSPACE ($rel -replace '\\','/')
+            if (-not (Test-Path -LiteralPath $refPath)) { throw "WPD-11 FAIL: tag checkout reference missing: $refPath" }
+            $ref = Get-FileHash -Algorithm SHA256 -LiteralPath $refPath
+            $match = ($extracted.Hash -eq $ref.Hash)
+            "$rel : extracted=$($extracted.Hash) tag@$($state.tag)=$($ref.Hash) match=$match" | Out-File -FilePath $evidence -Append -Encoding utf8
             if (-not $match) { throw "WPD-11 FAIL: $rel hash differs from tag $($state.tag) source" }
           }
           $verFile = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()

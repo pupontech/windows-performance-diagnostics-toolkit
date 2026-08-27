@@ -31,7 +31,7 @@ mkdir -p "$STAGE_DIR"
 git archive --format=tar HEAD | tar -x -C "$STAGE_DIR"
 
 python3 - <<'PYEOF'
-import os, zipfile, sys
+import os, zipfile, sys, subprocess, datetime
 
 stage = os.environ.get("STAGE_DIR", "")
 zip_path = os.environ.get("ZIP_FILE", "")
@@ -39,6 +39,18 @@ zip_path = os.environ.get("ZIP_FILE", "")
 if not stage or not zip_path:
     print("ERROR: STAGE_DIR or ZIP_FILE not set", file=sys.stderr)
     sys.exit(1)
+
+# Deterministic zip entries: every entry uses the HEAD commit time expressed in
+# the release-build timezone (UTC+2, the build host's local time) and the mode
+# of the tar entries git archive emits (0664/0775). Explicit values make the
+# zip byte-identical on any platform/OS/TZ (CI runners are UTC by default), so
+# the release asset can be reproduced and verified in CI via the .sha256 asset.
+commit_ts = int(subprocess.check_output(["git", "show", "-s", "--format=%ct", "HEAD"]).decode().strip())
+base_dt = datetime.datetime.fromtimestamp(
+    commit_ts, tz=datetime.timezone(datetime.timedelta(hours=2)))
+entry_dt = (base_dt.year, base_dt.month, base_dt.day,
+            base_dt.hour, base_dt.minute, base_dt.second)
+FILE_ATTR = (0o100664 << 16)  # matches git archive's 0664 for regular files
 
 stage = stage.rstrip("/") + "/"
 parent = os.path.dirname(stage.rstrip("/")) + "/"
@@ -55,9 +67,13 @@ entries.sort(key=lambda e: e[0])
 os.makedirs(os.path.dirname(zip_path) or ".", exist_ok=True)
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
     for arcname, full in entries:
-        zf.write(full, arcname)
+        info = zipfile.ZipInfo(arcname, date_time=entry_dt)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = FILE_ATTR
+        with open(full, "rb") as fh:
+            zf.writestr(info, fh.read())
 
-print(f"Created {zip_path} with {len(entries)} entries")
+print(f"Created {zip_path} with {len(entries)} entries (timestamp {entry_dt})")
 PYEOF
 
 (cd "$OUT_DIR" && sha256sum "${ARTIFACT}.zip" > "${ARTIFACT}.sha256")

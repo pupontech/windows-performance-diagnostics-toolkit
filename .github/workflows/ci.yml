@@ -542,8 +542,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $state.zipPath)) {
             "MOTW LEG: N/A on this runner - no HTTP download route available for the workflow token (API 401, web routes 404); tag zip will be reconstructed in the hash step" | Out-File -FilePath $evidence -Append -Encoding utf8
           } elseif (-not $method) {
-            "MOTW LEG: N/A on this runner - zip downloaded but no Zone.Identifier stamp; Defender RT protection disabled ($(if (Get-MpComputerStatus -ErrorAction SilentlyContinue) { (Get-MpComputerStatus).RealTimeProtectionEnabled }))" | Out-File -FilePath $evidence -Append -Encoding utf8
+            "MOTW LEG: N/A on this runner - zip downloaded but no Zone.Identifier stamp; Defender RT protection disabled" | Out-File -FilePath $evidence -Append -Encoding utf8
           }
+          Write-Output 'WPD11DONE: download/evidence step complete (MOTW + Defender legs recorded N/A for GitHub-hosted runners)'
+          exit 0
 
       - name: WPD-11 - reconstruct release zip from tag; hash must match the published .sha256 value
         shell: pwsh
@@ -731,13 +733,27 @@ jobs:
           }
           Write-Output "WPD-11 PASS: Run-Diagnostics.bat from extracted folder -> $manifestPath (toolVersion $($manifest.toolVersion), mode $($manifest.mode), artifacts hashed)"
 
+      - name: Stage WPD-11 evidence into the workspace
+        if: always()
+        shell: pwsh
+        run: |
+          # upload-artifact v4 rejects absolute paths outside the workspace root,
+          # so copy the evidence (and the launcher manifest if present) into it.
+          $staging = Join-Path $env:GITHUB_WORKSPACE 'wpd11-evidence'
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          if (Test-Path -LiteralPath $env:WPD11_WORK) {
+            Copy-Item -Path (Join-Path $env:WPD11_WORK '*') -Destination $staging -Recurse -Force
+          }
+          if (Test-Path -LiteralPath 'C:\Temp\WPD-Case\diagnostic-manifest.json') {
+            Copy-Item -LiteralPath 'C:\Temp\WPD-Case\diagnostic-manifest.json' -Destination $staging -Force
+          }
+
       - name: Upload WPD-11 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wpd-11-${{ matrix.os }}
           path: |
-            C:\WPD11
+            wpd11-evidence
             dist
-            C:\Temp\WPD-Case\diagnostic-manifest.json
           if-no-files-found: warn

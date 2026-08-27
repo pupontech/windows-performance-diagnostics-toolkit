@@ -158,17 +158,33 @@ jobs:
         shell: cmd
         run: call Run-Diagnostics.bat
 
-      - name: Assert launcher produced the diagnostic manifest
+      - name: Run the START-HERE menu in auto mode (option 2, basic collect)
+        shell: cmd
+        run: call START-HERE.bat 2
+
+      - name: Run the START-HERE menu in auto mode (option 4, plan only)
+        shell: cmd
+        run: call START-HERE.bat 4
+
+      - name: Assert launchers produced the diagnostic artifacts
         shell: pwsh
         run: |
           $manifest = "C:\Temp\WPD-Case\diagnostic-manifest.json"
-          if (-not (Test-Path -LiteralPath $manifest)) {
-            Write-Error "Run-Diagnostics.bat did not produce $manifest"
+          $plan = "C:\Temp\WPD-Case\diagnostic-plan.json"
+          foreach ($file in @($manifest, $plan)) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              Write-Error "Launcher did not produce $file"
+              exit 1
+            }
+          }
+          $m = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          if ($m.mode -ne "Collect") {
+            Write-Error "Unexpected manifest mode: $($m.mode)"
             exit 1
           }
-          $plan = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-          if ($plan.mode -ne "Collect") {
-            Write-Error "Unexpected manifest mode: $($plan.mode)"
+          $p = Get-Content -LiteralPath $plan -Raw | ConvertFrom-Json
+          if ($p.mode -ne "Plan") {
+            Write-Error "Unexpected plan mode: $($p.mode)"
             exit 1
           }
-          Write-Output "Launcher OK: $manifest (mode $($plan.mode), toolVersion $($plan.toolVersion))"
+          Write-Output "Launchers OK: $manifest (toolVersion $($m.toolVersion)), $plan (toolVersion $($p.toolVersion))"

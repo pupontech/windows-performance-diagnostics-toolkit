@@ -102,7 +102,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 `make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from a verified clean git tree. The bundle ships:
 
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
-- `START-HERE.bat` — double-click launcher that self-elevates via UAC and runs the full collection **including the WPR trace** (accepting the UAC prompt is the consent for `-CaptureWpr`/`-ConfirmWprCapture`)
+- `START-HERE.bat` — double-click console menu: UAC self-elevation, then 1) Full+WPR trace, 2) Basic, 3) Full+WPR+Defender recording, 4) Plan preview, 5) Exit; every run logged to `C:\Temp\WPD-Case\diagnostics-run.log`
 - `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace)
 - `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)
 - `schema\`, `docs\`, `tests\` — report contract, source map, live test matrix

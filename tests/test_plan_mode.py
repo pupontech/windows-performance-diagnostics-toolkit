@@ -258,8 +258,9 @@ def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
 
 
 def test_start_here_bat_is_elevation_safe_and_quote_safe():
-    """START-HERE.bat must self-elevate via UAC, run the full collection with
-    the WPR consent flags, and stay CI-safe and quote-safe like the other bat."""
+    """START-HERE.bat must self-elevate via UAC, present a console menu, run the
+    selected collection with the WPR/Defender consent flags, and stay CI-safe
+    and quote-safe like the other bat."""
     bat = (REPO_ROOT / "START-HERE.bat").read_bytes()
 
     assert b"\r\n" in bat  # CRLF line endings required for .bat files
@@ -270,11 +271,24 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     # UAC self-elevation: net session probe + re-launch with RunAs
     assert "net session >nul 2>&1" in text
     assert "-Verb RunAs" in text
-    # Full elevated run: explicit collection consent + WPR consent gates
+    # CI must never hang on UAC: guard the elevation attempt
+    assert 'if "%CI%"=="true"' in text
+    # Console menu with the five options
+    for option in ("1 - Full collection", "2 - Basic collection",
+                   "3 - Full + WPR + Defender", "4 - Plan preview", "5 - Exit"):
+        assert option in text, f"missing menu option {option!r}"
+    # Consent flags must be passed explicitly per option
     assert "-Mode Collect" in text
     assert "-ConfirmLocalCollection" in text
     assert "-CaptureWpr" in text
     assert "-ConfirmWprCapture" in text
+    assert "-CaptureDefender" in text
+    assert "-ConfirmDefenderCapture" in text
+    # Defender-strip resilience: pre-flight existence check with recovery steps
+    assert "src\\Invoke-WindowsPerformanceDiagnostics.ps1 was not found" in text
+    # Result visibility: log everything with Tee-Object, never a silent failure
+    assert "Tee-Object" in text
+    assert "diagnostic-manifest.json" in text
     # No trailing backslash before the closing quote of -OutputDirectory
-    assert '-OutputDirectory "C:\\Temp\\WPD-Case"' in text
+    assert '-OutputDirectory \'%OUTDIR%\'' in text
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard

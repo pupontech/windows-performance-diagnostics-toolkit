@@ -27,7 +27,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.0'
+$ScriptVersion = '0.3.1'
 
 function Write-JsonFile {
     param(

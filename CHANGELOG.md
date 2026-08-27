@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 — 2026-08-27
+
+START-HERE.bat rebuilt as a console menu (the "GUI" of the toolkit) and now tested in GitHub VMs.
+
+- `START-HERE.bat` now presents a numbered menu (1 Full+WPR / 2 Basic / 3 Full+WPR+Defender / 4 Plan preview / 5 Exit) after the UAC self-elevation prompt, instead of a bare single run.
+- Pre-flight check: if `src\Invoke-WindowsPerformanceDiagnostics.ps1` is missing (Defender Mark-of-the-Web can strip downloaded `.ps1` files), the bat prints the Unblock/Protection-history recovery steps instead of failing silently.
+- Every run is tee'd to `C:\Temp\WPD-Case\diagnostics-run.log` so results are always visible; the bat verifies `diagnostic-manifest.json` was produced and reports the artifact list.
+- CI-safe: menu supports auto-args (`START-HERE.bat 2`, `START-HERE.bat 4`), UAC elevation is guarded under CI, pause is skipped under CI.
+- GitHub VM testing: `windows-verify` now executes the START-HERE menu in auto mode (options 2 and 4) on windows-2022/2025 and asserts both the manifest and the plan JSON.
+- Safety contract unchanged.
+
 ## 0.3.0 — 2026-08-27
 
 Consent-gated Microsoft Defender performance capture.

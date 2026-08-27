@@ -22,11 +22,16 @@ All collection is gated by explicit consent prompts. Nothing runs silently.
 
 QUICK START
 -----------
-Option A (full collection, recommended - includes WPR trace):
+Option A (full collection, recommended):
   Double-click START-HERE.bat in the extracted folder.
-  Accept the UAC (administrator) prompt. The elevated run collects
-  performance samples, processes, System events, AND a 30-second WPR
-  trace into C:\Temp\WPD-Case.
+  Accept the UAC (administrator) prompt, then choose from the menu:
+    1 - Full collection + WPR trace        (recommended)
+    2 - Basic collection                   (no WPR)
+    3 - Full + WPR + Defender recording    (needs DefenderPerformance module)
+    4 - Plan preview only                  (writes plan, collects nothing)
+    5 - Exit
+  Every run is logged to C:\Temp\WPD-Case\diagnostics-run.log so the
+  result is always visible, even if the window closes.
 
 Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.

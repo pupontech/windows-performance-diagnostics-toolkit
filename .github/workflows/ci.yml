@@ -198,6 +198,20 @@ jobs:
             Write-Error "Unexpected bootFailureLogs block: $($m.bootFailureLogs | ConvertTo-Json -Compress)"
             exit 1
           }
+          if ($m.package.enabled -ne $true -or $m.package.status -notin @("completed","failed")) {
+            Write-Error "Unexpected package block: $($m.package | ConvertTo-Json -Compress)"
+            exit 1
+          }
+          if ($m.package.status -eq "completed") {
+            if (-not (Test-Path -LiteralPath $m.package.zipPath)) {
+              Write-Error "Case package zip missing at $($m.package.zipPath)"
+              exit 1
+            }
+            if ($m.package.sha256 -notmatch "^[A-Fa-f0-9]{64}$") {
+              Write-Error "Case package sha256 malformed: $($m.package.sha256)"
+              exit 1
+            }
+          }
           if ($m.network.dnsVsPing.verdict -notin @("dns-and-connectivity-ok","dns-failure","icmp-blocked-or-partial","connectivity-failure","inconclusive")) {
             Write-Error "Unexpected dnsVsPing verdict: $($m.network.dnsVsPing.verdict)"
             exit 1

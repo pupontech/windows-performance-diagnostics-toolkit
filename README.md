@@ -95,7 +95,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
 
-The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and a manifest with SHA-256 hashes. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
+The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and a manifest with SHA-256 hashes. With `-ZipOutput` it also packages this run's certified evidence (artifacts + manifest) into a timestamped case zip next to the output folder — stale files from reused folders are never included. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
 
 ## Deployment bundle
 
@@ -113,6 +113,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - ✅ Consent-gated, time-bounded WPR capture (`-CaptureWpr` + `-ConfirmWprCapture`, `GeneralProfile` or `CPU`/`DiskIO`/`FileIO`/`Network`/`Power`/`GPU`/`Registry`)
 - ✅ Consent-gated, time-bounded Defender performance capture (`-CaptureDefender` + `-ConfirmDefenderCapture`, official `New-MpPerformanceRecording`)
 - ✅ Consent-gated crash-evidence stages (`-CollectMinidumps` + `-ConfirmMinidumpCollection`, `-CollectBootFailureLogs` + `-ConfirmBootFailureLogCollection`; WinRE runbook in `docs/winre-boot-failure-runbook.md`)
+- ✅ Case packaging (`-ZipOutput` — zips only this run's whitelisted artifacts + manifest, `docs/zip-output.md`)
 - ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)
 - ✅ WPA-oriented analysis guidance (`docs/wpa-analysis-guide.md`)
 - 🔜 Windows lab test matrix execution before any live remediation capability

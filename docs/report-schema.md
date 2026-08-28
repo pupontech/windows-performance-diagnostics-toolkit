@@ -118,6 +118,30 @@ component-servicing/setup logs. Oversized logs are recorded with
 
 Each copied log is certified in the `artifacts` list as `bootfailure\<leaf>`.
 
+## Package Object
+
+The optional `package` object appears when `-ZipOutput` is specified. It
+describes the case zip produced after collection: a wrapper containing **only
+this run's whitelisted artifacts plus the manifest** (stale files in a reused
+output folder are never included — the zip certifies only this run's evidence).
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `destination` | string | Plan mode: parent directory of the output folder. |
+| `namePattern` | string | Plan mode: `<output-leaf>-<UTC-stamp>.zip`. |
+| `includesManifest` | boolean | The zip always contains `diagnostic-manifest.json`. |
+| `enabled` | boolean | Collect mode only. |
+| `status` | string enum | Collect mode only: `completed`, `failed`. |
+| `zipPath` | string | Full path of the produced zip (Collect mode). |
+| `sizeBytes` | integer | Zip size (Collect mode). |
+| `sha256` | string (64 hex) | Zip hash (Collect mode). |
+
+The `package` block is written back into the manifest **on disk** after the zip
+is produced; the copy of the manifest inside the zip is the pre-package version
+(the wrapper is described by the manifest, not vice versa). A failed packaging
+attempt still records `status: "failed"` with a `case-package` entry in
+`collectionErrors`.
+
 ## Safety Object
 
 Every manifest includes a `safety` object that declares the tool's runtime

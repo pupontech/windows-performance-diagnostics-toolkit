@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Case packaging (`-ZipOutput`)**: after Collect, this run's certified evidence (whitelisted artifacts + `diagnostic-manifest.json`) is zipped into `<output-leaf>-<UTC-stamp>.zip` next to the output folder (pattern from the RemoteDiagnostics `pull-local-logs.ps1` zip-to-desktop behavior). Only files written this run are packaged — stale files in a reused `C:\Temp\WPD-Case` never leak into the zip. The `package` block (path, size, SHA-256) is written back into the manifest on disk; a failed packaging attempt records `status: "failed"` and a `case-package` entry in `collectionErrors`. Plan mode advertises `package-local-case-folder-into-zip` with the destination and name pattern. No separate consent gate (packaging is a local file operation on already-collected evidence). START-HERE options 1/2/3/5 and Run-Diagnostics.bat pass `-ZipOutput`.
+
 ## 0.6.0 — 2026-08-28
 
 Consent-gated crash-evidence stages (patterns adopted from the field-tested RemoteDiagnostics kit: `pull-minidumps.ps1` + `Pull-BootFailureLogs.bat`).

@@ -67,20 +67,20 @@ echo.
 goto :end
 
 :opt_full
-set "EXTRA=-CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection"
+set "EXTRA=-CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
 goto :run
 
 :opt_basic
-set "EXTRA="
+set "EXTRA=-ZipOutput"
 goto :run
 
 :opt_defender
-set "EXTRA=-CaptureWpr -ConfirmWprCapture -CaptureDefender -ConfirmDefenderCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection"
+set "EXTRA=-CaptureWpr -ConfirmWprCapture -CaptureDefender -ConfirmDefenderCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
 goto :run
 
 :opt_crash
 echo Collecting minidumps and boot-failure evidence only...
-set "EXTRA=-CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection"
+set "EXTRA=-CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
 goto :run
 
 :opt_plan
@@ -117,6 +117,7 @@ echo   - wpr-trace.etl                (only with options 1 or 3)
 echo   - defender-performance.etl     (only with option 3)
 echo   - minidumps\                   (crash dumps, options 1, 3 or 5)
 echo   - bootfailure\                 (SRT/boot/CBS logs, options 1, 3 or 5)
+echo   - WPD-Case-<time>.zip          (case package, next to the output folder)
 echo Full log: %LOG%
 echo.
 

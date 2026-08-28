@@ -30,7 +30,9 @@ param(
 
     [switch]$CollectBootFailureLogs,
 
-    [switch]$ConfirmBootFailureLogCollection
+    [switch]$ConfirmBootFailureLogCollection,
+
+    [switch]$ZipOutput
 )
 
 Set-StrictMode -Version Latest
@@ -86,6 +88,73 @@ function Get-ArtifactMetadata {
         }
     }
     return $artifacts
+}
+
+function New-CasePackage {
+    <#
+      Zips EXACTLY the named relative files (this run's whitelisted artifacts
+      plus the manifest) into a timestamped zip in the destination directory.
+      Stale files in a reused output folder are never included - the zip
+      certifies only this run's evidence. Pure file operation (Linux-testable);
+      Collect mode calls it after the manifest is written, then records the
+      package block back into the manifest on disk.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$RelativeNames,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LeafName
+    )
+
+    $packageStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
+    $packagePath = Join-Path -Path $DestinationDirectory -ChildPath "$LeafName-$packageStamp.zip"
+    if (Test-Path -LiteralPath $packagePath) {
+        throw "Case package already exists: $packagePath"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+
+    $packageFileStream = [System.IO.File]::Open($packagePath, [System.IO.FileMode]::Create)
+    try {
+        $packageArchive = New-Object System.IO.Compression.ZipArchive($packageFileStream, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($relativeName in $RelativeNames) {
+                $sourceFile = Join-Path -Path $Directory -ChildPath $relativeName
+                if (-not (Test-Path -LiteralPath $sourceFile)) {
+                    continue
+                }
+                $entry = $packageArchive.CreateEntry($relativeName.Replace('\', '/'), [System.IO.Compression.CompressionLevel]::Optimal)
+                $entryStream = $entry.Open()
+                try {
+                    $inputStream = [System.IO.File]::OpenRead($sourceFile)
+                    try {
+                        $inputStream.CopyTo($entryStream)
+                    }
+                    finally {
+                        $inputStream.Dispose()
+                    }
+                }
+                finally {
+                    $entryStream.Dispose()
+                }
+            }
+        }
+        finally {
+            $packageArchive.Dispose()
+        }
+    }
+    finally {
+        $packageFileStream.Dispose()
+    }
+
+    return $packagePath
 }
 
 function Get-EventsSafe {
@@ -603,6 +672,17 @@ if ($CollectBootFailureLogs) {
     $planManifest.bootFailureLogs = [ordered]@{
         maxBytesPerFile = $script:MaxBootFailureLogBytes
         sources = @('srt-trail', 'boot-log', 'cbs-log', 'setupapi-panther', 'setupapi-error', 'dism-log')
+    }
+}
+
+if ($ZipOutput) {
+    # packaging is a local file operation on already-collected (consented)
+    # artifacts - no separate consent gate, but it IS advertised in the plan
+    $planManifest.plannedActions += 'package-local-case-folder-into-zip'
+    $planManifest.package = [ordered]@{
+        destination = (Split-Path -Parent $resolvedOutputDirectory)
+        namePattern = '<output-leaf>-<UTC-stamp>.zip'
+        includesManifest = $true
     }
 }
 
@@ -1207,3 +1287,38 @@ if ($CollectBootFailureLogs) {
 $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
 Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"
+
+if ($ZipOutput) {
+    try {
+        $packageParent = Split-Path -Parent $resolvedOutputDirectory
+        $packageLeaf = Split-Path -Leaf $resolvedOutputDirectory
+        if (-not $packageLeaf) {
+            $packageLeaf = 'wpd-case'
+        }
+        $packageRelativeNames = @($collectedArtifacts) + @('diagnostic-manifest.json')
+        $packagePath = New-CasePackage `
+            -Directory $resolvedOutputDirectory `
+            -RelativeNames $packageRelativeNames `
+            -DestinationDirectory $packageParent `
+            -LeafName $packageLeaf
+        $packageItem = Get-Item -LiteralPath $packagePath
+        $collectionManifest.package = [ordered]@{
+            enabled = $true
+            status = 'completed'
+            zipPath = $packagePath
+            sizeBytes = $packageItem.Length
+            sha256 = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
+            includesManifest = $true
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'case-package' -ErrorRecord $_
+        $collectionManifest.package = [ordered]@{
+            enabled = $true
+            status = 'failed'
+        }
+    }
+    # the package block lands in the manifest on disk; the copy inside the zip
+    # is the pre-package manifest (the wrapper describes itself, not the reverse)
+    Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+}

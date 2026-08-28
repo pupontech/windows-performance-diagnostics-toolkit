@@ -256,6 +256,39 @@
       },
       "additionalProperties": false
     },
+    "package": {
+      "type": "object",
+      "description": "Present when -ZipOutput was requested. Plan mode advertises the destination and name pattern; Collect mode reports the produced case zip. The zip contains only this run's whitelisted artifacts plus the manifest.",
+      "properties": {
+        "destination": {
+          "type": "string"
+        },
+        "namePattern": {
+          "type": "string"
+        },
+        "includesManifest": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "failed"]
+        },
+        "zipPath": {
+          "type": "string"
+        },
+        "sizeBytes": {
+          "type": "integer"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
     "startedAtUtc": {
       "type": "string",
       "format": "date-time"

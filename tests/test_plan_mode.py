@@ -377,6 +377,83 @@ def test_collect_with_boot_failure_consent_still_refuses_non_windows_hosts(tmp_p
     assert "supported only on Windows" in result.stderr
 
 
+def test_plan_mode_with_zip_output_lists_action_and_scope(tmp_path):
+    """Plan mode must advertise the case-package action and its destination
+    without packaging anything."""
+    output_directory = tmp_path / "plan-zip"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-ZipOutput",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "package-local-case-folder-into-zip" in manifest["plannedActions"]
+    assert manifest["package"]["namePattern"].endswith(".zip")
+    assert manifest["package"]["includesManifest"] is True
+
+
+def test_plan_mode_without_zip_output_has_no_package_section(tmp_path):
+    output_directory = tmp_path / "plan-plain-zip"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "package" not in manifest
+    assert "package-local-case-folder-into-zip" not in manifest["plannedActions"]
+
+
+def test_new_case_package_zips_only_named_files(tmp_path):
+    """New-CasePackage (dot-sourced from the collector) must zip EXACTLY the
+    named relative files - stale files in a reused output folder must never
+    leak into the case package, and subdirectory entries use forward slashes."""
+    import zipfile as zipfile_module
+
+    src = tmp_path / "case"
+    (src / "minidumps").mkdir(parents=True)
+    (src / "performance-samples.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (src / "network-state.json").write_text("{}", encoding="utf-8")
+    (src / "minidumps" / "082826-12345-01.dmp").write_bytes(b"MZDUMP")
+    (src / "STALE.etl").write_text("stale-from-previous-run", encoding="utf-8")
+    out = tmp_path / "packages"
+    out.mkdir()
+
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
+        f"New-CasePackage -Directory '{src.as_posix()}' "
+        f"-RelativeNames @('performance-samples.csv','network-state.json','minidumps/082826-12345-01.dmp') "
+        f"-DestinationDirectory '{out.as_posix()}' -LeafName 'wpd-test'"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    packages = list(out.glob("wpd-test-*.zip"))
+    assert len(packages) == 1, f"expected exactly one package, got {packages}"
+
+    with zipfile_module.ZipFile(packages[0]) as zf:
+        names = sorted(zf.namelist())
+        assert names == [
+            "minidumps/082826-12345-01.dmp",
+            "network-state.json",
+            "performance-samples.csv",
+        ], names
+        assert "STALE.etl" not in names
+        assert zf.read("minidumps/082826-12345-01.dmp") == b"MZDUMP"
+
+
 def test_release_packaging_files_present():
     """The deploy bundle must ship launchers and unblock guidance."""
     assert (REPO_ROOT / "Run-Diagnostics.bat").is_file()
@@ -397,6 +474,7 @@ def test_report_schema_is_valid_json():
     # consent-gated crash-evidence stages are part of the report contract
     assert "minidumps" in schema["properties"]
     assert "bootFailureLogs" in schema["properties"]
+    assert "package" in schema["properties"]
 
 
 def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
@@ -412,6 +490,7 @@ def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
     text = bat.decode("ascii")
     assert "-Mode Collect" in text
     assert "-ConfirmLocalCollection" in text  # consent flag must be passed explicitly
+    assert "-ZipOutput" in text  # case package is part of the standard launcher
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
 
 
@@ -716,6 +795,7 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     assert "-ConfirmMinidumpCollection" in text
     assert "-CollectBootFailureLogs" in text
     assert "-ConfirmBootFailureLogCollection" in text
+    assert "-ZipOutput" in text
     # Defender-strip resilience: pre-flight existence check with recovery steps
     assert "src\\Invoke-WindowsPerformanceDiagnostics.ps1 was not found" in text
     # Result visibility: log everything with Tee-Object, never a silent failure

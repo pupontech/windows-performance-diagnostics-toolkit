@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-08-28
 
 Consent-gated crash-evidence stages (patterns adopted from the field-tested RemoteDiagnostics kit: `pull-minidumps.ps1` + `Pull-BootFailureLogs.bat`).
 

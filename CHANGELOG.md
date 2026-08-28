@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.5.0 — 2026-08-27
+## 0.5.1 — 2026-08-28
+
+Stability release (found by the Matt-Pocock review + live CI gates).
+
+- **Manifest integrity**: `artifacts` now hashes **only files written this run** — a stale `wpr-trace.etl` from a reused `C:\Temp\WPD-Case` can no longer be certified as evidence of this run.
+- **Consent gates before side effects**: a consent-refusing Collect (or a non-Windows host) no longer creates the output directory at all; invalid `-OutputDirectory` again yields the clear error message in every mode (regression from the 0.5.0 consent reorder, fixed).
+- **Bounded network probes**: `Test-Connection -Count 3`, `Resolve-DnsName`, and `Get-NetTCPConnection` can block for minutes when ICMP/DNS is silently dropped or the token is restricted (observed as a 120s+ hang for a standard-user batch-logon session). Replaced with `.NET Ping` (2s timeout), `[System.Net.Dns]::GetHostAddresses`, and a native `netstat -ano` parse — network-state collection now completes in seconds everywhere.
+- **Sampling resilience**: transient CIM failures `continue` (break only after 3 consecutive); `wpr.exe` exit-code reads are sentinel-initialized so a stale `$LASTEXITCODE` can't leak into the manifest.
+- **CI hygiene**: WPD-09 creates its standard user via ADSI with a per-run random password (net.exe rejected the interpolated password; no reusable credential committed), excludes `sec.cfg`/ETLs/NGENPDB from artifacts; WPD-11 auth probes use the real `GITHUB_TOKEN`; the release-flow pin derives from `VERSION`.
+- Safety contract unchanged: read-only, local-only, no auto-elevation, no remediation.
+
+## 0.5.0 — 2026-08-28
 
 Read-only network-state snapshot (next pattern adopted from the field-tested RemoteDiagnostics kit: `capture-network-state.ps1`).
 

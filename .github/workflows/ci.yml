@@ -328,9 +328,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
           $user = 'wpdstd'
           # per-run random password: never commit a reusable credential
-          $pass = 'Wpd#' + $env:GITHUB_RUN_ID + '!Xy'
-          net user $user $pass /add | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'WPD-09 FAIL: net user /add failed' }
+          $pass = 'Wpd#' + [guid]::NewGuid().ToString('N').Substring(0, 12) + '!Xy'
+          # create the standard user via ADSI - net.exe chokes on some password
+          # spellings ('No valid response was provided.'), ADSI does not
+          try {
+            $adsi = [ADSI]"WinNT://$env:COMPUTERNAME"
+            $newUser = $adsi.Create('User', $user)
+            $newUser.SetPassword($pass)
+            $newUser.SetInfo()
+          } catch {
+            throw "WPD-09 FAIL: user creation failed: $($_.Exception.Message)"
+          }
           # grant the standard user write access to the staging area
           icacls $base /grant "${user}:(OI)(CI)M" | Out-Null
           Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE\src\Invoke-WindowsPerformanceDiagnostics.ps1" `

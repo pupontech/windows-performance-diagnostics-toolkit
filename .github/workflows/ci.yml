@@ -342,6 +342,37 @@ jobs:
           Write-Output "WPD-10 PASS: wpr-trace.etl $etlBytes bytes, wpr.status completed, hashed in manifest"
           exit 0
 
+      - name: WPD-12 - remote collection over loopback WinRM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'C:\WPD'
+          New-Item -ItemType Directory -Force -Path (Join-Path $base 'logs') | Out-Null
+          # CI-only: make sure WinRM is listening on the runner. The toolkit
+          # itself NEVER enables WinRM - this is the test harness setting up
+          # its own precondition (documented in docs/remote-mode.md).
+          if (-not (Test-WSMan -ComputerName localhost -ErrorAction SilentlyContinue)) {
+            Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+          }
+          if (-not (Test-WSMan -ComputerName localhost -ErrorAction SilentlyContinue)) {
+            throw 'WPD-12 FAIL: WinRM is not available on this runner'
+          }
+          $outDir = Join-Path $base 'WPD-12'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+            -Mode Collect -ConfirmLocalCollection -ConfirmRemoteCollection `
+            -RemoteComputer localhost -DurationSeconds 5 -OutputDirectory $outDir
+          $manifestPath = Join-Path $outDir 'diagnostic-manifest.json'
+          $m = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($m.remote.status -ne 'completed') { throw "WPD-12 FAIL: remote.status=$($m.remote.status)" }
+          if ($m.remote.pulledFileCount -lt 1) { throw "WPD-12 FAIL: no files pulled (pulledFileCount=$($m.remote.pulledFileCount))" }
+          if ($m.remote.verifiedSha256Count -ne $m.remote.pulledFileCount) {
+            throw "WPD-12 FAIL: hash verification incomplete ($($m.remote.verifiedSha256Count)/$($m.remote.pulledFileCount))"
+          }
+          if ($m.remote.hashVerificationFailed) { throw 'WPD-12 FAIL: hashVerificationFailed=true' }
+          Write-Output "WPD-12 PASS: remote collect pulled $($m.remote.pulledFileCount) files, $($m.remote.verifiedSha256Count) SHA-256 verified from $($m.remote.computerName)"
+          exit 0
+
       - name: WPD-09 - WPR on standard (non-admin) console is skipped, no elevation
         if: always()
         shell: pwsh

@@ -11,7 +11,13 @@ Treat the following as potentially sensitive diagnostic material:
 - Defender diagnostic CABs
 - DISM/SFC logs
 
-The toolkit must not upload, email, or copy these artifacts off-device by default.
+The toolkit must not upload, email, or copy these artifacts off-device by default. The
+one exception is **remote mode** (`-RemoteComputer`): with explicit
+`-ConfirmRemoteCollection` consent (in addition to `-ConfirmLocalCollection`), the
+collector runs on the target over WinRM and pulls the case folder back to the
+technician's machine, verifying every file's SHA-256 against the remote manifest.
+The toolkit never enables WinRM on the target; enabling it is an operator-owned
+precondition documented in `docs/remote-mode.md`.
 
 ## Required operator disclosure
 

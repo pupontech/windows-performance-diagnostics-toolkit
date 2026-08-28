@@ -32,7 +32,15 @@ param(
 
     [switch]$ConfirmBootFailureLogCollection,
 
-    [switch]$ZipOutput
+    [switch]$ZipOutput,
+
+    [string]$RemoteComputer,
+
+    [string]$RemoteOutputDirectory,
+
+    [System.Management.Automation.PSCredential]$Credential,
+
+    [switch]$ConfirmRemoteCollection
 )
 
 Set-StrictMode -Version Latest
@@ -170,6 +178,55 @@ function New-CasePackage {
     }
 
     return $packagePath
+}
+
+function Add-CasePackageBlock {
+    <#
+      Zips the given artifact names + the manifest into a case package and
+      records the 'package' block on the manifest object (mutated in place -
+      [ordered] dictionaries and PSCustomObjects are both reference types).
+      Shared by the local and the remote collect paths.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$CollectionManifest,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDirectory,
+
+        [string[]]$ArtifactNames = @()
+    )
+
+    try {
+        $packageParent = Split-Path -Parent $OutputDirectory
+        $packageLeaf = Split-Path -Leaf $OutputDirectory
+        if (-not $packageLeaf) {
+            $packageLeaf = 'wpd-case'
+        }
+        $packageRelativeNames = @($ArtifactNames) + @('diagnostic-manifest.json')
+        $packagePath = New-CasePackage `
+            -Directory $OutputDirectory `
+            -RelativeNames $packageRelativeNames `
+            -DestinationDirectory $packageParent `
+            -LeafName $packageLeaf
+        $packageItem = Get-Item -LiteralPath $packagePath
+        $CollectionManifest.package = [ordered]@{
+            enabled = $true
+            status = 'completed'
+            zipPath = $packagePath
+            sizeBytes = $packageItem.Length
+            sha256 = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
+            includesManifest = $true
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'case-package' -ErrorRecord $_
+        $CollectionManifest.package = [ordered]@{
+            enabled = $true
+            status = 'failed'
+        }
+    }
+    return $CollectionManifest
 }
 
 function Get-EventsSafe {
@@ -701,6 +758,22 @@ if ($ZipOutput) {
     }
 }
 
+if ($RemoteComputer) {
+    # Remote mode changes the safety block: the collection runs on a remote
+    # host over WinRM and the case folder is pulled back to THIS machine.
+    # readOnly/automaticUpload/automaticRemediation/automaticLogClearing are
+    # unchanged - the tool never enables WinRM, never mutates the target, and
+    # the pull is consent-gated like every local write.
+    $planManifest.plannedActions += 'collect-remotely-after-explicit-consent'
+    $planManifest.safety.localOnly = $false
+    $planManifest.safety.remoteTarget = $RemoteComputer
+    $planManifest.safety.remoteTransport = 'winrm'
+    $planManifest.remote = [ordered]@{
+        computerName = $RemoteComputer
+        transport = 'winrm'
+    }
+}
+
 if ($Mode -eq 'Plan') {
     try {
         New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
@@ -734,6 +807,10 @@ if (-not $ConfirmBootFailureLogCollection -and $CollectBootFailureLogs) {
     throw 'Boot-failure log collection requires -ConfirmBootFailureLogCollection. No diagnostic data was collected.'
 }
 
+if (-not $ConfirmRemoteCollection -and $RemoteComputer) {
+    throw 'Remote collection requires -ConfirmRemoteCollection. No diagnostic data was collected.'
+}
+
 if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw 'Collect mode is supported only on Windows. Use -Mode Plan for a non-collecting safety plan.'
 }
@@ -764,6 +841,160 @@ function Add-CollectionErrorText {
         Stage = $Stage
         Message = $Message
     }
+}
+
+if ($RemoteComputer) {
+    # ---- Remote collection over WinRM (remote-exec, pull-back, verified) ----
+    # The existing collector runs ON the target (stages execute locally there,
+    # same consent gates, same skip semantics); the case folder is pulled back
+    # and every pulled file's SHA-256 is verified against the remote manifest
+    # before the local manifest is written. WinRM is never enabled by this
+    # tool - Test-WSMan only reports availability.
+    $remoteStatus = 'failed'
+    $remoteWinrmStatus = 'failed-winrm-unavailable'
+    $remoteOutDir = $null
+    $remotePulledFileCount = 0
+    $remoteVerifiedCount = 0
+    $remoteHashVerificationFailed = $false
+    $remoteStartedAtUtc = Get-UtcTimestamp
+    $remotePulledManifest = $null
+    $session = $null
+    try {
+        $wsmanParams = @{ ComputerName = $RemoteComputer; ErrorAction = 'Stop' }
+        if ($Credential) {
+            $wsmanParams.Credential = $Credential
+        }
+        $null = Test-WSMan @wsmanParams
+        $remoteWinrmStatus = 'ok'
+
+        $session = New-PSSession @wsmanParams
+        if ($RemoteOutputDirectory) {
+            $remoteOutDir = $RemoteOutputDirectory
+        }
+        else {
+            $remoteOutDir = (Invoke-Command -Session $session -ScriptBlock { Join-Path $env:TEMP 'WPD-Remote-Case' })
+        }
+        $remoteScriptPath = Join-Path $remoteOutDir 'Invoke-WindowsPerformanceDiagnostics.ps1'
+        Invoke-Command -Session $session -ScriptBlock {
+            param($dir)
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        } -ArgumentList $remoteOutDir
+        Copy-Item -ToSession $session -Path $MyInvocation.MyCommand.Path -Destination $remoteScriptPath -Force
+
+        $remoteArgs = @('-Mode', 'Collect', '-ConfirmLocalCollection', '-OutputDirectory', $remoteOutDir)
+        if ($CaptureWpr) { $remoteArgs += @('-CaptureWpr', '-ConfirmWprCapture', '-WprProfile', $WprProfile) }
+        if ($CaptureDefender) { $remoteArgs += @('-CaptureDefender', '-ConfirmDefenderCapture') }
+        if ($CollectMinidumps) { $remoteArgs += @('-CollectMinidumps', '-ConfirmMinidumpCollection') }
+        if ($CollectBootFailureLogs) { $remoteArgs += @('-CollectBootFailureLogs', '-ConfirmBootFailureLogCollection') }
+        $remoteArgs += @('-DurationSeconds', "$DurationSeconds")
+
+        Invoke-Command -Session $session -ScriptBlock {
+            param($scriptPath, [string[]]$runArgs)
+            & $scriptPath @runArgs
+        } -ArgumentList $remoteScriptPath, $remoteArgs
+
+        $remoteManifestPath = Join-Path $remoteOutDir 'diagnostic-manifest.json'
+        $localManifestPath = Join-Path $resolvedOutputDirectory 'diagnostic-manifest.json'
+        Copy-Item -FromSession $session -Path $remoteManifestPath -Destination $localManifestPath -Force
+        $remotePulledManifest = Get-Content -LiteralPath $localManifestPath -Raw | ConvertFrom-Json
+
+        foreach ($artifact in @($remotePulledManifest.artifacts)) {
+            $remoteArtifactPath = Join-Path $remoteOutDir $artifact.Name
+            $localArtifactPath = Join-Path $resolvedOutputDirectory $artifact.Name
+            $localArtifactDir = Split-Path -Parent $localArtifactPath
+            if (-not (Test-Path -LiteralPath $localArtifactDir)) {
+                New-Item -ItemType Directory -Force -Path $localArtifactDir | Out-Null
+            }
+            Copy-Item -FromSession $session -Path $remoteArtifactPath -Destination $localArtifactPath -Force
+            $remotePulledFileCount++
+            $localHash = (Get-FileHash -LiteralPath $localArtifactPath -Algorithm SHA256).Hash
+            if ($localHash -eq $artifact.Sha256) {
+                $remoteVerifiedCount++
+            }
+            else {
+                $remoteHashVerificationFailed = $true
+            }
+        }
+        $remoteStatus = 'completed'
+    }
+    catch {
+        Add-CollectionError -Stage 'remote-collection' -ErrorRecord $_
+        $remoteStatus = 'failed'
+    }
+
+    # cleanup: remove OUR remote staging dir + session (documented in the plan)
+    if ($session) {
+        try {
+            if ($remoteOutDir) {
+                Invoke-Command -Session $session -ScriptBlock {
+                    param($dir)
+                    if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+                } -ArgumentList $remoteOutDir
+            }
+        }
+        catch {
+            Add-CollectionError -Stage 'remote-cleanup' -ErrorRecord $_
+        }
+        try {
+            Remove-PSSession -Session $session
+        }
+        catch {
+            Add-CollectionError -Stage 'remote-cleanup' -ErrorRecord $_
+        }
+    }
+
+    if ($remotePulledManifest) {
+        $collectionManifest = $remotePulledManifest
+        $collectionManifest | Add-Member -NotePropertyName 'remote' -NotePropertyValue ([ordered]@{
+            computerName = $RemoteComputer
+            transport = 'winrm'
+            winrmStatus = $remoteWinrmStatus
+            remoteOutputDirectory = $remoteOutDir
+            status = $remoteStatus
+            pulledFileCount = $remotePulledFileCount
+            verifiedSha256Count = $remoteVerifiedCount
+            hashVerificationFailed = $remoteHashVerificationFailed
+            pulledAtUtc = Get-UtcTimestamp
+        }) -Force
+    }
+    else {
+        # WinRM/session/manifest failed before anything was pulled: write a
+        # minimal manifest so the failure is inspectable
+        $collectionManifest = [ordered]@{
+            schemaVersion = '1.0'
+            toolName = 'Windows Performance Diagnostics Toolkit'
+            toolVersion = $ScriptVersion
+            mode = 'Collect'
+            startedAtUtc = $remoteStartedAtUtc
+            completedAtUtc = Get-UtcTimestamp
+            outputDirectory = $resolvedOutputDirectory
+            safety = $planManifest.safety
+            remote = [ordered]@{
+                computerName = $RemoteComputer
+                transport = 'winrm'
+                winrmStatus = $remoteWinrmStatus
+                status = $remoteStatus
+            }
+            collectionErrors = $collectionErrors
+            artifacts = @()
+        }
+    }
+
+    $collectedArtifacts = New-Object System.Collections.ArrayList
+    if ($remotePulledManifest) {
+        foreach ($artifact in @($remotePulledManifest.artifacts)) {
+            [void]$collectedArtifacts.Add($artifact.Name)
+        }
+    }
+
+    $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
+    Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+    if ($ZipOutput) {
+        $collectionManifest = Add-CasePackageBlock -CollectionManifest $collectionManifest -OutputDirectory $resolvedOutputDirectory -ArtifactNames @($collectedArtifacts)
+        Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+    }
+    Write-Output "Remote collection complete. Manifest written to $collectionManifestPath"
+    exit 0
 }
 
 $collectedArtifacts = New-Object System.Collections.ArrayList
@@ -1304,36 +1535,6 @@ Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"
 
 if ($ZipOutput) {
-    try {
-        $packageParent = Split-Path -Parent $resolvedOutputDirectory
-        $packageLeaf = Split-Path -Leaf $resolvedOutputDirectory
-        if (-not $packageLeaf) {
-            $packageLeaf = 'wpd-case'
-        }
-        $packageRelativeNames = @($collectedArtifacts) + @('diagnostic-manifest.json')
-        $packagePath = New-CasePackage `
-            -Directory $resolvedOutputDirectory `
-            -RelativeNames $packageRelativeNames `
-            -DestinationDirectory $packageParent `
-            -LeafName $packageLeaf
-        $packageItem = Get-Item -LiteralPath $packagePath
-        $collectionManifest.package = [ordered]@{
-            enabled = $true
-            status = 'completed'
-            zipPath = $packagePath
-            sizeBytes = $packageItem.Length
-            sha256 = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
-            includesManifest = $true
-        }
-    }
-    catch {
-        Add-CollectionError -Stage 'case-package' -ErrorRecord $_
-        $collectionManifest.package = [ordered]@{
-            enabled = $true
-            status = 'failed'
-        }
-    }
-    # the package block lands in the manifest on disk; the copy inside the zip
-    # is the pre-package manifest (the wrapper describes itself, not the reverse)
+    $collectionManifest = Add-CasePackageBlock -CollectionManifest $collectionManifest -OutputDirectory $resolvedOutputDirectory -ArtifactNames @($collectedArtifacts)
     Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
 }

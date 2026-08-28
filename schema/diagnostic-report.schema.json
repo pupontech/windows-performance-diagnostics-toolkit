@@ -55,6 +55,14 @@
         },
         "automaticLogClearing": {
           "type": "boolean"
+        },
+        "remoteTarget": {
+          "type": "string",
+          "description": "Present only in remote mode: the computer the collection runs on."
+        },
+        "remoteTransport": {
+          "type": "string",
+          "enum": ["winrm"]
         }
       },
       "additionalProperties": false
@@ -285,6 +293,44 @@
         "sha256": {
           "type": "string",
           "pattern": "^[A-Fa-f0-9]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote": {
+      "type": "object",
+      "description": "Present when -RemoteComputer was requested. Plan mode advertises the target and transport; Collect mode reports the pull-back result. The tool never enables WinRM on the target.",
+      "properties": {
+        "computerName": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string",
+          "enum": ["winrm"]
+        },
+        "winrmStatus": {
+          "type": "string",
+          "enum": ["ok", "failed-winrm-unavailable"]
+        },
+        "remoteOutputDirectory": {
+          "type": ["string", "null"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "failed"]
+        },
+        "pulledFileCount": {
+          "type": "integer"
+        },
+        "verifiedSha256Count": {
+          "type": "integer"
+        },
+        "hashVerificationFailed": {
+          "type": "boolean"
+        },
+        "pulledAtUtc": {
+          "type": "string",
+          "format": "date-time"
         }
       },
       "additionalProperties": false

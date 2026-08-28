@@ -457,6 +457,72 @@ def test_new_case_package_zips_only_named_files(tmp_path):
         assert zf.read("minidumps/082826-12345-01.dmp") == b"MZDUMP"
 
 
+def test_plan_mode_with_remote_lists_action_and_remote_safety_block(tmp_path):
+    """Plan mode must advertise the remote collection action and switch the
+    safety block to localOnly=false with the target, without touching WinRM."""
+    output_directory = tmp_path / "plan-remote"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-RemoteComputer", "SRV-DIAG-01",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "collect-remotely-after-explicit-consent" in manifest["plannedActions"]
+    assert manifest["safety"]["localOnly"] is False
+    assert manifest["safety"]["remoteTarget"] == "SRV-DIAG-01"
+    assert manifest["safety"]["remoteTransport"] == "winrm"
+    assert manifest["remote"]["computerName"] == "SRV-DIAG-01"
+    assert manifest["remote"]["transport"] == "winrm"
+
+
+def test_plan_mode_without_remote_keeps_local_only_safety(tmp_path):
+    output_directory = tmp_path / "plan-plain-remote"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert manifest["safety"]["localOnly"] is True
+    assert "remote" not in manifest
+    assert "collect-remotely-after-explicit-consent" not in manifest["plannedActions"]
+
+
+def test_remote_collection_refuses_without_consent(tmp_path):
+    """Remote collection needs its own consent gate, checked before any network I/O."""
+    result = run_tool(
+        "-Mode", "Collect",
+        "-ConfirmLocalCollection",
+        "-RemoteComputer", "SRV-DIAG-01",
+        "-OutputDirectory", str(tmp_path / "no-remote-consent"),
+    )
+
+    assert result.returncode != 0
+    assert "requires -ConfirmRemoteCollection" in result.stderr
+
+
+def test_remote_collection_still_refuses_non_windows_hosts(tmp_path):
+    if platform.system() == "Windows":
+        return
+
+    result = run_tool(
+        "-Mode", "Collect",
+        "-ConfirmLocalCollection",
+        "-ConfirmRemoteCollection",
+        "-RemoteComputer", "localhost",
+        "-OutputDirectory", str(tmp_path / "linux-remote-host"),
+    )
+
+    assert result.returncode != 0
+    assert "supported only on Windows" in result.stderr
+
+
 def test_release_packaging_files_present():
     """The deploy bundle must ship launchers and unblock guidance."""
     assert (REPO_ROOT / "Run-Diagnostics.bat").is_file()
@@ -494,6 +560,9 @@ def test_report_schema_is_valid_json():
     assert "minidumps" in schema["properties"]
     assert "bootFailureLogs" in schema["properties"]
     assert "package" in schema["properties"]
+    assert "remote" in schema["properties"]
+    assert "remoteTarget" in schema["properties"]["safety"]["properties"]
+    assert "remoteTransport" in schema["properties"]["safety"]["properties"]
 
 
 def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
@@ -761,6 +830,8 @@ def test_emitted_plan_validates_against_schema(tmp_path):
         "-CaptureDefender",
         "-CollectMinidumps",
         "-CollectBootFailureLogs",
+        "-ZipOutput",
+        "-RemoteComputer", "SRV-DIAG-01",
         "-OutputDirectory", str(output_directory),
     )
 

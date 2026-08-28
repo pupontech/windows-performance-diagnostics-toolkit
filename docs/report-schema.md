@@ -149,12 +149,36 @@ constraints. These fields are never silently changed between versions.
 
 | Field | Meaning |
 |-------|---------|
-| `localOnly` | All operations stay on the local machine. No remote calls. |
+| `localOnly` | `true` for local runs; `false` when `-RemoteComputer` is used (the collector runs on the target over WinRM and the case folder is pulled back with explicit `-ConfirmRemoteCollection` consent). |
 | `readOnly` | Plan mode performs no mutations. |
 | `requiresExplicitCollectionConsent` | Collect mode requires `-ConfirmLocalCollection`. |
 | `automaticUpload` | Always `false`. Data never leaves the machine automatically. |
 | `automaticRemediation` | Always `false`. The tool never modifies system state. |
 | `automaticLogClearing` | Always `false`. The tool never deletes logs. |
+| `remoteTarget` | Present only in remote mode: the computer the collection runs on. |
+| `remoteTransport` | Present only in remote mode: `winrm`. |
+
+## Remote Object
+
+The optional `remote` object appears when `-RemoteComputer` is specified. Plan
+mode advertises the target and transport; Collect mode reports the pull-back
+result. The tool **never enables WinRM** on the target — `winrmStatus` only
+reports availability.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `computerName` | string | Target computer. |
+| `transport` | string enum | `winrm`. |
+| `winrmStatus` | string enum | `ok` or `failed-winrm-unavailable`. |
+| `remoteOutputDirectory` | string | Staging directory on the target (removed after the pull). |
+| `status` | string enum | Collect mode only: `completed`, `failed`. |
+| `pulledFileCount` | integer | Artifacts copied back. |
+| `verifiedSha256Count` | integer | Pulled files whose hash matched the remote manifest. |
+| `hashVerificationFailed` | boolean | True if any pulled file did not match. |
+| `pulledAtUtc` | string (date-time) | When the pull-back finished. |
+
+In Collect mode the local `diagnostic-manifest.json` is the **remote** manifest
+(the collection record produced on the target) plus this `remote` block.
 
 ## SHA-256 Manifest Guarantee
 

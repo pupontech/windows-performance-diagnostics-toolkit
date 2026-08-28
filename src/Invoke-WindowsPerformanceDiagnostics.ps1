@@ -701,15 +701,35 @@ $networkState = $null
 $networkStatus = 'failed'
 $networkSectionErrorCount = 0
 try {
-    $networkResult = Get-NetworkState
-    $networkState = $networkResult.State
-    $networkSectionErrorCount = @($networkResult.Errors).Count
-    foreach ($sectionError in @($networkResult.Errors)) {
-        Add-CollectionErrorText -Stage "network-state-$($sectionError.Section)" -Message $sectionError.Message
+    # Get-NetworkState runs in a bounded job: a slow or blocked sub-collection
+    # (observed as a 120s+ hang for a standard-user batch-logon session on CI
+    # runners) must never stall the whole collection. 60s is generous for
+    # network introspection; a timeout records an error and continues.
+    $networkJob = Start-Job -ScriptBlock {
+        param($fnNetwork, $fnPropertyValue, $fnMatch)
+        Set-Item -Path function:Get-NetworkState -Value $fnNetwork
+        Set-Item -Path function:Get-PropertyValue -Value $fnPropertyValue
+        Set-Item -Path function:Test-SecuritySoftwareMatch -Value $fnMatch
+        Get-NetworkState
+    } -ArgumentList $function:Get-NetworkState, $function:Get-PropertyValue, $function:Test-SecuritySoftwareMatch
+    if (Wait-Job -Job $networkJob -Timeout 60) {
+        $networkResult = Receive-Job -Job $networkJob
+        Remove-Job -Job $networkJob -Force
+        $networkState = $networkResult.State
+        $networkSectionErrorCount = @($networkResult.Errors).Count
+        foreach ($sectionError in @($networkResult.Errors)) {
+            Add-CollectionErrorText -Stage "network-state-$($sectionError.Section)" -Message $sectionError.Message
+        }
+        Write-JsonFile -InputObject $networkState -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'network-state.json')
+        [void]$collectedArtifacts.Add('network-state.json')
+        $networkStatus = 'completed'
     }
-    Write-JsonFile -InputObject $networkState -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'network-state.json')
-    [void]$collectedArtifacts.Add('network-state.json')
-    $networkStatus = 'completed'
+    else {
+        Stop-Job -Job $networkJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $networkJob -Force -ErrorAction SilentlyContinue
+        Add-CollectionErrorText -Stage 'network-state' -Message 'network-state collection timed out after 60 seconds; skipped'
+        $networkStatus = 'failed'
+    }
 }
 catch {
     Add-CollectionError -Stage 'network-state' -ErrorRecord $_

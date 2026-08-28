@@ -349,27 +349,36 @@ jobs:
           Set-Content -LiteralPath $secCfg -Value $cfg -Encoding Ascii
           secedit /configure /db secedit.sdb /cfg $secCfg /areas USER_RIGHTS | Out-Null
           $consoleLog = Join-Path $logsDir 'WPD-09-console.log'
-          $cred = New-Object System.Management.Automation.PSCredential($user, (ConvertTo-SecureString $pass -AsPlainText -Force))
+          $exitFile = Join-Path $logsDir 'WPD-09-exitcode.txt'
+          # Run the collector through a cmd wrapper so the child's console streams
+          # to a file LIVE (diagnosable if it ever hangs) and the exit code lands
+          # in a file the harness polls - while still dropping privileges via
+          # CreateProcessWithLogonW (schtasks as a standard user never started on
+          # GitHub runners).
+          $runner = Join-Path $base 'wpd09.cmd'
+          $cmdLines = @(
+            '@echo off',
+            '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "C:\WPD\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CaptureWpr -ConfirmWprCapture -DurationSeconds 5 -OutputDirectory "C:\WPD\WPD-09" > "' + $consoleLog + '" 2>&1',
+            'echo %errorlevel% > "' + $exitFile + '"'
+          )
+          $cmdLines | Set-Content -LiteralPath $runner -Encoding Ascii
           $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-          $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $base + '\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CaptureWpr -ConfirmWprCapture -DurationSeconds 5 -OutputDirectory "' + $outDir + '"'
+          $psi.FileName = "$env:SystemRoot\System32\cmd.exe"
+          $psi.Arguments = '/d /c "' + $runner + '"'
           $psi.UseShellExecute = $false
           $psi.UserName = $user
           $psi.Domain = $env:COMPUTERNAME
           $psi.Password = (ConvertTo-SecureString $pass -AsPlainText -Force)
-          $psi.RedirectStandardOutput = $true
-          $psi.RedirectStandardError = $true
-          $proc = [System.Diagnostics.Process]::Start($psi)
-          $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-          $stderrTask = $proc.StandardError.ReadToEndAsync()
-          if (-not $proc.WaitForExit(120000)) {
-            try { $proc.Kill() } catch { }
-            throw 'WPD-09 FAIL: standard-user process did not finish within 120s'
+          [System.Diagnostics.Process]::Start($psi) | Out-Null
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not (Test-Path -LiteralPath $exitFile) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
           }
-          $exit = $proc.ExitCode
-          $stdoutTask.Wait(5000) | Out-Null
-          $stderrTask.Wait(5000) | Out-Null
-          ("--- stdout ---`n" + $stdoutTask.Result + "`n--- stderr ---`n" + $stderrTask.Result) | Set-Content -LiteralPath $consoleLog -Encoding utf8
+          if (-not (Test-Path -LiteralPath $exitFile)) {
+            $tail = if (Test-Path -LiteralPath $consoleLog) { Get-Content -LiteralPath $consoleLog -Raw } else { '(no console output yet)' }
+            throw "WPD-09 FAIL: standard-user process did not finish within 120s. Console so far: $tail"
+          }
+          $exit = [int](Get-Content -LiteralPath $exitFile -Raw).Trim()
           if ($exit -ne 0) { throw "WPD-09 FAIL: script exit code $exit; see $consoleLog" }
           $manifest = Get-Content -LiteralPath (Join-Path $outDir 'diagnostic-manifest.json') -Raw | ConvertFrom-Json
           if ($manifest.wpr.status -ne 'skipped-elevation-required') {

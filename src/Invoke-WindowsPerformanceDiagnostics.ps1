@@ -554,7 +554,12 @@ if ($CaptureDefender) {
 }
 
 if ($Mode -eq 'Plan') {
-    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+    try {
+        New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+    }
+    catch {
+        throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
+    }
     $planPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-plan.json'
     Write-JsonFile -InputObject $planManifest -Path $planPath
     Write-Output "Plan written to $planPath"
@@ -579,7 +584,12 @@ if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 
 # Consent gates passed: only now may the output directory be created, so a
 # consent-refusing Collect leaves no side effects behind.
-New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+try {
+    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+}
+catch {
+    throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
+}
 
 $collectionErrors = @()
 function Add-CollectionError {

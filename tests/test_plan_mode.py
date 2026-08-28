@@ -371,14 +371,17 @@ def test_network_state_collection_is_resilient_and_structured(tmp_path):
         "function ipconfig { param($x) 'Windows IP Configuration','   IPv4 Address. . . : 192.168.1.50' }; "
         "function arp { param($x) 'Interface: 192.168.1.50','192.168.1.1 aa-bb-cc-dd-ee-ff dynamic' }; "
         "function netsh { param($a,$b,$c) 'Current WinHTTP proxy settings:','Direct access (no proxy server).' }; "
+        "function netstat { param($x) 'TCP 0.0.0.0:443 1.2.3.4:50000 ESTABLISHED 1234' }; "
         "function Get-NetAdapter { [pscustomobject]@{Name='Ethernet';InterfaceDescription='Test Adapter';Status='Up';LinkSpeed='1 Gbps';MacAddress='00:11:22:33:44:55'} }; "
         "function Get-NetConnectionProfile { [pscustomobject]@{Name='testnet';InterfaceAlias='Ethernet';NetworkCategory='Private';IPv4Connectivity='Internet';IPv6Connectivity='NoTraffic'} }; "
         "function Get-DnsClientServerAddress { [pscustomobject]@{InterfaceAlias='Ethernet';AddressFamily=2;ServerAddresses=@('8.8.8.8','1.1.1.1')} }; "
         "function Get-DnsClientCache { [pscustomobject]@{Entry='google.com';Name='google.com';Data='142.250.1.1';Status='Success'} }; "
         "function Get-NetRoute { [pscustomobject]@{DestinationPrefix='0.0.0.0/0';NextHop='192.168.1.1';InterfaceAlias='Ethernet';RouteMetric=10} }; "
-        "function Test-Connection { param($ComputerName,$Count) [pscustomobject]@{Address=$ComputerName;ResponseTime=5;StatusCode=0} }; "
-        "function Resolve-DnsName { param($Name) [pscustomobject]@{Name=$Name;Type='A';IPAddress='1.2.3.4'} }; "
-        "function Get-NetTCPConnection { [pscustomobject]@{LocalAddress='0.0.0.0';LocalPort=443;RemoteAddress='1.2.3.4';RemotePort=50000;State='Established';OwningProcess=1234} }; "
+        # bounded probes: mock New-Object for the .NET Ping (deterministic
+        # Success regardless of host ICMP policy) and mock netstat; DNS uses
+        # the real resolver (GitHub runners resolve public names)
+        "class FakePing { [object] Send($target, $timeout) { return [pscustomobject]@{ Status = 'Success' } } [void] Dispose() {} }; "
+        "function New-Object { param([string]$TypeName) if ($TypeName -eq 'System.Net.NetworkInformation.Ping') { return [FakePing]::new() }; return (Microsoft.PowerShell.Utility\\New-Object -TypeName $TypeName) }; "
         "function Get-Process { [pscustomobject]@{Name='chrome';Id=1;Company='Google LLC'},[pscustomobject]@{Name='csagent';Id=2;Company='CrowdStrike, Inc.'} }; "
         "function Get-ItemProperty { param($Path,$ErrorAction) [pscustomobject]@{DisplayName='Google Chrome';DisplayVersion='1.0';Publisher='Google LLC'},[pscustomobject]@{DisplayName='CrowdStrike Falcon';Publisher='CrowdStrike, Inc.'},[pscustomobject]@{DisplayVersion='2.0'} }; "
         "$good = (Get-NetworkState).State | ConvertTo-Json -Depth 8; "

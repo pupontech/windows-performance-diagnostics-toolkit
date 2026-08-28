@@ -327,7 +327,8 @@ jobs:
           $outDir = Join-Path $base 'WPD-09'
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
           $user = 'wpdstd'
-          $pass = 'Wpd#2026!Test'
+          # per-run random password: never commit a reusable credential
+          $pass = 'Wpd#' + $env:GITHUB_RUN_ID + '!Xy'
           net user $user $pass /add | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'WPD-09 FAIL: net user /add failed' }
           # grant the standard user write access to the staging area
@@ -392,6 +393,8 @@ jobs:
             C:\WPD
             !C:\WPD\**\*.etl
             !C:\WPD\**\*.NGENPDB
+            !C:\WPD\sec.cfg
+            !C:\WPD11
           if-no-files-found: error
 
   # WPD-11: release zip + Mark-of-the-Web (MOTW) + launcher end-to-end
@@ -446,6 +449,14 @@ jobs:
           $latest = $versions | Sort-Object ver | Select-Object -Last 1
           $tag = $latest.tag
           $ver = $latest.ver.ToString()
+          # The release-flow pin must track VERSION: if a newer tag than the
+          # VERSION file exists (or the file was bumped without a tag), the gate
+          # is stale by construction - fail loudly instead of re-testing an old
+          # release forever.
+          $expectedTag = 'v' + (Get-Content -LiteralPath "$env:GITHUB_WORKSPACE\VERSION" -Raw).Trim()
+          if ($tag -ne $expectedTag) {
+            throw "WPD-11 FAIL: latest tag $tag does not match VERSION file ($expectedTag); update the release pin before shipping"
+          }
           $base = "windows-performance-diagnostics-toolkit-$ver"
           New-Item -ItemType Directory -Force -Path $env:WPD11_WORK | Out-Null
           $state = [ordered]@{

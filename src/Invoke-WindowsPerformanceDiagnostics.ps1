@@ -46,17 +46,29 @@ function Get-UtcTimestamp {
 }
 
 function Get-ArtifactMetadata {
+    <#
+      Hashes ONLY the artifacts written during this run (Names whitelist).
+      The output directory may contain stale files from earlier runs when a
+      launcher reuses the same folder - certifying those would corrupt the
+      SHA-256 trust anchor, so only tracked writes are listed.
+    #>
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Directory
+        [string]$Directory,
+
+        [string[]]$Names = @()
     )
 
     $artifacts = @()
-    Get-ChildItem -LiteralPath $Directory -File | Where-Object { $_.Name -ne 'diagnostic-manifest.json' } | ForEach-Object {
-        $artifacts += [pscustomobject]@{
-            Name = $_.Name
-            SizeBytes = $_.Length
-            Sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    foreach ($name in $Names) {
+        $path = Join-Path -Path $Directory -ChildPath $name
+        if (Test-Path -LiteralPath $path) {
+            $item = Get-Item -LiteralPath $path
+            $artifacts += [pscustomobject]@{
+                Name = $name
+                SizeBytes = $item.Length
+                Sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            }
         }
     }
     return $artifacts
@@ -480,7 +492,6 @@ function Get-NetworkState {
 
 try {
     $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
-    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
 }
 catch {
     throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
@@ -543,6 +554,7 @@ if ($CaptureDefender) {
 }
 
 if ($Mode -eq 'Plan') {
+    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
     $planPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-plan.json'
     Write-JsonFile -InputObject $planManifest -Path $planPath
     Write-Output "Plan written to $planPath"
@@ -565,6 +577,10 @@ if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw 'Collect mode is supported only on Windows. Use -Mode Plan for a non-collecting safety plan.'
 }
 
+# Consent gates passed: only now may the output directory be created, so a
+# consent-refusing Collect leaves no side effects behind.
+New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+
 $collectionErrors = @()
 function Add-CollectionError {
     param([string]$Stage, [System.Management.Automation.ErrorRecord]$ErrorRecord)
@@ -584,6 +600,7 @@ function Add-CollectionErrorText {
     }
 }
 
+$collectedArtifacts = New-Object System.Collections.ArrayList
 $startedAtUtc = Get-UtcTimestamp
 $systemSummary = [ordered]@{}
 try {
@@ -604,6 +621,7 @@ catch {
 }
 
 $samples = @()
+$consecutiveSampleFailures = 0
 for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
     try {
         $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
@@ -620,10 +638,16 @@ for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
             AvailableMemoryMB = [Math]::Round(($operatingSystem.FreePhysicalMemory / 1024), 2)
             TotalLogicalDiskFreeGB = [Math]::Round((($logicalDisks | Measure-Object -Property FreeSpace -Sum).Sum / 1GB), 2)
         }
+        $consecutiveSampleFailures = 0
     }
     catch {
         Add-CollectionError -Stage 'performance-sample' -ErrorRecord $_
-        break
+        $consecutiveSampleFailures++
+        # one transient CIM failure must not empty the whole CSV; give up only
+        # after several consecutive failures
+        if ($consecutiveSampleFailures -ge 3) {
+            break
+        }
     }
 
     if ($sampleIndex -lt ($DurationSeconds - 1)) {
@@ -633,6 +657,7 @@ for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
 
 try {
     $samples | Export-Csv -LiteralPath (Join-Path -Path $resolvedOutputDirectory -ChildPath 'performance-samples.csv') -NoTypeInformation -Encoding UTF8
+    [void]$collectedArtifacts.Add('performance-samples.csv')
 }
 catch {
     Add-CollectionError -Stage 'performance-export' -ErrorRecord $_
@@ -656,6 +681,7 @@ try {
         }
     } | Where-Object { $null -ne $_.CPU } | Sort-Object -Property CPU -Descending | Select-Object -First 20
     Write-JsonFile -InputObject $processes -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'top-processes.json')
+    [void]$collectedArtifacts.Add('top-processes.json')
 }
 catch {
     Add-CollectionError -Stage 'process-snapshot' -ErrorRecord $_
@@ -672,6 +698,7 @@ try {
         Add-CollectionErrorText -Stage "network-state-$($sectionError.Section)" -Message $sectionError.Message
     }
     Write-JsonFile -InputObject $networkState -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'network-state.json')
+    [void]$collectedArtifacts.Add('network-state.json')
     $networkStatus = 'completed'
 }
 catch {
@@ -687,6 +714,7 @@ try {
     $safeEvents = Get-EventsSafe -LogName 'System' -StartTime $eventStartTime -MaxEvents $MaxEventCount
     $events = $safeEvents.Events
     Write-JsonFile -InputObject $events -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'system-events-last-24-hours.json')
+    [void]$collectedArtifacts.Add('system-events-last-24-hours.json')
 }
 catch {
     Add-CollectionError -Stage 'system-event-summary' -ErrorRecord $_
@@ -738,6 +766,7 @@ if ($CaptureWpr) {
             else {
                 $wprStartedAtUtc = Get-UtcTimestamp
                 $wprEtlPath = Join-Path $resolvedOutputDirectory 'wpr-trace.etl'
+                $wprStartExitCode = $null
                 $wprStartFailed = $false
                 try {
                     & $wprExe -start $WprProfile -filemode
@@ -747,7 +776,6 @@ if ($CaptureWpr) {
                     }
                 }
                 catch {
-                    $wprStartExitCode = $LASTEXITCODE
                     Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
                     $wprStartFailed = $true
                 }
@@ -769,6 +797,7 @@ if ($CaptureWpr) {
                         $wprCompletedAtUtc = Get-UtcTimestamp
                         if ((Test-Path -LiteralPath $wprEtlPath) -and (Get-Item -LiteralPath $wprEtlPath).Length -gt 0) {
                             $wprEtlFilePath = $wprEtlPath
+                            [void]$collectedArtifacts.Add('wpr-trace.etl')
                             $wprStatus = 'completed'
                         }
                         else {
@@ -782,7 +811,6 @@ if ($CaptureWpr) {
                         }
                     }
                     catch {
-                        $wprStopExitCode = $LASTEXITCODE
                         Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
                         $wprStatus = 'failed'
                     }
@@ -832,6 +860,7 @@ if ($CaptureDefender) {
                     Import-Module -Name DefenderPerformance -ErrorAction Stop
                     New-MpPerformanceRecording -RecordTo $defenderEtlPath -Seconds $DurationSeconds -ErrorAction Stop
                     $defenderEtlFilePath = $defenderEtlPath
+                    [void]$collectedArtifacts.Add('defender-performance.etl')
                     $defenderModuleVersion = (Get-Module -Name DefenderPerformance).Version.ToString()
                     $defenderStatus = 'completed'
                 }
@@ -887,7 +916,7 @@ $collectionManifest = [ordered]@{
         sectionErrorCount = $networkSectionErrorCount
     }
     collectionErrors = $collectionErrors
-    artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory
+    artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
 }
 
 if ($systemLogInfo -and $safeEvents) {

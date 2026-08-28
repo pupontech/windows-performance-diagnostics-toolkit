@@ -1,5 +1,6 @@
 import json
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -40,26 +41,32 @@ def test_plan_mode_writes_a_local_only_read_only_manifest(tmp_path):
 
 
 def test_collect_mode_refuses_to_collect_without_explicit_consent(tmp_path):
-    result = run_tool("-Mode", "Collect", "-OutputDirectory", str(tmp_path / "no-consent"))
+    output_directory = tmp_path / "no-consent"
+    result = run_tool("-Mode", "Collect", "-OutputDirectory", str(output_directory))
 
     assert result.returncode != 0
     assert "requires -ConfirmLocalCollection" in result.stderr
+    # consent gates run before directory creation: refusal leaves zero side effects
+    assert not output_directory.exists()
 
 
 def test_collect_mode_refuses_non_windows_hosts_before_any_collection(tmp_path):
     if platform.system() == "Windows":
         return
 
+    output_directory = tmp_path / "linux-host"
     result = run_tool(
         "-Mode",
         "Collect",
         "-ConfirmLocalCollection",
         "-OutputDirectory",
-        str(tmp_path / "linux-host"),
+        str(output_directory),
     )
 
     assert result.returncode != 0
     assert "supported only on Windows" in result.stderr
+    # the platform gate also precedes directory creation
+    assert not output_directory.exists()
 
 
 def test_plan_mode_with_wpr_lists_capture_action_and_scope(tmp_path):
@@ -100,23 +107,26 @@ def test_plan_mode_without_wpr_has_no_wpr_section(tmp_path):
 
 def test_wpr_capture_refuses_without_wpr_consent(tmp_path):
     """WPR is a separate consent gate from local collection, checked before any run."""
+    output_directory = tmp_path / "no-wpr-consent"
     result = run_tool(
         "-Mode",
         "Collect",
         "-ConfirmLocalCollection",
         "-CaptureWpr",
         "-OutputDirectory",
-        str(tmp_path / "no-wpr-consent"),
+        str(output_directory),
     )
 
     assert result.returncode != 0
     assert "requires -ConfirmWprCapture" in result.stderr
+    assert not output_directory.exists()  # no side effects on refusal
 
 
 def test_collect_with_wpr_consent_still_refuses_non_windows_hosts(tmp_path):
     if platform.system() == "Windows":
         return
 
+    output_directory = tmp_path / "linux-wpr-host"
     result = run_tool(
         "-Mode",
         "Collect",
@@ -124,11 +134,12 @@ def test_collect_with_wpr_consent_still_refuses_non_windows_hosts(tmp_path):
         "-ConfirmWprCapture",
         "-CaptureWpr",
         "-OutputDirectory",
-        str(tmp_path / "linux-wpr-host"),
+        str(output_directory),
     )
 
     assert result.returncode != 0
     assert "supported only on Windows" in result.stderr
+    assert not output_directory.exists()
 
 
 def test_plan_mode_with_defender_lists_capture_action_and_scope(tmp_path):
@@ -455,6 +466,57 @@ def test_crash_analysis_decodes_bugchecks_and_flags_unexplained_shutdowns():
     # the -2min Kernel-Power 41 has a matching bugcheck -> not unexplained;
     # the -30min one has none -> unexplained
     assert len(analysis["unexplainedShutdowns"]) == 1
+
+
+def test_artifact_metadata_hashes_only_whitelisted_names(tmp_path):
+    """Regression: the manifest must never certify files not written this run.
+    Get-ArtifactMetadata with a Names whitelist ignores stale files in a
+    reused output directory (the launchers share C:\\Temp\\WPD-Case)."""
+    script = str(SCRIPT).replace("\\", "/")
+    out_dir = tmp_path / "reused-dir"
+    out_dir.mkdir()
+    (out_dir / "performance-samples.csv").write_text("a,b\n1,2\n")
+    (out_dir / "network-state.json").write_text("{}")
+    (out_dir / "wpr-trace.etl").write_text("STALE-ETL-FROM-PREVIOUS-RUN")  # not in whitelist
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory {out_dir.as_posix()}; "
+        f"Get-ArtifactMetadata -Directory '{out_dir.as_posix()}' -Names @('performance-samples.csv','network-state.json') "
+        "| ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    artifacts = json.loads(result.stdout)
+    names = sorted(a["Name"] for a in artifacts)
+
+    assert names == ["network-state.json", "performance-samples.csv"]
+    assert "wpr-trace.etl" not in names  # stale file must never be certified
+    assert all(re.fullmatch(r"[A-Fa-f0-9]{64}", a["Sha256"]) for a in artifacts)
+
+
+def test_emitted_plan_validates_against_schema(tmp_path):
+    """The schema test must validate REAL tool output, not just parse the schema."""
+    import jsonschema
+
+    schema = json.loads(
+        (REPO_ROOT / "schema" / "diagnostic-report.schema.json").read_text(encoding="utf-8")
+    )
+    output_directory = tmp_path / "plan-schema"
+    result = run_tool("-Mode", "Plan", "-CaptureWpr", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    plan = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    validator = jsonschema.Draft7Validator(schema)
+    errors = sorted(validator.iter_errors(plan), key=lambda e: list(e.path))
+    assert not errors, [(list(e.path), e.message) for e in errors]
 
 
 def test_start_here_bat_is_elevation_safe_and_quote_safe():

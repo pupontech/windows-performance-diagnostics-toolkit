@@ -76,6 +76,48 @@ collection the remaining fields are populated. Recording requires an elevated
 console and the `DefenderPerformance` module (Defender platform 4.18.2108.7 or
 later, per the performance analyzer prerequisites).
 
+## Minidumps Object
+
+The optional `minidumps` object appears when `-CollectMinidumps` is specified.
+It describes crash-dump collection: source dumps under `%SystemRoot%\Minidump`
+are copied **read-only** into the output `minidumps\` folder; the kernel dump
+`%SystemRoot%\MEMORY.DMP` is recorded as metadata only and never copied.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `sourcePath` | string | `%SystemRoot%\Minidump` (plan + collect). |
+| `maxTotalBytes` | integer | Hard cap on copied dump bytes (512 MB). |
+| `memoryDumpRecordedNotCopied` | boolean | Plan-mode declaration: MEMORY.DMP is metadata only. |
+| `enabled` | boolean | Collect mode only. |
+| `status` | string enum | Collect mode only: `completed`, `failed`, `skipped-no-minidumps`. |
+| `memoryDump` | object | `{ exists, sizeBytes, lastWriteTimeUtc }` — metadata only. |
+| `copiedCount` | integer | Dumps copied this run. |
+| `skippedCount` | integer | Dumps skipped (cumulative cap would be exceeded). |
+| `totalBytes` | integer | Bytes copied this run. |
+| `files` | array | Per-dump `{ Name, SizeBytes, SourceLastWriteTimeUtc }`. |
+
+Each copied dump is certified in the `artifacts` list as `minidumps\<name>`.
+
+## Boot-Failure Logs Object
+
+The optional `bootFailureLogs` object appears when `-CollectBootFailureLogs` is
+specified. It covers evidence a non-booting machine leaves behind: the Startup
+Repair trail, the boot log (present only when boot logging was enabled), and
+component-servicing/setup logs. Oversized logs are recorded with
+`skippedReason: "oversized"` — never truncated.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `maxBytesPerFile` | integer | Per-file cap (100 MB). |
+| `sources` | array of string | Plan-mode source names: `srt-trail`, `boot-log`, `cbs-log`, `setupapi-panther`, `setupapi-error`, `dism-log`. |
+| `enabled` | boolean | Collect mode only. |
+| `status` | string enum | Collect mode only: `completed`, `failed`. |
+| `copiedCount` | integer | Logs copied this run. |
+| `skippedOversizedCount` | integer | Logs present but over cap. |
+| `sourceEntries` | array of object | Collect mode per-source `{ name, sourcePath, found, sizeBytes, copied, copiedTo, skippedReason }`. |
+
+Each copied log is certified in the `artifacts` list as `bootfailure\<leaf>`.
+
 ## Safety Object
 
 Every manifest includes a `safety` object that declares the tool's runtime

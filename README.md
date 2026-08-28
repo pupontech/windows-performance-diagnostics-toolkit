@@ -95,15 +95,15 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
 
-The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, and a manifest with SHA-256 hashes. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
+The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and a manifest with SHA-256 hashes. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, transfer artifacts, or remediate anything. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
 
 ## Deployment bundle
 
 `make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from a verified clean git tree. The bundle ships:
 
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
-- `START-HERE.bat` — double-click console menu: UAC self-elevation, then 1) Full+WPR trace, 2) Basic, 3) Full+WPR+Defender recording, 4) Plan preview, 5) Exit; every run logged to `C:\Temp\WPD-Case\diagnostics-run.log`
-- `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace)
+- `START-HERE.bat` — double-click console menu: UAC self-elevation, then 1) Full+WPR trace + crash evidence, 2) Basic, 3) Full+WPR+Defender + crash evidence, 4) Plan preview, 5) Crash evidence only (minidumps + boot-failure logs), 6) Exit; every run logged to `C:\Temp\WPD-Case\diagnostics-run.log`
+- `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace; includes minidumps + boot-failure evidence)
 - `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)
 - `schema\`, `docs\`, `tests\` — report contract, source map, live test matrix
 
@@ -112,6 +112,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - ✅ Machine-readable report schema (`schema/diagnostic-report.schema.json`, `docs/report-schema.md`)
 - ✅ Consent-gated, time-bounded WPR capture (`-CaptureWpr` + `-ConfirmWprCapture`, `GeneralProfile` or `CPU`/`DiskIO`/`FileIO`/`Network`/`Power`/`GPU`/`Registry`)
 - ✅ Consent-gated, time-bounded Defender performance capture (`-CaptureDefender` + `-ConfirmDefenderCapture`, official `New-MpPerformanceRecording`)
+- ✅ Consent-gated crash-evidence stages (`-CollectMinidumps` + `-ConfirmMinidumpCollection`, `-CollectBootFailureLogs` + `-ConfirmBootFailureLogCollection`; WinRE runbook in `docs/winre-boot-failure-runbook.md`)
 - ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)
 - ✅ WPA-oriented analysis guidance (`docs/wpa-analysis-guide.md`)
 - 🔜 Windows lab test matrix execution before any live remediation capability

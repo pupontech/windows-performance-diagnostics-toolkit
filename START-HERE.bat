@@ -50,22 +50,24 @@ echo   1 - Full collection + WPR trace         (recommended)
 echo   2 - Basic collection                   (no WPR)
 echo   3 - Full + WPR + Defender recording    (needs DefenderPerformance module)
 echo   4 - Plan preview only                  (writes plan, collects nothing)
-echo   5 - Exit
+echo   5 - Crash evidence only                (minidumps + boot-failure logs, no WPR)
+echo   6 - Exit
 echo.
-set /p CHOICE="Enter 1-5: "
+set /p CHOICE="Enter 1-6: "
 
 :choice_set
 if "%CHOICE%"=="1" goto :opt_full
 if "%CHOICE%"=="2" goto :opt_basic
 if "%CHOICE%"=="3" goto :opt_defender
 if "%CHOICE%"=="4" goto :opt_plan
-if "%CHOICE%"=="5" exit /b 0
+if "%CHOICE%"=="5" goto :opt_crash
+if "%CHOICE%"=="6" exit /b 0
 echo [ERROR] Invalid choice: %CHOICE%
 echo.
 goto :end
 
 :opt_full
-set "EXTRA=-CaptureWpr -ConfirmWprCapture"
+set "EXTRA=-CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection"
 goto :run
 
 :opt_basic
@@ -73,7 +75,12 @@ set "EXTRA="
 goto :run
 
 :opt_defender
-set "EXTRA=-CaptureWpr -ConfirmWprCapture -CaptureDefender -ConfirmDefenderCapture"
+set "EXTRA=-CaptureWpr -ConfirmWprCapture -CaptureDefender -ConfirmDefenderCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection"
+goto :run
+
+:opt_crash
+echo Collecting minidumps and boot-failure evidence only...
+set "EXTRA=-CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection"
 goto :run
 
 :opt_plan
@@ -108,6 +115,8 @@ echo   - top-processes.json           (process snapshot)
 echo   - system-events-last-24-hours.json
 echo   - wpr-trace.etl                (only with options 1 or 3)
 echo   - defender-performance.etl     (only with option 3)
+echo   - minidumps\                   (crash dumps, options 1, 3 or 5)
+echo   - bootfailure\                 (SRT/boot/CBS logs, options 1, 3 or 5)
 echo Full log: %LOG%
 echo.
 

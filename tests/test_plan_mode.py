@@ -233,6 +233,150 @@ def test_collect_with_defender_consent_still_refuses_non_windows_hosts(tmp_path)
     assert "supported only on Windows" in result.stderr
 
 
+def test_plan_mode_with_minidumps_lists_action_and_scope(tmp_path):
+    """Plan mode must advertise the minidump collection action and its bounds
+    without touching Windows-only crash-dump paths."""
+    output_directory = tmp_path / "plan-minidumps"
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-CollectMinidumps",
+        "-OutputDirectory",
+        str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "collect-minidumps-after-explicit-consent" in manifest["plannedActions"]
+    assert manifest["minidumps"]["maxTotalBytes"] == 536870912  # 512 MB
+    assert manifest["minidumps"]["memoryDumpRecordedNotCopied"] is True
+    assert manifest["minidumps"]["sourcePath"].lower().endswith("minidump")
+
+
+def test_plan_mode_without_minidumps_has_no_minidumps_section(tmp_path):
+    output_directory = tmp_path / "plan-plain-minidumps"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "minidumps" not in manifest
+    assert "collect-minidumps-after-explicit-consent" not in manifest["plannedActions"]
+
+
+def test_minidump_collection_refuses_without_consent(tmp_path):
+    """Minidump collection is a separate consent gate, checked before any run."""
+    result = run_tool(
+        "-Mode",
+        "Collect",
+        "-ConfirmLocalCollection",
+        "-CollectMinidumps",
+        "-OutputDirectory",
+        str(tmp_path / "no-minidump-consent"),
+    )
+
+    assert result.returncode != 0
+    assert "requires -ConfirmMinidumpCollection" in result.stderr
+
+
+def test_collect_with_minidump_consent_still_refuses_non_windows_hosts(tmp_path):
+    if platform.system() == "Windows":
+        return
+
+    result = run_tool(
+        "-Mode",
+        "Collect",
+        "-ConfirmLocalCollection",
+        "-CollectMinidumps",
+        "-ConfirmMinidumpCollection",
+        "-OutputDirectory",
+        str(tmp_path / "linux-minidump-host"),
+    )
+
+    assert result.returncode != 0
+    assert "supported only on Windows" in result.stderr
+
+
+def test_plan_mode_with_boot_failure_logs_lists_action_and_scope(tmp_path):
+    """Plan mode must advertise the boot-failure evidence action and its
+    source list without touching Windows-only log paths."""
+    output_directory = tmp_path / "plan-bootfailure"
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-CollectBootFailureLogs",
+        "-OutputDirectory",
+        str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "collect-boot-failure-evidence-after-explicit-consent" in manifest["plannedActions"]
+    assert manifest["bootFailureLogs"]["maxBytesPerFile"] == 104857600  # 100 MB
+    assert manifest["bootFailureLogs"]["sources"] == [
+        "srt-trail",
+        "boot-log",
+        "cbs-log",
+        "setupapi-panther",
+        "setupapi-error",
+        "dism-log",
+    ]
+
+
+def test_plan_mode_without_boot_failure_logs_has_no_section(tmp_path):
+    output_directory = tmp_path / "plan-plain-bootfailure"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert "bootFailureLogs" not in manifest
+    assert "collect-boot-failure-evidence-after-explicit-consent" not in manifest["plannedActions"]
+
+
+def test_boot_failure_log_collection_refuses_without_consent(tmp_path):
+    """Boot-failure log collection is a separate consent gate, checked before any run."""
+    result = run_tool(
+        "-Mode",
+        "Collect",
+        "-ConfirmLocalCollection",
+        "-CollectBootFailureLogs",
+        "-OutputDirectory",
+        str(tmp_path / "no-bootfailure-consent"),
+    )
+
+    assert result.returncode != 0
+    assert "requires -ConfirmBootFailureLogCollection" in result.stderr
+
+
+def test_collect_with_boot_failure_consent_still_refuses_non_windows_hosts(tmp_path):
+    if platform.system() == "Windows":
+        return
+
+    result = run_tool(
+        "-Mode",
+        "Collect",
+        "-ConfirmLocalCollection",
+        "-CollectBootFailureLogs",
+        "-ConfirmBootFailureLogCollection",
+        "-OutputDirectory",
+        str(tmp_path / "linux-bootfailure-host"),
+    )
+
+    assert result.returncode != 0
+    assert "supported only on Windows" in result.stderr
+
+
 def test_release_packaging_files_present():
     """The deploy bundle must ship launchers and unblock guidance."""
     assert (REPO_ROOT / "Run-Diagnostics.bat").is_file()
@@ -250,6 +394,9 @@ def test_report_schema_is_valid_json():
     schema = json_module.loads(schema_path.read_text(encoding="utf-8"))
     assert schema["$schema"] == "http://json-schema.org/draft-07/schema#"
     assert schema["properties"]["mode"]["enum"] == ["Plan", "Collect"]
+    # consent-gated crash-evidence stages are part of the report contract
+    assert "minidumps" in schema["properties"]
+    assert "bootFailureLogs" in schema["properties"]
 
 
 def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
@@ -510,7 +657,14 @@ def test_emitted_plan_validates_against_schema(tmp_path):
         (REPO_ROOT / "schema" / "diagnostic-report.schema.json").read_text(encoding="utf-8")
     )
     output_directory = tmp_path / "plan-schema"
-    result = run_tool("-Mode", "Plan", "-CaptureWpr", "-OutputDirectory", str(output_directory))
+    result = run_tool(
+        "-Mode", "Plan",
+        "-CaptureWpr",
+        "-CaptureDefender",
+        "-CollectMinidumps",
+        "-CollectBootFailureLogs",
+        "-OutputDirectory", str(output_directory),
+    )
 
     assert result.returncode == 0, result.stderr
 
@@ -546,9 +700,10 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     assert "-Verb RunAs" in text
     # CI must never hang on UAC: guard the elevation attempt
     assert 'if "%CI%"=="true"' in text
-    # Console menu with the five options
+    # Console menu with the six options
     for option in ("1 - Full collection", "2 - Basic collection",
-                   "3 - Full + WPR + Defender", "4 - Plan preview", "5 - Exit"):
+                   "3 - Full + WPR + Defender", "4 - Plan preview", "5 - Crash evidence only",
+                   "6 - Exit"):
         assert option in text, f"missing menu option {option!r}"
     # Consent flags must be passed explicitly per option
     assert "-Mode Collect" in text
@@ -557,6 +712,10 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     assert "-ConfirmWprCapture" in text
     assert "-CaptureDefender" in text
     assert "-ConfirmDefenderCapture" in text
+    assert "-CollectMinidumps" in text
+    assert "-ConfirmMinidumpCollection" in text
+    assert "-CollectBootFailureLogs" in text
+    assert "-ConfirmBootFailureLogCollection" in text
     # Defender-strip resilience: pre-flight existence check with recovery steps
     assert "src\\Invoke-WindowsPerformanceDiagnostics.ps1 was not found" in text
     # Result visibility: log everything with Tee-Object, never a silent failure

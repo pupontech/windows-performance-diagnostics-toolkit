@@ -22,12 +22,26 @@ param(
 
     [switch]$CaptureDefender,
 
-    [switch]$ConfirmDefenderCapture
+    [switch]$ConfirmDefenderCapture,
+
+    [switch]$CollectMinidumps,
+
+    [switch]$ConfirmMinidumpCollection,
+
+    [switch]$CollectBootFailureLogs,
+
+    [switch]$ConfirmBootFailureLogCollection
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.5.1'
+$ScriptVersion = '0.6.0'
+
+# Bounds for the consent-gated crash-evidence stages (advertised in Plan mode,
+# enforced in Collect mode). Minidumps are typically <1 MB; MEMORY.DMP is
+# recorded as metadata only and never copied.
+$script:MaxMinidumpTotalBytes = 512MB
+$script:MaxBootFailureLogBytes = 100MB
 
 function Write-JsonFile {
     param(
@@ -573,6 +587,25 @@ if ($CaptureDefender) {
     }
 }
 
+$minidumpSourcePath = if ($env:SystemRoot) { Join-Path $env:SystemRoot 'Minidump' } else { 'C:\Windows\Minidump' }
+
+if ($CollectMinidumps) {
+    $planManifest.plannedActions += 'collect-minidumps-after-explicit-consent'
+    $planManifest.minidumps = [ordered]@{
+        sourcePath = $minidumpSourcePath
+        maxTotalBytes = $script:MaxMinidumpTotalBytes
+        memoryDumpRecordedNotCopied = $true
+    }
+}
+
+if ($CollectBootFailureLogs) {
+    $planManifest.plannedActions += 'collect-boot-failure-evidence-after-explicit-consent'
+    $planManifest.bootFailureLogs = [ordered]@{
+        maxBytesPerFile = $script:MaxBootFailureLogBytes
+        sources = @('srt-trail', 'boot-log', 'cbs-log', 'setupapi-panther', 'setupapi-error', 'dism-log')
+    }
+}
+
 if ($Mode -eq 'Plan') {
     try {
         New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
@@ -596,6 +629,14 @@ if (-not $ConfirmWprCapture -and $CaptureWpr) {
 
 if (-not $ConfirmDefenderCapture -and $CaptureDefender) {
     throw 'Defender performance capture requires -ConfirmDefenderCapture. No diagnostic data was collected.'
+}
+
+if (-not $ConfirmMinidumpCollection -and $CollectMinidumps) {
+    throw 'Minidump collection requires -ConfirmMinidumpCollection. No diagnostic data was collected.'
+}
+
+if (-not $ConfirmBootFailureLogCollection -and $CollectBootFailureLogs) {
+    throw 'Boot-failure log collection requires -ConfirmBootFailureLogCollection. No diagnostic data was collected.'
 }
 
 if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
@@ -763,6 +804,141 @@ try {
 }
 catch {
     Add-CollectionError -Stage 'crash-analysis' -ErrorRecord $_
+}
+
+# ---- Minidump collection (consent-gated; read-only copy of crash dumps) ----
+# Source files are never modified or deleted. MEMORY.DMP is recorded as
+# metadata only - kernel dumps can be GBs and are not worth copying blind.
+$minidumpStatus = $null
+$minidumpMemoryDumpInfo = [ordered]@{
+    exists = $false
+    sizeBytes = $null
+    lastWriteTimeUtc = $null
+}
+$minidumpCopiedCount = 0
+$minidumpSkippedCount = 0
+$minidumpTotalBytes = 0
+$minidumpFiles = @()
+
+if ($CollectMinidumps) {
+    try {
+        $minidumpDir = Join-Path $resolvedOutputDirectory 'minidumps'
+        New-Item -ItemType Directory -Force -Path $minidumpDir | Out-Null
+
+        $memoryDumpPath = Join-Path $env:SystemRoot 'MEMORY.DMP'
+        if (Test-Path -LiteralPath $memoryDumpPath) {
+            $memoryDumpItem = Get-Item -LiteralPath $memoryDumpPath
+            $minidumpMemoryDumpInfo = [ordered]@{
+                exists = $true
+                sizeBytes = $memoryDumpItem.Length
+                lastWriteTimeUtc = $memoryDumpItem.LastWriteTime.ToUniversalTime().ToString('o')
+            }
+        }
+
+        $dumps = @(
+            Get-ChildItem -LiteralPath $minidumpSourcePath -Filter '*.dmp' -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending
+        )
+        if ($dumps.Count -eq 0 -and -not $minidumpMemoryDumpInfo.exists) {
+            # no crash dumps and no kernel dump: healthy machines commonly have
+            # none - record as skipped, not as an error
+            $minidumpStatus = 'skipped-no-minidumps'
+        }
+        else {
+            foreach ($dump in $dumps) {
+                if (($minidumpTotalBytes + $dump.Length) -gt $script:MaxMinidumpTotalBytes) {
+                    $minidumpSkippedCount++
+                    continue
+                }
+                $minidumpDest = Join-Path $minidumpDir $dump.Name
+                Copy-Item -LiteralPath $dump.FullName -Destination $minidumpDest -Force
+                $minidumpTotalBytes += $dump.Length
+                $minidumpCopiedCount++
+                [void]$collectedArtifacts.Add("minidumps\$($dump.Name)")
+                $minidumpFiles += [pscustomobject]@{
+                    Name = $dump.Name
+                    SizeBytes = $dump.Length
+                    SourceLastWriteTimeUtc = $dump.LastWriteTime.ToUniversalTime().ToString('o')
+                }
+            }
+            $minidumpStatus = 'completed'
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'minidump-collection' -ErrorRecord $_
+        $minidumpStatus = 'failed'
+    }
+}
+
+# ---- Boot-failure evidence (consent-gated; read-only copy of SRT/boot/CBS logs) ----
+# Evidence a non-booting machine leaves behind: Startup-Repair trail, boot log
+# (present only if boot logging was enabled), component servicing and setup
+# logs. Oversized logs (CBS can grow to GBs) are recorded and skipped, never
+# truncated - a truncated log is worse than no log.
+$bootFailureStatus = $null
+$bootFailureCopiedCount = 0
+$bootFailureSkippedOversizedCount = 0
+$bootFailureSources = @()
+
+if ($CollectBootFailureLogs) {
+    try {
+        $bootFailureDir = Join-Path $resolvedOutputDirectory 'bootfailure'
+        New-Item -ItemType Directory -Force -Path $bootFailureDir | Out-Null
+
+        $bootFailureCandidates = @(
+            [pscustomobject]@{ Name = 'srt-trail'; SourcePath = (Join-Path $env:SystemRoot 'System32\LogFiles\Srt\SrtTrail.txt') }
+            [pscustomobject]@{ Name = 'boot-log'; SourcePath = (Join-Path $env:SystemRoot 'ntbtlog.txt') }
+            [pscustomobject]@{ Name = 'cbs-log'; SourcePath = (Join-Path $env:SystemRoot 'Logs\CBS\CBS.log') }
+            [pscustomobject]@{ Name = 'setupapi-panther'; SourcePath = (Join-Path $env:SystemRoot 'Panther\setupact.log') }
+            [pscustomobject]@{ Name = 'setupapi-error'; SourcePath = (Join-Path $env:SystemRoot 'Panther\setuperr.log') }
+            [pscustomobject]@{ Name = 'dism-log'; SourcePath = (Join-Path $env:SystemRoot 'Logs\DISM\dism.log') }
+        )
+        $bootFailureSourceEntries = @()
+        foreach ($candidate in $bootFailureCandidates) {
+            if (Test-Path -LiteralPath $candidate.SourcePath) {
+                $candidateItem = Get-Item -LiteralPath $candidate.SourcePath
+                $entry = [ordered]@{
+                    name = $candidate.Name
+                    sourcePath = $candidate.SourcePath
+                    found = $true
+                    sizeBytes = $candidateItem.Length
+                    copied = $false
+                    copiedTo = $null
+                    skippedReason = $null
+                }
+                if ($candidateItem.Length -le $script:MaxBootFailureLogBytes) {
+                    $bootFailureDest = Join-Path $bootFailureDir $candidateItem.Name
+                    Copy-Item -LiteralPath $candidate.SourcePath -Destination $bootFailureDest -Force
+                    $entry.copied = $true
+                    $entry.copiedTo = "bootfailure\$($candidateItem.Name)"
+                    $bootFailureCopiedCount++
+                    [void]$collectedArtifacts.Add("bootfailure\$($candidateItem.Name)")
+                }
+                else {
+                    $entry.skippedReason = 'oversized'
+                    $bootFailureSkippedOversizedCount++
+                }
+            }
+            else {
+                $entry = [ordered]@{
+                    name = $candidate.Name
+                    sourcePath = $candidate.SourcePath
+                    found = $false
+                    sizeBytes = $null
+                    copied = $false
+                    copiedTo = $null
+                    skippedReason = $null
+                }
+            }
+            $bootFailureSourceEntries += $entry
+        }
+        $bootFailureSources = $bootFailureSourceEntries
+        $bootFailureStatus = 'completed'
+    }
+    catch {
+        Add-CollectionError -Stage 'boot-failure-log-collection' -ErrorRecord $_
+        $bootFailureStatus = 'failed'
+    }
 }
 
 $wprStatus = $null
@@ -1000,6 +1176,31 @@ if ($CaptureDefender) {
         completedAtUtc = $defenderCompletedAtUtc
         moduleVersion = $defenderModuleVersion
         status = $defenderStatus
+    }
+}
+
+if ($CollectMinidumps) {
+    $collectionManifest.minidumps = [ordered]@{
+        enabled = $true
+        status = $minidumpStatus
+        sourcePath = $minidumpSourcePath
+        maxTotalBytes = $script:MaxMinidumpTotalBytes
+        memoryDump = $minidumpMemoryDumpInfo
+        copiedCount = $minidumpCopiedCount
+        skippedCount = $minidumpSkippedCount
+        totalBytes = $minidumpTotalBytes
+        files = @($minidumpFiles)
+    }
+}
+
+if ($CollectBootFailureLogs) {
+    $collectionManifest.bootFailureLogs = [ordered]@{
+        enabled = $true
+        status = $bootFailureStatus
+        maxBytesPerFile = $script:MaxBootFailureLogBytes
+        copiedCount = $bootFailureCopiedCount
+        skippedOversizedCount = $bootFailureSkippedOversizedCount
+        sourceEntries = @($bootFailureSources)
     }
 }
 

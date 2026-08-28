@@ -130,6 +130,132 @@
       },
       "additionalProperties": false
     },
+    "minidumps": {
+      "type": "object",
+      "description": "Present when -CollectMinidumps was requested. Plan mode advertises the scope; Collect mode reports the outcome. Source dumps are copied read-only; MEMORY.DMP is metadata only.",
+      "properties": {
+        "sourcePath": {
+          "type": "string"
+        },
+        "maxTotalBytes": {
+          "type": "integer"
+        },
+        "memoryDumpRecordedNotCopied": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "failed", "skipped-no-minidumps"]
+        },
+        "memoryDump": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "sizeBytes": {
+              "type": ["integer", "null"]
+            },
+            "lastWriteTimeUtc": {
+              "type": ["string", "null"],
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false
+        },
+        "copiedCount": {
+          "type": "integer"
+        },
+        "skippedCount": {
+          "type": "integer"
+        },
+        "totalBytes": {
+          "type": "integer"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "Name": {
+                "type": "string"
+              },
+              "SizeBytes": {
+                "type": "integer"
+              },
+              "SourceLastWriteTimeUtc": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "bootFailureLogs": {
+      "type": "object",
+      "description": "Present when -CollectBootFailureLogs was requested. Plan mode advertises the scope; Collect mode reports per-source outcome. Oversized logs are recorded with skippedReason 'oversized', never truncated.",
+      "properties": {
+        "maxBytesPerFile": {
+          "type": "integer"
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "failed"]
+        },
+        "copiedCount": {
+          "type": "integer"
+        },
+        "skippedOversizedCount": {
+          "type": "integer"
+        },
+        "sourceEntries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "sourcePath": {
+                "type": "string"
+              },
+              "found": {
+                "type": "boolean"
+              },
+              "sizeBytes": {
+                "type": ["integer", "null"]
+              },
+              "copied": {
+                "type": "boolean"
+              },
+              "copiedTo": {
+                "type": ["string", "null"]
+              },
+              "skippedReason": {
+                "type": ["string", "null"]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "startedAtUtc": {
       "type": "string",
       "format": "date-time"

@@ -166,6 +166,10 @@ jobs:
         shell: cmd
         run: call START-HERE.bat 4
 
+      - name: Run the START-HERE menu in auto mode (option 5, crash evidence only)
+        shell: cmd
+        run: call START-HERE.bat 5
+
       - name: Assert launchers produced the diagnostic artifacts
         shell: pwsh
         run: |
@@ -184,6 +188,14 @@ jobs:
           }
           if ($m.network.status -ne "completed") {
             Write-Error "Unexpected network.status: $($m.network.status)"
+            exit 1
+          }
+          if ($m.minidumps.enabled -ne $true -or $m.minidumps.status -notin @("completed","skipped-no-minidumps","failed")) {
+            Write-Error "Unexpected minidumps block: $($m.minidumps | ConvertTo-Json -Compress)"
+            exit 1
+          }
+          if ($m.bootFailureLogs.enabled -ne $true -or $m.bootFailureLogs.status -notin @("completed","failed")) {
+            Write-Error "Unexpected bootFailureLogs block: $($m.bootFailureLogs | ConvertTo-Json -Compress)"
             exit 1
           }
           if ($m.network.dnsVsPing.verdict -notin @("dns-and-connectivity-ok","dns-failure","icmp-blocked-or-partial","connectivity-failure","inconclusive")) {

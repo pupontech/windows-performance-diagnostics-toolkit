@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Consent-gated crash-evidence stages (patterns adopted from the field-tested RemoteDiagnostics kit: `pull-minidumps.ps1` + `Pull-BootFailureLogs.bat`).
+
+- **Minidump collection (`-CollectMinidumps` + `-ConfirmMinidumpCollection`)**: crash dumps under `%SystemRoot%\Minidump` are copied read-only into the output `minidumps\` folder (newest first, 512 MB cumulative cap, oversized skipped and counted); the kernel dump `MEMORY.DMP` is recorded as metadata only, never copied. Status `completed` / `failed` / `skipped-no-minidumps` (healthy machines commonly have none — not an error). Each copied dump is certified in the `artifacts` whitelist.
+- **Boot-failure evidence (`-CollectBootFailureLogs` + `-ConfirmBootFailureLogCollection`)**: Startup-Repair trail (`SrtTrail.txt`), boot log (`ntbtlog.txt`), CBS, Panther setup, and DISM logs are copied read-only into the output `bootfailure\` folder. Logs over the 100 MB per-file cap are recorded with `skippedReason: "oversized"` — never truncated. Per-source `sourceEntries` report found/copied/skipped so a missing boot log is visible, not silent.
+- Both stages: separate consent gates checked before any side effect, Plan-mode advertising (`collect-minidumps-after-explicit-consent`, `collect-boot-failure-evidence-after-explicit-consent`), schema + report-schema coverage, START-HERE option 5 (crash evidence only), Run-Diagnostics.bat includes both.
+- **WinRE runbook** (`docs/winre-boot-failure-runbook.md`): for machines that will not boot — collect SRT/CBS/DISM/ntbtlog evidence to a PE drive. Boot logging is **not** enabled automatically; `bcdedit /set {default} bootlog yes` is an explicit, user-confirmed manual step (persistent system change, outside the collector's no-mutation contract).
+- Safety contract unchanged: read-only, local-only, no auto-elevation, no remediation.
+
 ## 0.5.1 — 2026-08-28
 
 Stability release (found by the Matt-Pocock review + live CI gates).

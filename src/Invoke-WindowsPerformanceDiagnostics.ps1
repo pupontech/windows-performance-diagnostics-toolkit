@@ -37,7 +37,17 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.6.0'
+# Single source of truth for the version is the VERSION file at the repo/bundle
+# root; the constant below is only a fallback for standalone copies of the
+# script (e.g. CI staging copies) - test_version_file_matches_script_fallback
+# keeps the two in sync so drift fails CI.
+$script:ScriptVersion = '0.6.0'
+try {
+    $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
+}
+catch {
+    # VERSION file not present (standalone copy) - fallback constant above
+}
 
 # Bounds for the consent-gated crash-evidence stages (advertised in Plan mode,
 # enforced in Collect mode). Minidumps are typically <1 MB; MEMORY.DMP is
@@ -54,7 +64,12 @@ function Write-JsonFile {
         [string]$Path
     )
 
-    $InputObject | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+    # Explicit UTF-8 WITHOUT BOM: Windows PowerShell 5.1's Set-Content -Encoding
+    # UTF8 writes a BOM while pwsh 7 does not, so manifests would differ by
+    # engine. WriteAllText with UTF8Encoding($false) makes the JSON contract
+    # byte-identical on both.
+    $json = $InputObject | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Get-UtcTimestamp {

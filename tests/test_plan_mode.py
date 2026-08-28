@@ -31,6 +31,9 @@ def test_plan_mode_writes_a_local_only_read_only_manifest(tmp_path):
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
 
+    assert manifest["toolVersion"] == (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    assert manifest_path.read_bytes()[:3] != b"\xef\xbb\xbf"  # no BOM: JSON must be byte-identical on PS 5.1 and pwsh 7
+
     assert manifest["schemaVersion"] == "1.0"
     assert manifest["mode"] == "Plan"
     assert manifest["safety"]["localOnly"] is True
@@ -460,6 +463,22 @@ def test_release_packaging_files_present():
     assert (REPO_ROOT / "START-HERE.bat").is_file()
     assert (REPO_ROOT / "README-FIRST.txt").is_file()
     assert (REPO_ROOT / "make-deploy-bundle.sh").is_file()
+
+
+def test_version_file_matches_script_fallback():
+    """Single-source version: the ps1 must read VERSION at runtime, and its
+    standalone-copy fallback constant must never drift from the VERSION file."""
+    import re as re_module
+
+    version = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    script = (REPO_ROOT / "src" / "Invoke-WindowsPerformanceDiagnostics.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+    match = re_module.search(r"\$script:ScriptVersion = '([^']+)'", script)
+    assert match, "fallback ScriptVersion constant missing from ps1"
+    assert match.group(1) == version, (
+        f"fallback ScriptVersion {match.group(1)!r} != VERSION {version!r}"
+    )
 
 
 def test_report_schema_is_valid_json():

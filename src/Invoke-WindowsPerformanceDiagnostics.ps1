@@ -338,15 +338,20 @@ function Get-NetworkState {
     # DNS-vs-ping split test: reach a public IP by raw address (link/routing
     # without DNS) and resolve public names (DNS). The combination tells the
     # technician whether the outage is in connectivity or in name resolution.
+    # Probes are hard-timeout bounded (.NET Ping 2s; GetHostAddresses resolver
+    # timeout) - Test-Connection/Resolve-DnsName can block for minutes when
+    # ICMP/DNS is silently dropped (observed in batch-logon standard-user
+    # sessions on CI runners).
     $pingTargets = @('8.8.8.8', '1.1.1.1')
     $pingResults = @()
     foreach ($target in $pingTargets) {
+        $ping = New-Object System.Net.NetworkInformation.Ping
         try {
-            $replies = @(Test-Connection -ComputerName $target -Count 3 -ErrorAction SilentlyContinue)
+            $reply = $ping.Send($target, 2000)
             $pingResults += [pscustomobject]@{
                 Target = $target
-                Reachable = ($replies.Count -gt 0)
-                ReplyCount = $replies.Count
+                Reachable = ($null -ne $reply -and $reply.Status -eq 'Success')
+                ReplyCount = 1
             }
         }
         catch {
@@ -357,6 +362,9 @@ function Get-NetworkState {
                 Error = $_.Exception.Message
             }
         }
+        finally {
+            $ping.Dispose()
+        }
     }
 
     $dnsTargets = @('google.com', 'cloudflare.com', 'microsoft.com')
@@ -364,9 +372,8 @@ function Get-NetworkState {
     foreach ($domain in $dnsTargets) {
         try {
             $resolvedIps = @(
-                Resolve-DnsName -Name $domain -ErrorAction Stop |
-                    Where-Object { $_.Type -in @('A', 'AAAA') } |
-                    ForEach-Object { $_.IPAddress }
+                [System.Net.Dns]::GetHostAddresses($domain) |
+                    ForEach-Object { $_.IPAddressToString }
             )
             $dnsResults += [pscustomobject]@{
                 Domain = $domain
@@ -441,12 +448,25 @@ function Get-NetworkState {
     }
 
     try {
-        $state['tcpConnections'] = @(
-            Get-NetTCPConnection -ErrorAction SilentlyContinue |
-                Where-Object { $_.State -in @('Established', 'Listen') } |
-                Sort-Object LocalPort |
-                Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess
+        # netstat -ano instead of Get-NetTCPConnection: the cmdlet enumerates
+        # per-connection owning processes and can take minutes for a restricted
+        # token (batch-logon standard user); netstat is native and instant.
+        $tcpConnections = @(
+            (& netstat -ano) | Where-Object { $_ -match '^\s*TCP' } | ForEach-Object {
+                $parts = @(($_ -split '\s+') | Where-Object { $_ })
+                if ($parts.Count -ge 5) {
+                    [pscustomobject]@{
+                        LocalAddress = $parts[1]
+                        LocalPort = ($parts[1] -split ':')[-1]
+                        RemoteAddress = $parts[2]
+                        RemotePort = ($parts[2] -split ':')[-1]
+                        State = $parts[3]
+                        OwningProcess = $parts[4]
+                    }
+                }
+            } | Where-Object { $_.State -in @('ESTABLISHED', 'LISTENING') } | Sort-Object LocalPort
         )
+        $state['tcpConnections'] = $tcpConnections
     }
     catch {
         $errors += [pscustomobject]@{ Section = 'tcp-connections'; Message = $_.Exception.Message }
@@ -701,35 +721,17 @@ $networkState = $null
 $networkStatus = 'failed'
 $networkSectionErrorCount = 0
 try {
-    # Get-NetworkState runs in a bounded job: a slow or blocked sub-collection
-    # (observed as a 120s+ hang for a standard-user batch-logon session on CI
-    # runners) must never stall the whole collection. 60s is generous for
-    # network introspection; a timeout records an error and continues.
-    $networkJob = Start-Job -ScriptBlock {
-        param($fnNetwork, $fnPropertyValue, $fnMatch)
-        Set-Item -Path function:Get-NetworkState -Value $fnNetwork
-        Set-Item -Path function:Get-PropertyValue -Value $fnPropertyValue
-        Set-Item -Path function:Test-SecuritySoftwareMatch -Value $fnMatch
-        Get-NetworkState
-    } -ArgumentList $function:Get-NetworkState, $function:Get-PropertyValue, $function:Test-SecuritySoftwareMatch
-    if (Wait-Job -Job $networkJob -Timeout 60) {
-        $networkResult = Receive-Job -Job $networkJob
-        Remove-Job -Job $networkJob -Force
-        $networkState = $networkResult.State
-        $networkSectionErrorCount = @($networkResult.Errors).Count
-        foreach ($sectionError in @($networkResult.Errors)) {
-            Add-CollectionErrorText -Stage "network-state-$($sectionError.Section)" -Message $sectionError.Message
-        }
-        Write-JsonFile -InputObject $networkState -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'network-state.json')
-        [void]$collectedArtifacts.Add('network-state.json')
-        $networkStatus = 'completed'
+    # all network sub-collections are probe-bounded and independently guarded;
+    # a single slow section never loses the rest
+    $networkResult = Get-NetworkState
+    $networkState = $networkResult.State
+    $networkSectionErrorCount = @($networkResult.Errors).Count
+    foreach ($sectionError in @($networkResult.Errors)) {
+        Add-CollectionErrorText -Stage "network-state-$($sectionError.Section)" -Message $sectionError.Message
     }
-    else {
-        Stop-Job -Job $networkJob -ErrorAction SilentlyContinue
-        Remove-Job -Job $networkJob -Force -ErrorAction SilentlyContinue
-        Add-CollectionErrorText -Stage 'network-state' -Message 'network-state collection timed out after 60 seconds; skipped'
-        $networkStatus = 'failed'
-    }
+    Write-JsonFile -InputObject $networkState -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'network-state.json')
+    [void]$collectedArtifacts.Add('network-state.json')
+    $networkStatus = 'completed'
 }
 catch {
     Add-CollectionError -Stage 'network-state' -ErrorRecord $_

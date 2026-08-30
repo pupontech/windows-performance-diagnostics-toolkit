@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
 # keeps the two in sync so drift fails CI.
-$script:ScriptVersion = '0.6.0'
+$script:ScriptVersion = '0.7.0'
 try {
     $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
 }

@@ -881,17 +881,37 @@ if ($RemoteComputer) {
         } -ArgumentList $remoteOutDir
         Copy-Item -ToSession $session -Path $MyInvocation.MyCommand.Path -Destination $remoteScriptPath -Force
 
-        $remoteArgs = @('-Mode', 'Collect', '-ConfirmLocalCollection', '-OutputDirectory', $remoteOutDir)
-        if ($CaptureWpr) { $remoteArgs += @('-CaptureWpr', '-ConfirmWprCapture', '-WprProfile', $WprProfile) }
-        if ($CaptureDefender) { $remoteArgs += @('-CaptureDefender', '-ConfirmDefenderCapture') }
-        if ($CollectMinidumps) { $remoteArgs += @('-CollectMinidumps', '-ConfirmMinidumpCollection') }
-        if ($CollectBootFailureLogs) { $remoteArgs += @('-CollectBootFailureLogs', '-ConfirmBootFailureLogCollection') }
-        $remoteArgs += @('-DurationSeconds', "$DurationSeconds")
+        # Named-parameter hashtable: splatting a string ARRAY would pass the
+        # elements positionally ("-Mode" would bind to $Mode and fail the
+        # ValidateSet) - a hashtable splat binds real parameter names.
+        $remoteParams = @{
+            Mode = 'Collect'
+            ConfirmLocalCollection = $true
+            OutputDirectory = $remoteOutDir
+            DurationSeconds = $DurationSeconds
+        }
+        if ($CaptureWpr) {
+            $remoteParams.CaptureWpr = $true
+            $remoteParams.ConfirmWprCapture = $true
+            $remoteParams.WprProfile = $WprProfile
+        }
+        if ($CaptureDefender) {
+            $remoteParams.CaptureDefender = $true
+            $remoteParams.ConfirmDefenderCapture = $true
+        }
+        if ($CollectMinidumps) {
+            $remoteParams.CollectMinidumps = $true
+            $remoteParams.ConfirmMinidumpCollection = $true
+        }
+        if ($CollectBootFailureLogs) {
+            $remoteParams.CollectBootFailureLogs = $true
+            $remoteParams.ConfirmBootFailureLogCollection = $true
+        }
 
         Invoke-Command -Session $session -ScriptBlock {
-            param($scriptPath, [string[]]$runArgs)
-            & $scriptPath @runArgs
-        } -ArgumentList $remoteScriptPath, $remoteArgs
+            param($scriptPath, $invokeParams)
+            & $scriptPath @invokeParams
+        } -ArgumentList $remoteScriptPath, $remoteParams
 
         $remoteManifestPath = Join-Path $remoteOutDir 'diagnostic-manifest.json'
         $localManifestPath = Join-Path $resolvedOutputDirectory 'diagnostic-manifest.json'

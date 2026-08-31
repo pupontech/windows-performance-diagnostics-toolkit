@@ -296,7 +296,17 @@ function Invoke-ConsentedCapture {
                 $result.status = 'skipped-elevation-required'
             }
             else {
-                $captureResult = & $CaptureBody
+                # the capture body may emit native-tool output (wpr.exe -start/
+                # -stop print to stdout) BEFORE its final return - pick the LAST
+                # result dictionary out of the stream instead of assuming a
+                # single-object return (WPD-10 caught this: an array of stray
+                # strings + the dict made '.Keys' throw even though the ETL was
+                # written fine)
+                $captureOutput = @(& $CaptureBody)
+                $captureResult = $captureOutput | Where-Object { $_ -is [System.Collections.IDictionary] } | Select-Object -Last 1
+                if ($null -eq $captureResult) {
+                    throw "Capture body for stage '$StageName' did not return a result object"
+                }
                 foreach ($key in $captureResult.Keys) {
                     $result[$key] = $captureResult[$key]
                 }

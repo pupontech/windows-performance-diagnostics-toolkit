@@ -117,6 +117,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
 - `START-HERE.bat` — double-click console menu: UAC self-elevation, then 1) Full+WPR trace + crash evidence, 2) Basic, 3) Full+WPR+Defender + crash evidence, 4) Plan preview, 5) Crash evidence only (minidumps + boot-failure logs), 6) Exit; every run logged to `C:\Temp\WPD-Case\diagnostics-run.log`
 - `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace; includes minidumps + boot-failure evidence)
+- `Pull-BootFailureLogs.bat` — WinRE/WinPE runbook launcher for machines that will not boot (SRT/boot/CBS/setup/DISM evidence to a PE drive; `bcdedit bootlog` only via an explicit y/N prompt)
 - `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)
 - `schema\`, `docs\`, `tests\` — report contract, source map, live test matrix
 
@@ -125,7 +126,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - ✅ Machine-readable report schema (`schema/diagnostic-report.schema.json`, `docs/report-schema.md`)
 - ✅ Consent-gated, time-bounded WPR capture (`-CaptureWpr` + `-ConfirmWprCapture`, `GeneralProfile` or `CPU`/`DiskIO`/`FileIO`/`Network`/`Power`/`GPU`/`Registry`)
 - ✅ Consent-gated, time-bounded Defender performance capture (`-CaptureDefender` + `-ConfirmDefenderCapture`, official `New-MpPerformanceRecording`)
-- ✅ Consent-gated crash-evidence stages (`-CollectMinidumps` + `-ConfirmMinidumpCollection`, `-CollectBootFailureLogs` + `-ConfirmBootFailureLogCollection`; WinRE runbook in `docs/winre-boot-failure-runbook.md`)
+- ✅ Consent-gated crash-evidence stages (`-CollectMinidumps` + `-ConfirmMinidumpCollection`, `-CollectBootFailureLogs` + `-ConfirmBootFailureLogCollection`; WinRE runbook in `docs/winre-boot-failure-runbook.md` + `Pull-BootFailureLogs.bat`)
 - ✅ Case packaging (`-ZipOutput` — zips only this run's whitelisted artifacts + manifest, `docs/zip-output.md`)
 - ✅ Remote collection over WinRM (`-RemoteComputer` + `-ConfirmRemoteCollection`, remote-exec + pull-back with SHA-256 verification, `docs/remote-mode.md`)
 - ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)

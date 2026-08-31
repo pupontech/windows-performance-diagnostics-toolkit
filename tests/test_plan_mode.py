@@ -523,6 +523,76 @@ def test_remote_collection_still_refuses_non_windows_hosts(tmp_path):
     assert "supported only on Windows" in result.stderr
 
 
+def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
+    """Invoke-ConsentedCapture (dot-sourced) must record collectionErrors and
+    return the right status on the readiness-fail and elevation-skip paths
+    without invoking the capture body (the elevated capture path itself is
+    live-gated by WPD-09/WPD-10 on Windows runners)."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
+        "$script:collectionErrors = @(); $script:bodyCalls = 0; "
+        "$r1 = Invoke-ConsentedCapture -StageName 'wpr-capture' -SkipStatusNotReady 'skipped-wpr-not-found' "
+        "-NotReadyMessage 'wpr.exe not found; WPR capture skipped' -NotReadyErrorId 'WprNotFound' "
+        "-ElevationMessage 'requires an elevated (Administrator) console; WPR capture skipped' "
+        "-ElevationErrorId 'WprElevationRequired' -ReadyCheck { $false } "
+        "-CaptureBody { $script:bodyCalls++; return [ordered]@{ status = 'completed' } }; "
+        "$r2 = Invoke-ConsentedCapture -StageName 'defender-capture' -SkipStatusNotReady 'skipped-defender-module-not-found' "
+        "-NotReadyMessage 'DefenderPerformance module not found; Defender performance capture skipped' -NotReadyErrorId 'DefenderModuleNotFound' "
+        "-ElevationMessage 'requires an elevated (Administrator) console; Defender performance capture skipped' -ElevationErrorId 'DefenderElevationRequired' "
+        "-ReadyCheck { $true } "
+        "-CaptureBody { $script:bodyCalls++; return [ordered]@{ status = 'completed' } }; "
+        "[ordered]@{ s1=$r1.status; s2=$r2.status; errCount=@($script:collectionErrors).Count; bodyCalls=$script:bodyCalls } | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    out = json.loads(result.stdout)
+    # readiness fail: skip status + error recorded, body never called
+    assert out["s1"] == "skipped-wpr-not-found"
+    # ready but not elevated (Linux never reports the Administrator role):
+    # elevation-skip status + error recorded, body still never called
+    assert out["s2"] == "skipped-elevation-required"
+    assert out["errCount"] == 2
+    assert out["bodyCalls"] == 0
+
+
+def test_winre_puller_bat_is_ascii_crlf_and_consent_safe():
+    """Pull-BootFailureLogs.bat (WinRE/WinPE runbook launcher) must be ASCII
+    CRLF, goto-style only, and must NEVER run bcdedit automatically - the
+    boot-log toggle is reachable only through an explicit y/N prompt."""
+    import re as re_module
+
+    bat = (REPO_ROOT / "Pull-BootFailureLogs.bat").read_bytes()
+
+    assert b"\r\n" in bat
+    assert b'\\"' not in bat, "backslash-immediately-before-quote hazard in Pull-BootFailureLogs.bat"
+    assert all(b < 128 for b in bat), "Pull-BootFailureLogs.bat must be pure ASCII"
+    for line in bat.decode("ascii").splitlines():
+        assert not re_module.match(r"\s*(if|for)\b.*\(\s*$", line), (
+            f"parenthesized block in Pull-BootFailureLogs.bat: {line!r}"
+        )
+
+    text = bat.decode("ascii")
+    # interactive drive-letter prompts
+    assert "SYSDRIVE" in text
+    assert "PEDRIVE" in text
+    # evidence sources
+    assert "SrtTrail.txt" in text
+    assert "ntbtlog.txt" in text
+    # bcdedit only behind an explicit y/N gate, and only the bootlog toggle
+    assert 'if /i "%ENABLEBOOTLOG%"=="y"' in text
+    assert "bcdedit /set {default} bootlog yes" in text
+    assert "bcdedit /deletevalue {default} bootlog" in text
+    # CI-safe pause guard
+    assert 'if not "%CI%"=="true" pause' in text
+
+
 def test_release_packaging_files_present():
     """The deploy bundle must ship launchers and unblock guidance."""
     assert (REPO_ROOT / "Run-Diagnostics.bat").is_file()

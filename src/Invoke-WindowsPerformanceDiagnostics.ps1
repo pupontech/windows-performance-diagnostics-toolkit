@@ -229,6 +229,87 @@ function Add-CasePackageBlock {
     return $CollectionManifest
 }
 
+function Invoke-ConsentedCapture {
+    <#
+      Shared skeleton for the WPR and Defender capture stages: readiness
+      check -> elevation check -> capture body -> status/error recording.
+      The per-stage differences (tool/module lookup, the capture call,
+      exit-code/version details) live in the scriptblocks; the skip
+      statuses, collectionErrors stage names, and error messages stay
+      identical to the pre-refactor behavior (live-gated by WPD-08/09/10).
+      Returns an [ordered] dict whose union of result fields is all
+      initialized, so StrictMode never trips on a missing key.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StageName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SkipStatusNotReady,
+
+        [Parameter(Mandatory = $true)]
+        [string]$NotReadyMessage,
+
+        [Parameter(Mandatory = $true)]
+        [string]$NotReadyErrorId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ElevationMessage,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ElevationErrorId,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ReadyCheck,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$CaptureBody
+    )
+
+    $result = [ordered]@{
+        status = $SkipStatusNotReady
+        etlFilePath = $null
+        startedAtUtc = $null
+        completedAtUtc = $null
+        startExitCode = $null
+        stopExitCode = $null
+        moduleVersion = $null
+    }
+    try {
+        if (-not (& $ReadyCheck)) {
+            Add-CollectionError -Stage $StageName -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new($NotReadyMessage),
+                $NotReadyErrorId,
+                [System.Management.Automation.ErrorCategory]::ObjectNotFound,
+                $null
+            ))
+        }
+        else {
+            $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $isElevated) {
+                Add-CollectionError -Stage $StageName -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                    [System.Exception]::new($ElevationMessage),
+                    $ElevationErrorId,
+                    [System.Management.Automation.ErrorCategory]::PermissionDenied,
+                    $null
+                ))
+                $result.status = 'skipped-elevation-required'
+            }
+            else {
+                $captureResult = & $CaptureBody
+                foreach ($key in $captureResult.Keys) {
+                    $result[$key] = $captureResult[$key]
+                }
+            }
+        }
+    }
+    catch {
+        Add-CollectionError -Stage $StageName -ErrorRecord $_
+        $result.status = 'failed'
+    }
+    return $result
+}
+
 function Get-EventsSafe {
     <#
       Reads a log record-by-record via the low-level .NET reader instead of
@@ -1287,149 +1368,106 @@ if ($CollectBootFailureLogs) {
     }
 }
 
-$wprStatus = $null
-$wprStartedAtUtc = $null
-$wprCompletedAtUtc = $null
-$wprEtlFilePath = $null
-$wprStartExitCode = $null
-$wprStopExitCode = $null
-
 if ($CaptureWpr) {
-    $wprStatus = 'skipped-wpr-not-found'
-    try {
-        $wprExe = Join-Path $env:SystemRoot 'System32\wpr.exe'
-        if (-not (Test-Path -LiteralPath $wprExe)) {
-            Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                [System.Exception]::new('wpr.exe not found; WPR capture skipped'),
-                'WprNotFound',
-                [System.Management.Automation.ErrorCategory]::ObjectNotFound,
-                $null
-            ))
-        }
-        else {
-            $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-            if (-not $isElevated) {
+    $wprResult = Invoke-ConsentedCapture `
+        -StageName 'wpr-capture' `
+        -SkipStatusNotReady 'skipped-wpr-not-found' `
+        -NotReadyMessage 'wpr.exe not found; WPR capture skipped' `
+        -NotReadyErrorId 'WprNotFound' `
+        -ElevationMessage 'requires an elevated (Administrator) console; WPR capture skipped' `
+        -ElevationErrorId 'WprElevationRequired' `
+        -ReadyCheck { Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\wpr.exe') } `
+        -CaptureBody {
+            $wprExe = Join-Path $env:SystemRoot 'System32\wpr.exe'
+            $startedAtUtc = Get-UtcTimestamp
+            $etlPath = Join-Path $resolvedOutputDirectory 'wpr-trace.etl'
+            $startExitCode = $null
+            $stopExitCode = $null
+            $startFailed = $false
+            try {
+                & $wprExe -start $WprProfile -filemode
+                $startExitCode = $LASTEXITCODE
+                if ($startExitCode -ne 0) {
+                    $startFailed = $true
+                }
+            }
+            catch {
+                Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
+                $startFailed = $true
+            }
+
+            if ($startFailed) {
                 Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                    [System.Exception]::new('requires an elevated (Administrator) console; WPR capture skipped'),
-                    'WprElevationRequired',
-                    [System.Management.Automation.ErrorCategory]::PermissionDenied,
+                    [System.Exception]::new("wpr.exe -start $WprProfile failed with exit code $startExitCode; WPR capture skipped (an already-running trace is left untouched)"),
+                    'WprStartFailed',
+                    [System.Management.Automation.ErrorCategory]::InvalidOperation,
                     $null
                 ))
-                $wprStatus = 'skipped-elevation-required'
+                return [ordered]@{ status = 'failed'; startedAtUtc = $startedAtUtc; startExitCode = $startExitCode }
             }
-            else {
-                $wprStartedAtUtc = Get-UtcTimestamp
-                $wprEtlPath = Join-Path $resolvedOutputDirectory 'wpr-trace.etl'
-                $wprStartExitCode = $null
-                $wprStartFailed = $false
-                try {
-                    & $wprExe -start $WprProfile -filemode
-                    $wprStartExitCode = $LASTEXITCODE
-                    if ($wprStartExitCode -ne 0) {
-                        $wprStartFailed = $true
-                    }
-                }
-                catch {
-                    Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
-                    $wprStartFailed = $true
-                }
 
-                if ($wprStartFailed) {
-                    $wprStatus = 'failed'
-                    Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                        [System.Exception]::new("wpr.exe -start $WprProfile failed with exit code $wprStartExitCode; WPR capture skipped (an already-running trace is left untouched)"),
-                        'WprStartFailed',
-                        [System.Management.Automation.ErrorCategory]::InvalidOperation,
-                        $null
-                    ))
+            Start-Sleep -Seconds $DurationSeconds
+            try {
+                & $wprExe -stop $etlPath
+                $stopExitCode = $LASTEXITCODE
+                $completedAtUtc = Get-UtcTimestamp
+                if ((Test-Path -LiteralPath $etlPath) -and (Get-Item -LiteralPath $etlPath).Length -gt 0) {
+                    [void]$collectedArtifacts.Add('wpr-trace.etl')
+                    return [ordered]@{
+                        status = 'completed'
+                        etlFilePath = $etlPath
+                        startedAtUtc = $startedAtUtc
+                        completedAtUtc = $completedAtUtc
+                        startExitCode = $startExitCode
+                        stopExitCode = $stopExitCode
+                    }
                 }
                 else {
-                    Start-Sleep -Seconds $DurationSeconds
-                    try {
-                        & $wprExe -stop $wprEtlPath
-                        $wprStopExitCode = $LASTEXITCODE
-                        $wprCompletedAtUtc = Get-UtcTimestamp
-                        if ((Test-Path -LiteralPath $wprEtlPath) -and (Get-Item -LiteralPath $wprEtlPath).Length -gt 0) {
-                            $wprEtlFilePath = $wprEtlPath
-                            [void]$collectedArtifacts.Add('wpr-trace.etl')
-                            $wprStatus = 'completed'
-                        }
-                        else {
-                            Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                                [System.Exception]::new("wpr.exe -stop reported exit code $wprStopExitCode but no wpr-trace.etl was produced"),
-                                'WprEtlMissing',
-                                [System.Management.Automation.ErrorCategory]::InvalidData,
-                                $null
-                            ))
-                            $wprStatus = 'failed'
-                        }
-                    }
-                    catch {
-                        Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
-                        $wprStatus = 'failed'
-                    }
+                    Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                        [System.Exception]::new("wpr.exe -stop reported exit code $stopExitCode but no wpr-trace.etl was produced"),
+                        'WprEtlMissing',
+                        [System.Management.Automation.ErrorCategory]::InvalidData,
+                        $null
+                    ))
+                    return [ordered]@{ status = 'failed'; startedAtUtc = $startedAtUtc; completedAtUtc = $completedAtUtc; startExitCode = $startExitCode; stopExitCode = $stopExitCode }
                 }
             }
+            catch {
+                Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
+                return [ordered]@{ status = 'failed'; startedAtUtc = $startedAtUtc; startExitCode = $startExitCode }
+            }
         }
-    }
-    catch {
-        Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
-        $wprStatus = 'failed'
-    }
 }
 
-$defenderStatus = $null
-$defenderStartedAtUtc = $null
-$defenderCompletedAtUtc = $null
-$defenderEtlFilePath = $null
-$defenderModuleVersion = $null
-
 if ($CaptureDefender) {
-    $defenderStatus = 'skipped-defender-module-not-found'
-    try {
-        $defenderModule = Get-Module -ListAvailable -Name DefenderPerformance
-        if ($null -eq $defenderModule) {
-            Add-CollectionError -Stage 'defender-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                [System.Exception]::new('DefenderPerformance module not found; Defender performance capture skipped'),
-                'DefenderModuleNotFound',
-                [System.Management.Automation.ErrorCategory]::ObjectNotFound,
-                $null
-            ))
-        }
-        else {
-            $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-            if (-not $isElevated) {
-                Add-CollectionError -Stage 'defender-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                    [System.Exception]::new('requires an elevated (Administrator) console; Defender performance capture skipped'),
-                    'DefenderElevationRequired',
-                    [System.Management.Automation.ErrorCategory]::PermissionDenied,
-                    $null
-                ))
-                $defenderStatus = 'skipped-elevation-required'
+    $defenderResult = Invoke-ConsentedCapture `
+        -StageName 'defender-capture' `
+        -SkipStatusNotReady 'skipped-defender-module-not-found' `
+        -NotReadyMessage 'DefenderPerformance module not found; Defender performance capture skipped' `
+        -NotReadyErrorId 'DefenderModuleNotFound' `
+        -ElevationMessage 'requires an elevated (Administrator) console; Defender performance capture skipped' `
+        -ElevationErrorId 'DefenderElevationRequired' `
+        -ReadyCheck { $null -ne (Get-Module -ListAvailable -Name DefenderPerformance) } `
+        -CaptureBody {
+            $startedAtUtc = Get-UtcTimestamp
+            $etlPath = Join-Path $resolvedOutputDirectory 'defender-performance.etl'
+            try {
+                Import-Module -Name DefenderPerformance -ErrorAction Stop
+                New-MpPerformanceRecording -RecordTo $etlPath -Seconds $DurationSeconds -ErrorAction Stop
+                [void]$collectedArtifacts.Add('defender-performance.etl')
+                return [ordered]@{
+                    status = 'completed'
+                    etlFilePath = $etlPath
+                    startedAtUtc = $startedAtUtc
+                    completedAtUtc = Get-UtcTimestamp
+                    moduleVersion = (Get-Module -Name DefenderPerformance).Version.ToString()
+                }
             }
-            else {
-                $defenderStartedAtUtc = Get-UtcTimestamp
-                $defenderEtlPath = Join-Path $resolvedOutputDirectory 'defender-performance.etl'
-                try {
-                    Import-Module -Name DefenderPerformance -ErrorAction Stop
-                    New-MpPerformanceRecording -RecordTo $defenderEtlPath -Seconds $DurationSeconds -ErrorAction Stop
-                    $defenderEtlFilePath = $defenderEtlPath
-                    [void]$collectedArtifacts.Add('defender-performance.etl')
-                    $defenderModuleVersion = (Get-Module -Name DefenderPerformance).Version.ToString()
-                    $defenderStatus = 'completed'
-                }
-                catch {
-                    Add-CollectionError -Stage 'defender-capture' -ErrorRecord $_
-                    $defenderStatus = 'failed'
-                }
-                $defenderCompletedAtUtc = Get-UtcTimestamp
+            catch {
+                Add-CollectionError -Stage 'defender-capture' -ErrorRecord $_
+                return [ordered]@{ status = 'failed'; startedAtUtc = $startedAtUtc; completedAtUtc = Get-UtcTimestamp }
             }
         }
-    }
-    catch {
-        Add-CollectionError -Stage 'defender-capture' -ErrorRecord $_
-        $defenderStatus = 'failed'
-    }
 }
 
 $completedAtUtc = Get-UtcTimestamp
@@ -1505,23 +1543,23 @@ if ($CaptureWpr) {
     $collectionManifest.wpr = [ordered]@{
         profile = $WprProfile
         durationSeconds = $DurationSeconds
-        etlFilePath = $wprEtlFilePath
-        startedAtUtc = $wprStartedAtUtc
-        completedAtUtc = $wprCompletedAtUtc
-        startExitCode = $wprStartExitCode
-        stopExitCode = $wprStopExitCode
-        status = $wprStatus
+        etlFilePath = $wprResult.etlFilePath
+        startedAtUtc = $wprResult.startedAtUtc
+        completedAtUtc = $wprResult.completedAtUtc
+        startExitCode = $wprResult.startExitCode
+        stopExitCode = $wprResult.stopExitCode
+        status = $wprResult.status
     }
 }
 
 if ($CaptureDefender) {
     $collectionManifest.defender = [ordered]@{
         durationSeconds = $DurationSeconds
-        etlFilePath = $defenderEtlFilePath
-        startedAtUtc = $defenderStartedAtUtc
-        completedAtUtc = $defenderCompletedAtUtc
-        moduleVersion = $defenderModuleVersion
-        status = $defenderStatus
+        etlFilePath = $defenderResult.etlFilePath
+        startedAtUtc = $defenderResult.startedAtUtc
+        completedAtUtc = $defenderResult.completedAtUtc
+        moduleVersion = $defenderResult.moduleVersion
+        status = $defenderResult.status
     }
 }
 

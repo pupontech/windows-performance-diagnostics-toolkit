@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **WPR/Defender capture dedup (Matt-Pocock review leftover)**: the two
+  near-identical capture blocks are now one `Invoke-ConsentedCapture` helper
+  (readiness check → elevation check → capture body → status/error recording).
+  Behavior is unchanged: identical skip statuses, `collectionErrors` stage
+  names, error messages, and manifest fields (live-gated by WPD-08/09/10);
+  Linux tests cover the readiness-fail and elevation-skip paths.
+- **WinRE puller launcher (`Pull-BootFailureLogs.bat`)**: the WinRE/WinPE
+  runbook is now a shipped double-click launcher — drive-letter prompts,
+  SRT/boot/CBS/Panther/DISM evidence copied to a `bootfailure-evidence` folder
+  on the PE drive (100 MB per-file cap via robocopy), a
+  `collection-status.txt` log, and crash-dump listings. `bcdedit /set {default}
+  bootlog yes` is ONLY reachable through an explicit y/N prompt (persistent
+  system change — never automatic).
+
 ## 0.7.0 — 2026-08-28
 
 Remote collection + case packaging release.

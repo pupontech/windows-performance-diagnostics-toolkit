@@ -5,11 +5,18 @@ Windows Recovery Environment (WinRE) or a WinPE USB. This is the offline
 complement to the collector's live `-CollectBootFailureLogs` stage
 (see [minidump-boot-failure-collection.md](minidump-boot-failure-collection.md)).
 
+**Fast path:** `Pull-BootFailureLogs.bat` (ships with the release) automates
+everything below — drive-letter prompts, evidence copies to a
+`bootfailure-evidence` folder on the PE drive, a `collection-status.txt` log,
+and an explicit y/N prompt before the optional `bcdedit` boot-log toggle. The
+manual steps below are the same procedure, for when you are already in a
+Command Prompt and prefer to copy by hand.
+
 Adapted from the field-tested RemoteDiagnostics `Pull-BootFailureLogs.bat`,
 with one deliberate change: **boot logging is never enabled automatically.**
 `bcdedit /set {default} bootlog yes` is a persistent system change, and the
 toolkit's safety contract is read-only — so it is an explicit, user-confirmed
-manual step below.
+manual step below (and a y/N prompt in the bat).
 
 ## When to use this
 

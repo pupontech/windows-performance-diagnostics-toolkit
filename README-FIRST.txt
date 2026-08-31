@@ -104,6 +104,8 @@ FILE LAYOUT
   Run-Diagnostics.bat            - Double-click launcher (basic, no admin)
   START-HERE.bat                 - Double-click launcher (full + WPR trace,
                                    self-elevates via UAC)
+  Pull-BootFailureLogs.bat       - WinRE/WinPE launcher for machines that
+                                   will not boot (read-only evidence pull)
   src/
     Invoke-WindowsPerformanceDiagnostics.ps1  - Main diagnostics script
   docs/

@@ -525,12 +525,15 @@ def test_remote_collection_still_refuses_non_windows_hosts(tmp_path):
 
 def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
     """Invoke-ConsentedCapture (dot-sourced) must record collectionErrors and
-    return the right status on the readiness-fail and elevation-skip paths
-    without invoking the capture body (the elevated capture path itself is
-    live-gated by WPD-09/WPD-10 on Windows runners)."""
+    return the right status on the readiness-fail path, and must fail SAFE
+    (body never called) when the elevation check cannot run. Add-CollectionError
+    is defined after the plan-mode early exit, so the test stubs it; the real
+    elevation-skip semantics are live-gated by WPD-09 on Windows runners."""
     script = str(SCRIPT).replace("\\", "/")
     command = (
         f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
+        "function Add-CollectionError { param($Stage, $ErrorRecord) "
+        "$script:collectionErrors += [pscustomobject]@{Stage=$Stage;Message=$ErrorRecord.Exception.Message} }; "
         "$script:collectionErrors = @(); $script:bodyCalls = 0; "
         "$r1 = Invoke-ConsentedCapture -StageName 'wpr-capture' -SkipStatusNotReady 'skipped-wpr-not-found' "
         "-NotReadyMessage 'wpr.exe not found; WPR capture skipped' -NotReadyErrorId 'WprNotFound' "
@@ -555,9 +558,10 @@ def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
     out = json.loads(result.stdout)
     # readiness fail: skip status + error recorded, body never called
     assert out["s1"] == "skipped-wpr-not-found"
-    # ready but not elevated (Linux never reports the Administrator role):
-    # elevation-skip status + error recorded, body still never called
-    assert out["s2"] == "skipped-elevation-required"
+    # ready, but the elevation check cannot run on Linux (WindowsPrincipal is
+    # unsupported -> throws) - the helper must fail SAFE: status failed,
+    # error recorded, capture body never invoked
+    assert out["s2"] == "failed"
     assert out["errCount"] == 2
     assert out["bodyCalls"] == 0
 

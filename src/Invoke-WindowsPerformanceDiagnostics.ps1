@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Plan', 'Collect')]
+    [ValidateSet('Plan', 'Collect', 'Verify')]
     [string]$Mode = 'Plan',
 
     [ValidateRange(5, 300)]
@@ -10,6 +10,8 @@ param(
     [int]$MaxEventCount = 200,
 
     [string]$OutputDirectory = (Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics'),
+
+    [string]$InputDirectory,
 
     [switch]$ConfirmLocalCollection,
 
@@ -158,6 +160,422 @@ function Get-ValidatedRemoteArtifactName {
     }
 
     return $normalizedName
+}
+
+function Get-CaseJsonProperty {
+    param(
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) {
+            return $InputObject[$Name]
+        }
+    }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -ne $property) {
+        return $property.Value
+    }
+    return $null
+}
+
+function Test-CasePathContained {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Candidate
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root)
+    $candidateFull = [System.IO.Path]::GetFullPath($Candidate)
+    $rootRoot = [System.IO.Path]::GetPathRoot($rootFull)
+    if ($rootFull -eq $rootRoot) {
+        $rootPrefix = $rootFull
+    }
+    else {
+        $rootPrefix = $rootFull.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
+    }
+    return $candidateFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Invoke-CasePackageVerification {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Manifest,
+
+        [object[]]$ArtifactEntries = @()
+    )
+
+    $summary = [ordered]@{ status = 'not-present' }
+    $errors = @()
+    $package = Get-CaseJsonProperty -InputObject $Manifest -Name 'package'
+    if ($null -eq $package) {
+        return [pscustomobject]@{ Summary = $summary; Errors = @() }
+    }
+
+    $packageStatus = [string](Get-CaseJsonProperty -InputObject $package -Name 'status')
+    if ($packageStatus -ne 'completed') {
+        $summary.status = 'not-verified'
+        $errors += "Manifest package status is '$packageStatus', not completed."
+        return [pscustomobject]@{ Summary = $summary; Errors = $errors }
+    }
+
+    try {
+        $declaredZipPath = [string](Get-CaseJsonProperty -InputObject $package -Name 'zipPath')
+        if ([string]::IsNullOrWhiteSpace($declaredZipPath)) {
+            throw 'Manifest package is missing zipPath.'
+        }
+        $zipLeaf = @([string]$declaredZipPath -split '[\\/]')[-1]
+        if ([string]::IsNullOrWhiteSpace($zipLeaf) -or $zipLeaf -in @('.', '..')) {
+            throw 'Manifest package zipPath does not contain a safe file name.'
+        }
+        # Package files are deliberately written next to the case directory.
+        # Use only the recorded leaf after relocation; never open an arbitrary
+        # absolute path supplied by a manifest.
+        $zipPath = Join-Path -Path (Split-Path -Parent $Directory) -ChildPath $zipLeaf
+        if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            throw "Case package not found beside InputDirectory: $zipPath"
+        }
+        $zipItem = Get-Item -LiteralPath $zipPath -ErrorAction Stop
+        if (($zipItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Case package is a reparse point: $zipPath"
+        }
+        $declaredSizeValue = Get-CaseJsonProperty -InputObject $package -Name 'sizeBytes'
+        $declaredHash = [string](Get-CaseJsonProperty -InputObject $package -Name 'sha256')
+        if ($null -eq $declaredSizeValue) {
+            throw 'Manifest package is missing sizeBytes.'
+        }
+        if ($zipItem.Length -ne [int64]$declaredSizeValue) {
+            throw "Case package size mismatch (manifest=$declaredSizeValue, actual=$($zipItem.Length))."
+        }
+        if ($declaredHash -notmatch '^[A-Fa-f0-9]{64}$') {
+            throw 'Manifest package has an invalid SHA-256.'
+        }
+        $actualZipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ($actualZipHash -ne $declaredHash) {
+            throw "Case package hash mismatch (manifest=$declaredHash, actual=$actualZipHash)."
+        }
+        if ((Get-CaseJsonProperty -InputObject $package -Name 'includesManifest') -ne $true) {
+            throw 'Manifest package must declare includesManifest=true.'
+        }
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+        try {
+            $entryMap = @{}
+            foreach ($entry in @($archive.Entries)) {
+                $entryName = [string]$entry.FullName
+                if ($entryMap.ContainsKey($entryName)) {
+                    throw "Case package contains duplicate entry '$entryName'."
+                }
+                $entryMap[$entryName] = $entry
+            }
+            $summary.entryCount = $entryMap.Count
+
+            $expectedEntryMap = @{}
+            $expectedEntryMap['diagnostic-manifest.json'] = $true
+            $outerArtifactsByName = @{}
+            foreach ($artifact in $ArtifactEntries) {
+                $nameValue = Get-CaseJsonProperty -InputObject $artifact -Name 'Name'
+                if ($null -eq $nameValue) {
+                    throw 'Manifest package comparison found an artifact without Name.'
+                }
+                $normalizedName = Get-ValidatedRemoteArtifactName -Name ([string]$nameValue)
+                $entryName = $normalizedName.Replace('\\', '/')
+                if ($expectedEntryMap.ContainsKey($entryName)) {
+                    throw "Manifest package expected-entry list contains duplicate '$entryName'."
+                }
+                $expectedEntryMap[$entryName] = $true
+                $outerArtifactsByName[$normalizedName.ToUpperInvariant()] = $artifact
+            }
+
+            if ($entryMap.Count -ne $expectedEntryMap.Count) {
+                throw "Case package entry count mismatch (expected=$($expectedEntryMap.Count), actual=$($entryMap.Count))."
+            }
+            foreach ($expectedName in $expectedEntryMap.Keys) {
+                if (-not $entryMap.ContainsKey($expectedName)) {
+                    throw "Case package is missing entry '$expectedName'."
+                }
+            }
+            foreach ($actualName in $entryMap.Keys) {
+                if (-not $expectedEntryMap.ContainsKey($actualName)) {
+                    throw "Case package contains unexpected entry '$actualName'."
+                }
+            }
+
+            foreach ($entryName in $outerArtifactsByName.Keys) {
+                $outerArtifact = $outerArtifactsByName[$entryName]
+                $zipEntryName = ([string](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'Name')).Replace('\\', '/')
+                $zipEntry = $entryMap[$zipEntryName]
+                $declaredEntrySize = [int64](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'SizeBytes')
+                if ($zipEntry.Length -ne $declaredEntrySize) {
+                    throw "Case package entry size mismatch: $zipEntryName"
+                }
+                $entryHasher = [System.Security.Cryptography.SHA256]::Create()
+                $entryStream = $zipEntry.Open()
+                try {
+                    $entryDigest = $entryHasher.ComputeHash($entryStream)
+                }
+                finally {
+                    $entryStream.Dispose()
+                    $entryHasher.Dispose()
+                }
+                $entryHash = ([System.BitConverter]::ToString($entryDigest)).Replace('-', '')
+                $declaredEntryHash = [string](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'Sha256')
+                if ($entryHash -ne $declaredEntryHash) {
+                    throw "Case package entry hash mismatch: $zipEntryName"
+                }
+            }
+
+            $manifestEntry = $entryMap['diagnostic-manifest.json']
+            $manifestReader = New-Object System.IO.StreamReader($manifestEntry.Open())
+            try {
+                $innerManifest = $manifestReader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
+            }
+            finally {
+                $manifestReader.Dispose()
+            }
+            if ((Get-CaseJsonProperty -InputObject $innerManifest -Name 'mode') -ne 'Collect') {
+                throw 'Case package manifest is not a Collect manifest.'
+            }
+            $innerArtifactValue = Get-CaseJsonProperty -InputObject $innerManifest -Name 'artifacts'
+            $innerArtifacts = @($innerArtifactValue)
+            $innerByName = @{}
+            foreach ($innerArtifact in $innerArtifacts) {
+                $innerName = [string](Get-CaseJsonProperty -InputObject $innerArtifact -Name 'Name')
+                if (-not [string]::IsNullOrWhiteSpace($innerName)) {
+                    $innerByName[$innerName.ToUpperInvariant()] = $innerArtifact
+                }
+            }
+            foreach ($outerName in $outerArtifactsByName.Keys) {
+                if (-not $innerByName.ContainsKey($outerName)) {
+                    throw "Case package manifest is missing artifact '$outerName'."
+                }
+                $outerArtifact = $outerArtifactsByName[$outerName]
+                $innerArtifact = $innerByName[$outerName]
+                if ([int64](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'SizeBytes') -ne [int64](Get-CaseJsonProperty -InputObject $innerArtifact -Name 'SizeBytes') -or
+                    [string](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'Sha256') -ne [string](Get-CaseJsonProperty -InputObject $innerArtifact -Name 'Sha256')) {
+                    throw "Case package manifest disagrees with the outer artifact manifest for '$outerName'."
+                }
+            }
+        }
+        finally {
+            $archive.Dispose()
+        }
+        $summary.status = 'verified'
+        $summary.path = $zipPath
+    }
+    catch {
+        $errors += "Case package verification failed: $($_.Exception.Message)"
+        $summary.status = 'failed'
+    }
+    return [pscustomobject]@{ Summary = $summary; Errors = $errors }
+}
+
+function Invoke-CaseVerification {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    $report = [ordered]@{
+        reportType = 'case-verification'
+        verifierVersion = '1.0'
+        mode = 'Verify'
+        status = 'failed'
+        inputDirectory = $Directory
+        manifestPath = $null
+        artifactCount = 0
+        verifiedArtifactCount = 0
+        package = [ordered]@{ status = 'not-present' }
+        errors = @()
+        warnings = @()
+        verifiedAtUtc = Get-UtcTimestamp
+    }
+    $errors = @()
+
+    try {
+        $resolvedDirectory = [System.IO.Path]::GetFullPath($Directory)
+    }
+    catch {
+        $errors += "InputDirectory '$Directory' is not a valid path: $($_.Exception.Message)"
+        $report.errors = $errors
+        return $report
+    }
+    $report.inputDirectory = $resolvedDirectory
+
+    if (-not (Test-Path -LiteralPath $resolvedDirectory -PathType Container)) {
+        $errors += "InputDirectory '$resolvedDirectory' does not exist or is not a directory."
+        $report.errors = $errors
+        return $report
+    }
+
+    try {
+        $directoryItem = Get-Item -LiteralPath $resolvedDirectory -ErrorAction Stop
+        if (($directoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $errors += "InputDirectory '$resolvedDirectory' is a reparse point; verification refuses redirected paths."
+            $report.errors = $errors
+            return $report
+        }
+    }
+    catch {
+        $errors += "Unable to inspect InputDirectory '$resolvedDirectory': $($_.Exception.Message)"
+        $report.errors = $errors
+        return $report
+    }
+
+    $manifestPath = Join-Path -Path $resolvedDirectory -ChildPath 'diagnostic-manifest.json'
+    $report.manifestPath = $manifestPath
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        $errors += "Manifest not found: $manifestPath"
+        $report.errors = $errors
+        return $report
+    }
+
+    try {
+        $manifestItem = Get-Item -LiteralPath $manifestPath -ErrorAction Stop
+        if (($manifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'manifest is a reparse point'
+        }
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        $errors += "Manifest could not be read or parsed: $($_.Exception.Message)"
+        $report.errors = $errors
+        return $report
+    }
+
+    foreach ($requiredProperty in @('schemaVersion', 'toolName', 'toolVersion', 'mode', 'safety')) {
+        $value = Get-CaseJsonProperty -InputObject $manifest -Name $requiredProperty
+        if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) {
+            $errors += "Manifest is missing required property '$requiredProperty'."
+        }
+    }
+    if ((Get-CaseJsonProperty -InputObject $manifest -Name 'toolName') -ne 'Windows Performance Diagnostics Toolkit') {
+        $errors += 'Manifest toolName is not the Windows Performance Diagnostics Toolkit.'
+    }
+    if ((Get-CaseJsonProperty -InputObject $manifest -Name 'mode') -ne 'Collect') {
+        $errors += 'Verify mode accepts only a Collect manifest.'
+    }
+
+    $safety = Get-CaseJsonProperty -InputObject $manifest -Name 'safety'
+    if ($null -eq $safety) {
+        $errors += 'Manifest safety block is missing.'
+    }
+    else {
+        foreach ($safetyProperty in @('localOnly', 'readOnly', 'requiresExplicitCollectionConsent', 'automaticUpload', 'automaticRemediation', 'automaticLogClearing')) {
+            $value = Get-CaseJsonProperty -InputObject $safety -Name $safetyProperty
+            if ($null -eq $value -or -not ($value -is [bool])) {
+                $errors += "Manifest safety.$safetyProperty must be a boolean."
+            }
+        }
+        foreach ($falseSafetyProperty in @('readOnly', 'requiresExplicitCollectionConsent', 'automaticUpload', 'automaticRemediation', 'automaticLogClearing')) {
+            $value = Get-CaseJsonProperty -InputObject $safety -Name $falseSafetyProperty
+            if ($falseSafetyProperty -eq 'readOnly' -and $value -ne $true) {
+                $errors += 'Manifest safety.readOnly must be true.'
+            }
+            elseif ($falseSafetyProperty -eq 'requiresExplicitCollectionConsent' -and $value -ne $true) {
+                $errors += 'Manifest safety.requiresExplicitCollectionConsent must be true.'
+            }
+            elseif ($falseSafetyProperty -ne 'readOnly' -and $falseSafetyProperty -ne 'requiresExplicitCollectionConsent' -and $value -ne $false) {
+                $errors += "Manifest safety.$falseSafetyProperty must be false."
+            }
+        }
+    }
+
+    $artifactValue = Get-CaseJsonProperty -InputObject $manifest -Name 'artifacts'
+    if ($null -eq $artifactValue) {
+        $errors += 'Manifest artifacts array is missing.'
+        $artifactEntries = @()
+    }
+    elseif ($artifactValue -is [System.Array]) {
+        $artifactEntries = @($artifactValue)
+    }
+    else {
+        $artifactEntries = @($artifactValue)
+    }
+    $report.artifactCount = $artifactEntries.Count
+    $seenNames = @{}
+    $verifiedCount = 0
+
+    foreach ($artifact in $artifactEntries) {
+        $nameValue = Get-CaseJsonProperty -InputObject $artifact -Name 'Name'
+        if ($null -eq $nameValue -or [string]::IsNullOrWhiteSpace([string]$nameValue)) {
+            $errors += 'Manifest artifact entry is missing Name.'
+            continue
+        }
+        $name = [string]$nameValue
+        try {
+            $normalizedName = Get-ValidatedRemoteArtifactName -Name $name
+        }
+        catch {
+            $errors += $_.Exception.Message
+            continue
+        }
+        $nameKey = $normalizedName.ToUpperInvariant()
+        if ($seenNames.ContainsKey($nameKey)) {
+            $errors += "Manifest contains duplicate artifact '$normalizedName'."
+            continue
+        }
+        $seenNames[$nameKey] = $true
+        $platformRelativeName = $normalizedName.Replace([char]92, [System.IO.Path]::DirectorySeparatorChar)
+        $artifactPath = Join-Path -Path $resolvedDirectory -ChildPath $platformRelativeName
+        try {
+            if (-not (Test-CasePathContained -Root $resolvedDirectory -Candidate $artifactPath)) {
+                throw "artifact path escapes InputDirectory: $name"
+            }
+            if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+                throw "artifact is missing: $name"
+            }
+            $artifactItem = Get-Item -LiteralPath $artifactPath -ErrorAction Stop
+            if (($artifactItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "artifact is a reparse point: $name"
+            }
+            $declaredSizeValue = Get-CaseJsonProperty -InputObject $artifact -Name 'SizeBytes'
+            $declaredHash = [string](Get-CaseJsonProperty -InputObject $artifact -Name 'Sha256')
+            if ($null -eq $declaredSizeValue) {
+                throw "artifact is missing SizeBytes: $name"
+            }
+            $declaredSize = [int64]$declaredSizeValue
+            if ($declaredSize -lt 0 -or $artifactItem.Length -ne $declaredSize) {
+                throw "artifact size mismatch: $name (manifest=$declaredSize, actual=$($artifactItem.Length))"
+            }
+            if ($declaredHash -notmatch '^[A-Fa-f0-9]{64}$') {
+                throw "artifact has an invalid SHA-256: $name"
+            }
+            $actualHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($actualHash -ne $declaredHash) {
+                throw "artifact hash mismatch: $name (manifest=$declaredHash, actual=$actualHash)"
+            }
+            $verifiedCount++
+        }
+        catch {
+            $errors += $_.Exception.Message
+        }
+    }
+    $report.verifiedArtifactCount = $verifiedCount
+    $packageVerification = Invoke-CasePackageVerification `
+        -Directory $resolvedDirectory `
+        -Manifest $manifest `
+        -ArtifactEntries $artifactEntries
+    $report.package = $packageVerification.Summary
+    $errors += @($packageVerification.Errors)
+    $report.errors = $errors
+    if ($errors.Count -eq 0) {
+        $report.status = 'verified'
+    }
+    return $report
 }
 
 function Get-ArtifactMetadata {
@@ -835,6 +1253,18 @@ function Get-NetworkState {
         State = $state
         Errors = @($errors)
     }
+}
+
+if ($Mode -eq 'Verify') {
+    if ([string]::IsNullOrWhiteSpace($InputDirectory)) {
+        throw 'Verify mode requires -InputDirectory. No files were modified.'
+    }
+    $verificationReport = Invoke-CaseVerification -Directory $InputDirectory
+    Write-Output ($verificationReport | ConvertTo-Json -Depth 8)
+    if ($verificationReport.status -ne 'verified') {
+        exit 1
+    }
+    exit 0
 }
 
 try {

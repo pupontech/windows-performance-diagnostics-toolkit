@@ -4,7 +4,7 @@
 
 **Version:** 0.8.2
 
-**Status:** Read-only local collection plus consent-gated WPR/Defender performance captures, crash evidence, network-state diagnostics, optional local case packaging, and consent-gated remote WinRM collection with SHA-256 verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM.
+**Status:** Read-only local collection plus consent-gated WPR/Defender performance captures, crash evidence, network-state diagnostics, optional local case packaging, consent-gated remote WinRM collection with SHA-256 verification, and read-only case verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM.
 
 [![CI](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml)
 
@@ -50,6 +50,22 @@ See [SECURITY.md](SECURITY.md) for data-handling and approval boundaries.
 - No automatic Defender exclusions, protection changes, or cloud upload
 - No unattended collection of full memory dumps
 
+## Three operating modes
+
+The public workflow has exactly three top-level modes:
+
+| Mode | Purpose | Writes to the case directory? |
+|---|---|---|
+| `Plan` | Preview the bounded collection scope, consent gates, and safety contract. | Yes — plan manifest only. |
+| `Collect` | Execute the selected read-only diagnostics after explicit consent. | Yes — diagnostic artifacts and manifest. |
+| `Verify` | Check an existing Collect case and optional ZIP for integrity. | No. |
+
+WPR, Defender, crash evidence, networking, remote collection, and packaging are
+capabilities inside `Collect` (and are advertised by `Plan`), not additional
+modes. This keeps the operator decision to one of plan, collect, or verify.
+`Run-Diagnostics.bat` is a convenience shortcut for a basic Collect invocation;
+`Pull-BootFailureLogs.bat` is a separate WinRE/WinPE runbook, not a fourth mode.
+
 ## MVP usage
 
 Start with a **non-collecting safety plan** (works on the Linux verification host too):
@@ -70,6 +86,19 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -MaxEventCount 200 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
+
+Verify an existing case folder and its optional package without modifying it:
+
+```powershell
+powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Verify `
+  -InputDirectory C:\Temp\WPD-Case-001
+```
+
+Verify mode emits a machine-readable `case-verification` report on stdout and
+returns exit code 0 only when the Collect manifest, every listed artifact, and
+any recorded case ZIP pass validation. It refuses reparse-point paths and never
+writes into the case directory.
 
 Capture a **bounded WPR trace** (requires an elevated console, its own consent gate):
 
@@ -108,14 +137,14 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
 
-The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and a manifest with SHA-256 hashes. With `-ZipOutput` it also packages this run's certified evidence (artifacts + manifest) into a timestamped case zip next to the output folder — stale files from reused folders are never included. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, or remediate anything. In local mode it never transfers artifacts off the machine; in remote mode (`-RemoteComputer`) the pull-back to this machine is consent-gated and hash-verified. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
+The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and a manifest with SHA-256 hashes. With `-ZipOutput` it also packages this run's certified evidence (artifacts + manifest) into a timestamped case zip next to the output folder — stale files from reused folders are never included. `-Mode Verify -InputDirectory <case>` validates an existing Collect manifest, its listed artifacts, and any recorded case ZIP without modifying the case. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, or remediate anything. In local mode it never transfers artifacts off the machine; in remote mode (`-RemoteComputer`) the pull-back to this machine is consent-gated and hash-verified. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
 
 ## Deployment bundle
 
 `make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from the exact matching release tag in a verified clean git tree. It refuses to create a same-version archive from a later `main` commit. The bundle ships:
 
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
-- `START-HERE.bat` — double-click console menu: UAC self-elevation, then 1) Full+WPR trace + crash evidence, 2) Basic, 3) Full+WPR+Defender + crash evidence, 4) Plan preview, 5) Crash evidence only (minidumps + boot-failure logs), 6) Exit; every run logged to `C:\Temp\WPD-Case\diagnostics-run.log`
+- `START-HERE.bat` — double-click console menu: 1) Plan preview, 2) Collect diagnostics (recommended full read-only evidence), 3) Verify an existing case, 4) Exit; Collect is UAC-elevated only when needed and every run is logged to `C:\Temp\WPD-Case\diagnostics-run.log`
 - `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace; includes minidumps + boot-failure evidence)
 - `Pull-BootFailureLogs.bat` — WinRE/WinPE runbook launcher for machines that will not boot (SRT/boot/CBS/setup/DISM evidence to a PE drive; `bcdedit bootlog` only via an explicit y/N prompt)
 - `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)
@@ -130,6 +159,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - ✅ Case packaging (`-ZipOutput` — zips only this run's whitelisted artifacts + manifest, `docs/zip-output.md`)
 - ✅ Remote collection over WinRM (`-RemoteComputer` + `-ConfirmRemoteCollection`, remote-exec + pull-back with SHA-256 verification, `docs/remote-mode.md`)
 - ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)
+- ✅ Read-only case verification (`-Mode Verify -InputDirectory`, manifest/artifact/package integrity)
 - ✅ WPA-oriented analysis guidance (`docs/wpa-analysis-guide.md`)
 - 🔜 Windows lab test matrix execution before any live remediation capability
 

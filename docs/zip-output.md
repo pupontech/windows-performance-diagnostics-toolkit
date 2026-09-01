@@ -38,17 +38,31 @@ Note: the manifest copy **inside** the zip is the pre-package version (written
 before the zip was created). The wrapper describes itself; the evidence inside
 is certified by the in-zip manifest's `artifacts` block.
 
-## 4. Schema
+## 4. Verify mode
+
+`-Mode Verify -InputDirectory <case>` is read-only and can be run after a
+collection or after moving a case folder together with its sibling ZIP. It
+checks the Collect manifest, every listed artifact's safe path, size, and
+SHA-256, then checks a recorded package's filename, size, SHA-256, exact
+artifact-plus-manifest entry whitelist, entry hashes, and in-ZIP artifact
+metadata. It emits a `case-verification` JSON report to stdout and returns
+`0` only when all checks pass; failures return `1`.
+
+The verifier uses only the ZIP filename from `package.zipPath` and resolves it
+beside the input directory. It will not open an arbitrary absolute path from a
+manifest. Reparse-point case, artifact, and package paths are rejected.
+
+## 5. Schema
 
 Top-level optional `package` object (union of Plan-scope and Collect-scope
 fields, `additionalProperties: false`, `sha256` pattern `^[A-Fa-f0-9]{64}$`).
 
-## 5. Launchers
+## 6. Launchers
 
-START-HERE options 1/2/3/5 and Run-Diagnostics.bat pass `-ZipOutput`; the
+START-HERE's Collect mode and Run-Diagnostics.bat pass `-ZipOutput`; the
 completion echo lists the zip.
 
-## 6. Tests
+## 7. Tests
 
 - Plan advertises the action + scope; absent without the switch.
 - `New-CasePackage` Linux test: zips exactly the named files (subdir entry uses

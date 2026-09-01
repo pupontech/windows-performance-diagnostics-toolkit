@@ -20,6 +20,41 @@ def run_tool(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _write_minimal_collect_case(tmp_path, contents=b"a,b\n1,2\n"):
+    """Create the smallest valid Collect case for Verify-mode tests."""
+    import hashlib
+
+    case = tmp_path / "case-to-verify"
+    case.mkdir()
+    artifact_path = case / "performance-samples.csv"
+    artifact_path.write_bytes(contents)
+    manifest = {
+        "schemaVersion": "1.0",
+        "toolName": "Windows Performance Diagnostics Toolkit",
+        "toolVersion": (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        "mode": "Collect",
+        "safety": {
+            "localOnly": True,
+            "readOnly": True,
+            "requiresExplicitCollectionConsent": True,
+            "automaticUpload": False,
+            "automaticRemediation": False,
+            "automaticLogClearing": False,
+        },
+        "artifacts": [
+            {
+                "Name": artifact_path.name,
+                "SizeBytes": artifact_path.stat().st_size,
+                "Sha256": hashlib.sha256(contents).hexdigest(),
+            }
+        ],
+    }
+    (case / "diagnostic-manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return case
+
+
 def test_plan_mode_writes_a_local_only_read_only_manifest(tmp_path):
     """Plan mode must work without touching Windows-only collection APIs."""
     output_directory = tmp_path / "diagnostic-plan"
@@ -1070,9 +1105,8 @@ def test_emitted_plan_validates_against_schema(tmp_path):
 
 
 def test_start_here_bat_is_elevation_safe_and_quote_safe():
-    """START-HERE.bat must self-elevate via UAC, present a console menu, run the
-    selected collection with the WPR/Defender consent flags, and stay CI-safe
-    and quote-safe like the other bat."""
+    """START-HERE.bat must present the three operating modes, elevate only for
+    collection, run the selected workflow safely, and stay CI/quote-safe."""
     bat = (REPO_ROOT / "START-HERE.bat").read_bytes()
 
     assert b"\r\n" in bat  # CRLF line endings required for .bat files
@@ -1093,23 +1127,21 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     assert "-Verb RunAs" in text
     # CI must never hang on UAC: guard the elevation attempt
     assert 'if "%CI%"=="true"' in text
-    # Console menu with the six options
-    for option in ("1 - Full collection", "2 - Basic collection",
-                   "3 - Full + WPR + Defender", "4 - Plan preview", "5 - Crash evidence only",
-                   "6 - Exit"):
+    # Console menu with three operating modes plus Exit
+    for option in ("1 - Plan preview", "2 - Collect diagnostics", "3 - Verify an existing case", "4 - Exit"):
         assert option in text, f"missing menu option {option!r}"
-    # Consent flags must be passed explicitly per option
+    # Consent flags remain explicit in the single launcher Collect flow
     assert "-Mode Collect" in text
     assert "-ConfirmLocalCollection" in text
     assert "-CaptureWpr" in text
     assert "-ConfirmWprCapture" in text
-    assert "-CaptureDefender" in text
-    assert "-ConfirmDefenderCapture" in text
     assert "-CollectMinidumps" in text
     assert "-ConfirmMinidumpCollection" in text
     assert "-CollectBootFailureLogs" in text
     assert "-ConfirmBootFailureLogCollection" in text
     assert "-ZipOutput" in text
+    assert "-Mode Verify" in text
+    assert "-InputDirectory" in text
     # Defender-strip resilience: pre-flight existence check with recovery steps
     assert "src\\Invoke-WindowsPerformanceDiagnostics.ps1 was not found" in text
     # Result visibility: log everything with Tee-Object, never a silent failure
@@ -1142,3 +1174,147 @@ def test_wpa_guide_matches_the_collector_wpr_profile():
     assert "The `GeneralProfile` profile is First Level Triage" in guide
     assert "wpr.exe -start General -filemode" not in guide
     assert 'schema enum: `"General"`' not in guide
+
+
+def test_verify_mode_accepts_a_valid_collect_case_without_writing_it(tmp_path):
+    case = _write_minimal_collect_case(tmp_path)
+    before = {
+        path.relative_to(case): path.read_bytes()
+        for path in case.rglob("*")
+        if path.is_file()
+    }
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["reportType"] == "case-verification"
+    assert report["mode"] == "Verify"
+    assert report["status"] == "verified"
+    assert report["artifactCount"] == 1
+    assert report["verifiedArtifactCount"] == 1
+    assert report["package"]["status"] == "not-present"
+    schema = json.loads(
+        (REPO_ROOT / "schema" / "case-verification.schema.json").read_text(encoding="utf-8")
+    )
+    import jsonschema
+
+    errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(report), key=lambda e: list(e.path))
+    assert not errors, [(list(error.path), error.message) for error in errors]
+    assert {
+        path.relative_to(case): path.read_bytes()
+        for path in case.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_verify_mode_fails_on_a_tampered_artifact(tmp_path):
+    case = _write_minimal_collect_case(tmp_path)
+    (case / "performance-samples.csv").write_bytes(b"x,y\n3,4\n")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report["status"] == "failed"
+    assert report["artifactCount"] == 1
+    assert report["verifiedArtifactCount"] == 0
+    assert any("hash mismatch" in error.lower() for error in report["errors"])
+
+
+def test_verify_mode_requires_an_input_directory():
+    result = run_tool("-Mode", "Verify")
+
+    assert result.returncode != 0
+    assert "requires -InputDirectory" in result.stderr
+
+
+def test_verify_mode_validates_the_recorded_case_package(tmp_path):
+    import hashlib
+    import zipfile
+
+    case = _write_minimal_collect_case(tmp_path)
+    manifest_path = case / "diagnostic-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    zip_path = case.parent / "case-to-verify-20260901T000000.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("performance-samples.csv", (case / "performance-samples.csv").read_bytes())
+        archive.writestr("diagnostic-manifest.json", json.dumps(manifest))
+    zip_bytes = zip_path.read_bytes()
+    manifest["package"] = {
+        "enabled": True,
+        "status": "completed",
+        "zipPath": r"C:\old\case-to-verify-20260901T000000.zip",
+        "sizeBytes": len(zip_bytes),
+        "sha256": hashlib.sha256(zip_bytes).hexdigest(),
+        "includesManifest": True,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["status"] == "verified"
+    assert report["package"]["status"] == "verified"
+    assert report["package"]["entryCount"] == 2
+
+
+def test_verify_mode_rejects_an_unexpected_case_package_entry(tmp_path):
+    import hashlib
+    import zipfile
+
+    case = _write_minimal_collect_case(tmp_path)
+    manifest_path = case / "diagnostic-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    zip_path = case.parent / "case-to-verify-extra-20260901T000000.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("performance-samples.csv", (case / "performance-samples.csv").read_bytes())
+        archive.writestr("diagnostic-manifest.json", json.dumps(manifest))
+        archive.writestr("unexpected-secret.txt", b"not part of the whitelist")
+    zip_bytes = zip_path.read_bytes()
+    manifest["package"] = {
+        "enabled": True,
+        "status": "completed",
+        "zipPath": str(zip_path),
+        "sizeBytes": len(zip_bytes),
+        "sha256": hashlib.sha256(zip_bytes).hexdigest(),
+        "includesManifest": True,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report["status"] == "failed"
+    assert report["package"]["status"] == "failed"
+    assert any("entry count mismatch" in error.lower() for error in report["errors"])
+
+
+def test_verify_mode_rejects_traversal_without_reading_outside_the_case(tmp_path):
+    case = _write_minimal_collect_case(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("do not touch", encoding="utf-8")
+    manifest_path = case / "diagnostic-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"][0]["Name"] = "..\\outside.txt"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report["status"] == "failed"
+    assert any("traversal" in error.lower() for error in report["errors"])
+    assert outside.read_text(encoding="utf-8") == "do not touch"
+
+
+def test_case_verification_schema_is_valid_json():
+    schema_path = REPO_ROOT / "schema" / "case-verification.schema.json"
+    assert schema_path.is_file()
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert schema["$schema"] == "http://json-schema.org/draft-07/schema#"
+    assert schema["properties"]["reportType"]["enum"] == ["case-verification"]
+    assert schema["properties"]["mode"]["enum"] == ["Verify"]
+    assert schema["properties"]["status"]["enum"] == ["verified", "failed"]

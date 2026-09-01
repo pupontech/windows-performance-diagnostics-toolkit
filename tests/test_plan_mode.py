@@ -968,3 +968,15 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     # No trailing backslash before the closing quote of -OutputDirectory
     assert '-OutputDirectory \'%OUTDIR%\'' in text
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
+
+
+def test_human_facing_release_metadata_matches_version():
+    """The shipped quick-start documents must advertise the current release."""
+    version = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    readme_first = (REPO_ROOT / "README-FIRST.txt").read_text(encoding="utf-8")
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert f"**Version:** {version}" in readme
+    assert f"Version {version}" in readme_first
+    assert f"## {version} — " in changelog

@@ -1,6 +1,6 @@
 # Case Packaging (`-ZipOutput`) — Design Spec
 
-Status: implemented (Unreleased, after v0.6.0)
+Status: implemented and released in v0.7.0
 Scope: optional packaging of a Collect run's certified evidence into a timestamped
 zip; Plan-mode advertising; schema `package` block; launcher integration.
 

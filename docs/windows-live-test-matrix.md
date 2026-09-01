@@ -58,4 +58,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Invoke-WindowsPerf
 
 ## Explicitly out of scope
 
-This release does not start Procmon, DISM, SFC, scans, remediation, log clearing, remote transfer, or automatic upload. WPR capture is available only behind the separate `-ConfirmWprCapture` gate (WPD-08/09/10), and Defender performance recording only behind the separate `-ConfirmDefenderCapture` gate (WPD-12/13/14). Everything else on this list requires separate designs, explicit consent, and their own test cases.
+This release does not start Procmon, DISM, SFC, scans, remediation, log clearing, or automatic upload. Remote transfer is supported only through the separate `-ConfirmRemoteCollection` gate documented in [docs/remote-mode.md](remote-mode.md). WPR capture is available only behind the separate `-ConfirmWprCapture` gate (WPD-08/09/10), and Defender performance recording only behind the separate `-ConfirmDefenderCapture` gate (WPD-12/13/14). Everything else on this list requires separate designs, explicit consent, and their own test cases.

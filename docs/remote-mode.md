@@ -1,6 +1,6 @@
 # Remote Mode — Design Spec
 
-Status: **implemented** (Unreleased, after v0.6.0). Owner-approved contract change
+Status: **implemented and released in v0.7.0**. Owner-approved contract change
 (`localOnly: false` in remote mode only).
 
 ## 1. Problem
@@ -58,7 +58,7 @@ the plan/manifest says `status: 'skipped-winrm-unavailable'` with the exact
 service/firewall guidance — the tech enables WinRM out-of-band (documented,
 consent-owned).
 
-## 4. Scope for v1 (0.7.0)
+## 4. Implemented scope (v0.7.0)
 
 - Remote Collect of the full existing stage set (samples, processes, network,
   events, crash analysis, minidumps, boot-failure logs) — WPR/Defender only if

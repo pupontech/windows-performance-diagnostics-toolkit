@@ -2,9 +2,9 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.5.0
+**Version:** 0.8.0
 
-**Status:** Read-only collection MVP plus consent-gated WPR and Defender performance captures, and a built-in read-only network-state snapshot (DNS-vs-ping split test, hosts file, proxy, security-software inventory). It collects local diagnostics only after explicit consent; it performs no repair, upload, policy change, or remediation.
+**Status:** Read-only local collection plus consent-gated WPR/Defender performance captures, crash evidence, network-state diagnostics, optional local case packaging, and consent-gated remote WinRM collection with SHA-256 verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM.
 
 [![CI](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml)
 
@@ -42,7 +42,7 @@ See [SECURITY.md](SECURITY.md) for data-handling and approval boundaries.
 | 4. Analysis | Compare time-correlated evidence | WPA tables/graphs, event timeline, CSV/JSON reports |
 | 5. Approval-gated repair | Apply a reviewed remedy only when evidence warrants it | Consent record, command output, CBS/DISM logs |
 
-## Non-goals for v0.1.0
+## Current non-goals
 
 - No automated repair or registry changes
 - No automatic event-log clearing

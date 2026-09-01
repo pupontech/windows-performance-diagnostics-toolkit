@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.8.0 — 2026-09-01
+
+WPR/Defender capture deduplication and WinRE puller release.
+
 - **WPR/Defender capture dedup (Matt-Pocock review leftover)**: the two
   near-identical capture blocks are now one `Invoke-ConsentedCapture` helper
   (readiness check → elevation check → capture body → status/error recording).

@@ -1,7 +1,7 @@
 WINDOWS PERFORMANCE DIAGNOSTICS TOOLKIT
 =======================================
 Read-Only Diagnostics Collector for Windows 10/11
-Version 0.5.0
+Version 0.8.0
 
 This toolkit collects read-only Windows performance diagnostics to help
 troubleshoot performance issues. It does NOT upload data, remediate problems,
@@ -22,6 +22,12 @@ WHAT THIS TOOL COLLECTS
 - Optional Microsoft Defender performance recording
   (requires explicit consent, elevated console, and the
   DefenderPerformance module - Defender platform 4.18.2108.7 or later)
+- Optional crash evidence: minidumps and boot-failure logs
+  (requires explicit consent)
+- Optional local case package containing only this run's certified artifacts
+  (use the collector's -ZipOutput switch)
+- Optional remote collection over pre-enabled WinRM (requires an additional
+  consent flag and verifies every pulled file with SHA-256)
 
 All collection is gated by explicit consent prompts. Nothing runs silently.
 
@@ -34,14 +40,16 @@ Option A (full collection, recommended):
     2 - Basic collection                   (no WPR)
     3 - Full + WPR + Defender recording    (needs DefenderPerformance module)
     4 - Plan preview only                  (writes plan, collects nothing)
-    5 - Exit
+    5 - Crash evidence only                (minidumps + boot-failure logs)
+    6 - Exit
   Every run is logged to C:\Temp\WPD-Case\diagnostics-run.log so the
   result is always visible, even if the window closes.
 
 Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.
   The script will ask for explicit consent before collecting anything.
-  Output goes to C:\Temp\WPD-Case (no WPR trace).
+  Output goes to C:\Temp\WPD-Case (no WPR trace; includes crash evidence and
+  a local case package).
 
 Option C (manual):
   Open PowerShell and run:
@@ -84,7 +92,7 @@ HASH VERIFICATION
 -----------------
 Verify the downloaded zip against the published SHA-256 hash:
 
-    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.5.0.zip
+    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.8.0.zip
 
 Compare the output hash to the value in the .sha256 file published alongside
 the release. They must match exactly.

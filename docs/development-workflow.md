@@ -31,8 +31,8 @@ being exercised on real Windows (GitHub-hosted VMs) first.
 
 | Job | Runner | Verifies |
 |---|---|---|
-| `linux-verify` | ubuntu-latest | pytest suite (plan mode, consent gates, WPR gates, schema, packaging) + pwsh parse gate |
-| `windows-verify` | windows-2022 **and** windows-2025 | Parse gates under Windows PowerShell 5.1 and pwsh 7; Plan mode; Collect-without-consent refusal; WPR-without-consent refusal; **invalid-`-OutputDirectory` clear error**; **executes the real `Run-Diagnostics.bat` via `cmd`** and asserts `C:\Temp\WPD-Case\diagnostic-manifest.json` |
+| `linux-verify` | ubuntu-latest | pytest suite (plan mode, consent gates, WPR gates, schema, packaging, Verify mode) + pwsh parse gate |
+| `windows-verify` | windows-2022 **and** windows-2025 | Parse gates under Windows PowerShell 5.1 and pwsh 7; Plan mode; Collect-without-consent refusal; WPR-without-consent refusal; **invalid-`-OutputDirectory` clear error**; **executes the real `Run-Diagnostics.bat` via `cmd`**; executes START-HERE Plan/Collect/Verify modes and asserts `C:\Temp\WPD-Case\diagnostic-manifest.json` |
 
 A change is not releasable until both jobs are green on both Windows OS
 versions. This is what catches the class of bug that Linux-only checks miss

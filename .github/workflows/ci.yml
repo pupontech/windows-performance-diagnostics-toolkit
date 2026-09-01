@@ -158,17 +158,17 @@ jobs:
         shell: cmd
         run: call Run-Diagnostics.bat
 
-      - name: Run the START-HERE menu in auto mode (option 2, basic collect)
+      - name: Run the START-HERE menu in auto mode (option 2, collect)
         shell: cmd
         run: call START-HERE.bat 2
 
-      - name: Run the START-HERE menu in auto mode (option 4, plan only)
+      - name: Run the START-HERE menu in auto mode (option 1, plan)
         shell: cmd
-        run: call START-HERE.bat 4
+        run: call START-HERE.bat 1
 
-      - name: Run the START-HERE menu in auto mode (option 5, crash evidence only)
+      - name: Run the START-HERE menu in auto mode (option 3, verify)
         shell: cmd
-        run: call START-HERE.bat 5
+        run: call START-HERE.bat 3 C:\Temp\WPD-Case
 
       - name: Assert launchers produced the diagnostic artifacts
         shell: pwsh

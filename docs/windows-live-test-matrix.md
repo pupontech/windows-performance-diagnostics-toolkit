@@ -24,12 +24,13 @@ This project is verified on Linux only for PowerShell parsing and safety-mode be
 | WPD-09 | Run `-Mode Collect -ConfirmLocalCollection -CaptureWpr -ConfirmWprCapture` on a **standard (non-admin)** console | Collection completes; manifest `wpr.status` is `skipped-elevation-required`; no UAC prompt appears; no auto-elevation. | Manifest `wpr` block and console output |
 | WPD-10 | Run the WPD-09 command from an **elevated** console | `wpr-trace.etl` exists with the manifest `wpr.status` `completed`; ETL is listed in manifest hashes. | `wpr-trace.etl`, manifest |
 | WPD-11 | Download the release zip, extract, inspect `src\Invoke-WindowsPerformanceDiagnostics.ps1` and `Run-Diagnostics.bat` | If the `.ps1` was removed by Defender, follow `README-FIRST.txt` (Unblock / Protection history) and confirm the launcher runs. Verify file hashes against the `.sha256` asset. | Extraction folder listing, `Get-FileHash` output |
-| WPD-15 | Double-click `START-HERE.bat` from a standard (non-admin) account | A UAC prompt appears; after accepting, the console menu shows options 1-5. Run option 1: samples + events + `wpr-trace.etl`; manifest `wpr.status` is `completed`; `diagnostics-run.log` contains the run output. | UAC screenshot, menu screenshot, console output, manifest + ETL + log |
+| WPD-15 | Double-click `START-HERE.bat` from a standard (non-admin) account | The console menu shows Plan, Collect, Verify, and Exit. Run Collect: a UAC prompt appears only for collection; samples + events + `wpr-trace.etl` are produced when WPR is available; `diagnostics-run.log` contains the run output. | UAC screenshot, menu screenshot, console output, manifest + ETL + log |
 | WPD-16 | Run a collection on a machine with a crash in the last 24h (or create one: `Stop-Computer -Force` during a busy run is NOT advised — instead check an existing machine with Kernel-Power 41 history) | Manifest contains `crashAnalysis` with `bugchecks` (BugCheck 1001 decoded to `0x…` codes) and/or `unexplainedShutdowns` (Kernel-Power 41 without a nearby bugcheck); `systemEventLog` block shows `enabled`/`recordCount`/`pulledCount`/`skippedUnrenderableCount`. | Manifest `crashAnalysis` + `systemEventLog` blocks |
 | WPD-12 | Run `-Mode Collect -ConfirmLocalCollection -CaptureDefender` **without** `-ConfirmDefenderCapture` | Fails before any collection with the Defender consent message; no recording started. | Console output |
 | WPD-13 | Run `-Mode Collect -ConfirmLocalCollection -CaptureDefender -ConfirmDefenderCapture` on a **standard (non-admin)** console | Collection completes; manifest `defender.status` is `skipped-elevation-required`; no UAC prompt appears; no auto-elevation. | Manifest `defender` block and console output |
 | WPD-14 | Run the WPD-13 command from an **elevated** console with Defender platform 4.18.2108.7+ installed | `defender-performance.etl` exists with the manifest `defender.status` `completed`; ETL is listed in manifest hashes. | `defender-performance.etl`, manifest |
 | WPD-17 | Run a collection on a machine with a network problem (no internet, slow browsing, or DNS failure — or simulate by breaking DNS resolution or adding a hosts-file redirect) | `network-state.json` is produced and listed in manifest hashes; the manifest `network` block carries `status` `completed`, a `dnsVsPing.verdict` matching the fault (e.g. `dns-failure` when raw IPs ping but names do not resolve, `connectivity-failure` when neither works), and `securitySoftwareMatches` counts; per-section failures (if any) appear in `collectionErrors` with `network-state-<section>` stages. Verify on a standard (non-admin) account that collection still works (WPD-05). | Manifest `network` block, `network-state.json` |
+| WPD-18 | Run `-Mode Verify -InputDirectory <case>` on an intact Collect case, then modify a listed artifact and run it again | Intact case returns exit code 0 and report `status: "verified"`; tampered case returns exit code 1 with an artifact or package integrity error. The case directory is unchanged by verification. | JSON verification reports, before/after case listing |
 
 ## Approved collection example
 
@@ -40,6 +41,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Invoke-WindowsPerf
   -DurationSeconds 30 `
   -MaxEventCount 200 `
   -OutputDirectory C:\Temp\WPD-Case-001
+```
+
+Verify the resulting case:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Verify `
+  -InputDirectory C:\Temp\WPD-Case-001
 ```
 
 Consent-gated Defender performance recording (elevated console required):

@@ -1,7 +1,8 @@
 # Remote Mode — Design Spec
 
-Status: **implemented and released in v0.7.0**. Owner-approved contract change
-(`localOnly: false` in remote mode only).
+Status: **implemented and released in v0.8.2**. Owner-approved contract change
+(`localOnly: false` in remote mode only); v0.8.2 hardens staging ownership,
+artifact verification, and failure reporting.
 
 ## 1. Problem
 
@@ -25,8 +26,9 @@ Run the **existing collector on the target** and pull the results:
 4. `Copy-Item -FromSession` the whole case folder (incl. manifest) to a local
    output dir; verify the manifest parses, `mode == Collect`, and every
    artifact's SHA-256 matches (the existing whitelist contract).
-5. Cleanup: remove the remote output dir + session (removal of **our own**
-   temp artifacts, documented in the plan).
+5. Cleanup: remove only the unique remote staging child created by this run +
+   the session. A caller-supplied `-RemoteOutputDirectory` is a base directory,
+   never a cleanup target.
 
 Why remote-exec beats local-query: every stage runs on the real machine
 (Get-CimInstance, Get-NetAdapter, WinRM-free network probes, minidump reads),
@@ -112,10 +114,16 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Remote -ZipOutput
 ```
 
-What happens: the collector is staged to `%TEMP%\WPD-Remote-Case` on the target,
+What happens: the collector is staged to a unique `%TEMP%\WPD-Remote-Case-<nonce>`
+child on the target. If `-RemoteOutputDirectory` is supplied, the same unique
+child is created under that base; the base itself is never removed. The collector
 runs there with the same consent gates (WPR/Defender skip if the remote console
 is not elevated), the case folder is pulled back, every pulled file's SHA-256 is
-compared to the remote manifest, the local manifest is the remote manifest plus
-the `remote` block, and the staging directory + session are removed. If WinRM is
-unreachable the manifest records `winrmStatus: failed-winrm-unavailable` — no
-artifacts, no side effects on the target.
+compared to the remote manifest, and artifact names must be relative and
+traversal-free. The local manifest is the remote manifest with a normalized
+remote safety block and `remote` block. The owned staging child + session are
+removed. A hash mismatch or any pulled-file count mismatch records a
+`remote-hash-verification` error, marks `remote.status` as `failed`, and exits
+non-zero; it is never reported as successful. If WinRM is unreachable the
+manifest records `winrmStatus: failed-winrm-unavailable` and the command exits
+non-zero — no artifacts, no side effects on the target.

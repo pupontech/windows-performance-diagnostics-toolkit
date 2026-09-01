@@ -523,6 +523,60 @@ def test_remote_collection_still_refuses_non_windows_hosts(tmp_path):
     assert "supported only on Windows" in result.stderr
 
 
+def test_remote_helpers_fail_closed_for_safety_and_hash_verification(tmp_path):
+    """Remote helper contracts must make remote provenance explicit, stage in
+    a unique child, and turn any hash-verification failure into a failed result."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
+        f"$s = Get-RemoteSafetyBlock -RemoteTarget 'SRV-DIAG-01'; "
+        f"$p = New-RemoteStagingPath -BaseDirectory '{tmp_path.as_posix()}/remote-root' -Nonce 'abc123'; "
+        "$failed = Get-RemoteVerificationStatus -HashVerificationFailed $true -PulledFileCount 1 -VerifiedFileCount 0; "
+        "$passed = Get-RemoteVerificationStatus -HashVerificationFailed $false -PulledFileCount 2 -VerifiedFileCount 2; "
+        "$relative = Get-ValidatedRemoteArtifactName -Name 'logs/item.json'; "
+        "$traversal = 'accepted'; try { Get-ValidatedRemoteArtifactName -Name '../outside.txt' | Out-Null } catch { $traversal = 'rejected' }; "
+        "[ordered]@{safety=$s;path=$p;failed=$failed;passed=$passed;relative=$relative;traversal=$traversal} | ConvertTo-Json -Depth 6"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    output = json.loads(result.stdout)
+    assert output["safety"] == {
+        "localOnly": False,
+        "readOnly": True,
+        "requiresExplicitCollectionConsent": True,
+        "automaticUpload": False,
+        "automaticRemediation": False,
+        "automaticLogClearing": False,
+        "remoteTarget": "SRV-DIAG-01",
+        "remoteTransport": "winrm",
+    }
+    assert Path(output["path"]).name == "WPD-Remote-Case-abc123"
+    assert output["failed"] == "failed"
+    assert output["passed"] == "completed"
+    assert output["relative"] == "logs\\item.json"
+    assert output["traversal"] == "rejected"
+
+
+def test_remote_collection_source_uses_owned_staging_and_fail_closed_status():
+    """The WinRM-only branch is statically contract-tested on Linux; live
+    WinRM execution remains an owner/Windows CI gate."""
+    text = SCRIPT.read_text(encoding="utf-8")
+
+    assert "$remoteStagingOwned = $false" in text
+    assert "$remoteStagingOwned = $true" in text
+    assert "if ($remoteStagingOwned -and $remoteOutDir)" in text
+    assert "Get-RemoteVerificationStatus" in text
+    assert "$remotePulledManifest.safety = Get-RemoteSafetyBlock" in text
+    assert "Remote collection failed. Manifest written" in text
+    assert "remotePulledManifest.collectionErrors" in text
+
+
 def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
     """Invoke-ConsentedCapture (dot-sourced) must record collectionErrors and
     return the right status on the readiness-fail path, and must fail SAFE
@@ -603,6 +657,46 @@ def test_release_packaging_files_present():
     assert (REPO_ROOT / "START-HERE.bat").is_file()
     assert (REPO_ROOT / "README-FIRST.txt").is_file()
     assert (REPO_ROOT / "make-deploy-bundle.sh").is_file()
+
+
+def test_bundle_rejects_same_version_from_non_tagged_head(tmp_path):
+    """A release-named bundle must come from the exact matching tag, not a
+    later same-version main commit with different shipped contents."""
+    repo = tmp_path / "bundle-repo"
+    repo.mkdir()
+    shutil.copy2(REPO_ROOT / "make-deploy-bundle.sh", repo / "make-deploy-bundle.sh")
+    (repo / "VERSION").write_text("1.2.3\n", encoding="ascii")
+    (repo / "README.txt").write_text("base\n", encoding="ascii")
+
+    def git(*arguments: str) -> None:
+        subprocess.run(
+            ["git", *arguments],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "wpd-tests@example.invalid")
+    git("config", "user.name", "WPD Tests")
+    git("add", "VERSION", "README.txt", "make-deploy-bundle.sh")
+    git("commit", "-qm", "release base")
+    git("tag", "v1.2.3")
+    (repo / "README.txt").write_text("post-release main change\n", encoding="ascii")
+    git("add", "README.txt")
+    git("commit", "-qm", "post-release change")
+
+    result = subprocess.run(
+        ["bash", "make-deploy-bundle.sh"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "not checked out at its release tag" in result.stderr
 
 
 def test_version_file_matches_script_fallback():

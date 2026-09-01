@@ -48,7 +48,7 @@ Every release, without exception:
 2. Add a real `CHANGELOG.md` entry describing the change and the root cause for fixes.
 3. Push to `main` and wait for CI to be green.
 4. Tag `v<semver>`; create the GitHub Release with notes **mirrored from CHANGELOG.md** — never a bare tag or one-line note.
-5. Build the zip from the verified clean tree: `bash make-deploy-bundle.sh` (refuses to build a dirty tree).
+5. Check out the exact `v<semver>` tag and build the zip from that verified clean tree: `bash make-deploy-bundle.sh` (refuses dirty trees and same-version non-tag commits).
 6. Attach the zip **and** the `.sha256` asset; then byte-verify: download the published asset and confirm `sha256sum` matches the local build exactly.
 
 ## 5. Live handoff (owner)

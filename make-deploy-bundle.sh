@@ -16,6 +16,15 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+RELEASE_TAG="v${VERSION}"
+TAG_COMMIT="$(git rev-parse --verify --quiet "${RELEASE_TAG}^{commit}" || true)"
+HEAD_COMMIT="$(git rev-parse HEAD)"
+if [ -z "$TAG_COMMIT" ] || [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+  echo "ERROR: VERSION ${VERSION} is not checked out at its release tag ${RELEASE_TAG}." >&2
+  echo "       Check out the exact release tag before building the release zip." >&2
+  exit 1
+fi
+
 ARTIFACT="windows-performance-diagnostics-toolkit-${VERSION}"
 STAGE_DIR="dist/stage/${ARTIFACT}"
 OUT_DIR="dist"

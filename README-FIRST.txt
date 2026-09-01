@@ -1,7 +1,7 @@
 WINDOWS PERFORMANCE DIAGNOSTICS TOOLKIT
 =======================================
 Read-Only Diagnostics Collector for Windows 10/11
-Version 0.8.1
+Version 0.8.2
 
 This toolkit collects read-only Windows performance diagnostics to help
 troubleshoot performance issues. It does NOT upload data, remediate problems,
@@ -47,7 +47,8 @@ Option A (full collection, recommended):
 
 Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.
-  The script will ask for explicit consent before collecting anything.
+  This standard launcher passes the explicit collection-consent switches for
+  its documented read-only workflow; it does not display a second prompt.
   Output goes to C:\Temp\WPD-Case (no WPR trace; includes crash evidence and
   a local case package).
 
@@ -92,7 +93,7 @@ HASH VERIFICATION
 -----------------
 Verify the downloaded zip against the published SHA-256 hash:
 
-    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.8.1.zip
+    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.8.2.zip
 
 Compare the output hash to the value in the .sha256 file published alongside
 the release. They must match exactly.

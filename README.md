@@ -2,7 +2,7 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.8.1
+**Version:** 0.8.2
 
 **Status:** Read-only local collection plus consent-gated WPR/Defender performance captures, crash evidence, network-state diagnostics, optional local case packaging, and consent-gated remote WinRM collection with SHA-256 verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM.
 
@@ -112,7 +112,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 
 ## Deployment bundle
 
-`make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from a verified clean git tree. The bundle ships:
+`make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from the exact matching release tag in a verified clean git tree. It refuses to create a same-version archive from a later `main` commit. The bundle ships:
 
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
 - `START-HERE.bat` — double-click console menu: UAC self-elevation, then 1) Full+WPR trace + crash evidence, 2) Basic, 3) Full+WPR+Defender + crash evidence, 4) Plan preview, 5) Crash evidence only (minidumps + boot-failure logs), 6) Exit; every run logged to `C:\Temp\WPD-Case\diagnostics-run.log`

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.8.2 — 2026-09-01
+
+Remote integrity and release provenance hardening.
+
+- **Remote staging ownership**: `-RemoteOutputDirectory` is now treated as a
+  base directory for a unique nonce-named child. Only the child created by this
+  run is eligible for cleanup; an existing staging-path collision is refused.
+- **Remote pull integrity**: relative, traversal-free artifact names are
+  required; any SHA-256 or pulled-file-count mismatch marks the remote result
+  `failed`, records `remote-hash-verification`, writes the manifest, and exits
+  non-zero instead of claiming successful collection.
+- **Remote provenance**: pulled manifests now normalize `safety.localOnly` to
+  `false` and include the remote target and WinRM transport in the safety block.
+- **Bundle provenance**: `make-deploy-bundle.sh` now requires `HEAD` to be the
+  exact `v<VERSION>` release tag, preventing same-version archives from drifting
+  after post-release CI pin commits.
+- Added Linux regression coverage for remote helper contracts, artifact
+  traversal rejection, fail-closed remote source flow, and tag-bound bundling.
+
 ## 0.8.1 — 2026-09-01
 
 Evidence-contract hardening release.

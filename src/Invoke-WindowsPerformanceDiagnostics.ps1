@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
 # keeps the two in sync so drift fails CI.
-$script:ScriptVersion = '0.8.1'
+$script:ScriptVersion = '0.8.2'
 try {
     $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
 }
@@ -82,6 +82,82 @@ function Write-JsonFile {
 
 function Get-UtcTimestamp {
     return (Get-Date).ToUniversalTime().ToString('o')
+}
+
+function Get-RemoteSafetyBlock {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RemoteTarget
+    )
+
+    return [ordered]@{
+        localOnly = $false
+        readOnly = $true
+        requiresExplicitCollectionConsent = $true
+        automaticUpload = $false
+        automaticRemediation = $false
+        automaticLogClearing = $false
+        remoteTarget = $RemoteTarget
+        remoteTransport = 'winrm'
+    }
+}
+
+function New-RemoteStagingPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Nonce
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BaseDirectory)) {
+        throw 'Remote staging base directory cannot be empty.'
+    }
+    if ($Nonce -notmatch '^[A-Za-z0-9-]+$') {
+        throw 'Remote staging nonce contains unsupported characters.'
+    }
+
+    return Join-Path -Path $BaseDirectory -ChildPath ('WPD-Remote-Case-' + $Nonce)
+}
+
+function Get-RemoteVerificationStatus {
+    param(
+        [bool]$HashVerificationFailed,
+        [int]$PulledFileCount,
+        [int]$VerifiedFileCount
+    )
+
+    if ($HashVerificationFailed -or ($PulledFileCount -ne $VerifiedFileCount)) {
+        return 'failed'
+    }
+    return 'completed'
+}
+
+function Get-ValidatedRemoteArtifactName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        throw 'Remote manifest contains an empty artifact name.'
+    }
+
+    $normalizedName = $Name.Replace('/', '\')
+    if ($normalizedName.StartsWith('\') -or $normalizedName -match '^[A-Za-z]:') {
+        throw "Remote manifest artifact name must be relative: $Name"
+    }
+    foreach ($segment in $normalizedName.Split([char]92)) {
+        if ($segment -eq '.' -or $segment -eq '..') {
+            throw "Remote manifest artifact name contains a traversal segment: $Name"
+        }
+    }
+    if ($normalizedName -match '[:*?"<>|]') {
+        throw "Remote manifest artifact name contains an unsupported character: $Name"
+    }
+
+    return $normalizedName
 }
 
 function Get-ArtifactMetadata {
@@ -949,6 +1025,8 @@ if ($RemoteComputer) {
     $remoteStatus = 'failed'
     $remoteWinrmStatus = 'failed-winrm-unavailable'
     $remoteOutDir = $null
+    $remoteStagingOwned = $false
+    $remoteStagingNonce = [Guid]::NewGuid().ToString('N')
     $remotePulledFileCount = 0
     $remoteVerifiedCount = 0
     $remoteHashVerificationFailed = $false
@@ -965,16 +1043,29 @@ if ($RemoteComputer) {
 
         $session = New-PSSession @wsmanParams
         if ($RemoteOutputDirectory) {
-            $remoteOutDir = $RemoteOutputDirectory
+            # A caller-supplied path is a BASE only. Never treat it as an
+            # owned directory: create and later remove a unique child.
+            $remoteOutDir = New-RemoteStagingPath `
+                -BaseDirectory $RemoteOutputDirectory `
+                -Nonce $remoteStagingNonce
         }
         else {
-            $remoteOutDir = (Invoke-Command -Session $session -ScriptBlock { Join-Path $env:TEMP 'WPD-Remote-Case' })
+            $remoteOutDir = (Invoke-Command -Session $session -ScriptBlock {
+                param($nonce)
+                Join-Path $env:TEMP ('WPD-Remote-Case-' + $nonce)
+            } -ArgumentList $remoteStagingNonce)
         }
         $remoteScriptPath = Join-Path $remoteOutDir 'Invoke-WindowsPerformanceDiagnostics.ps1'
-        Invoke-Command -Session $session -ScriptBlock {
+        $remoteDirectoryCreated = Invoke-Command -Session $session -ScriptBlock {
             param($dir)
+            if (Test-Path -LiteralPath $dir) { return $false }
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            return $true
         } -ArgumentList $remoteOutDir
+        if (-not [bool]$remoteDirectoryCreated) {
+            throw "Remote staging directory already exists; refusing to use it: $remoteOutDir"
+        }
+        $remoteStagingOwned = $true
         Copy-Item -ToSession $session -Path $MyInvocation.MyCommand.Path -Destination $remoteScriptPath -Force
 
         # Named-parameter hashtable: splatting a string ARRAY would pass the
@@ -1013,10 +1104,14 @@ if ($RemoteComputer) {
         $localManifestPath = Join-Path $resolvedOutputDirectory 'diagnostic-manifest.json'
         Copy-Item -FromSession $session -Path $remoteManifestPath -Destination $localManifestPath -Force
         $remotePulledManifest = Get-Content -LiteralPath $localManifestPath -Raw | ConvertFrom-Json
+        if ($remotePulledManifest.mode -ne 'Collect') {
+            throw 'Remote manifest mode was not Collect; refusing to certify the pulled case.'
+        }
 
         foreach ($artifact in @($remotePulledManifest.artifacts)) {
-            $remoteArtifactPath = Join-Path $remoteOutDir $artifact.Name
-            $localArtifactPath = Join-Path $resolvedOutputDirectory $artifact.Name
+            $artifactName = Get-ValidatedRemoteArtifactName -Name ([string]$artifact.Name)
+            $remoteArtifactPath = Join-Path $remoteOutDir $artifactName
+            $localArtifactPath = Join-Path $resolvedOutputDirectory $artifactName
             $localArtifactDir = Split-Path -Parent $localArtifactPath
             if (-not (Test-Path -LiteralPath $localArtifactDir)) {
                 New-Item -ItemType Directory -Force -Path $localArtifactDir | Out-Null
@@ -1031,7 +1126,15 @@ if ($RemoteComputer) {
                 $remoteHashVerificationFailed = $true
             }
         }
-        $remoteStatus = 'completed'
+        $remoteStatus = Get-RemoteVerificationStatus `
+            -HashVerificationFailed $remoteHashVerificationFailed `
+            -PulledFileCount $remotePulledFileCount `
+            -VerifiedFileCount $remoteVerifiedCount
+        if ($remoteStatus -eq 'failed') {
+            Add-CollectionErrorText `
+                -Stage 'remote-hash-verification' `
+                -Message 'One or more pulled remote artifacts failed SHA-256 verification.'
+        }
     }
     catch {
         Add-CollectionError -Stage 'remote-collection' -ErrorRecord $_
@@ -1041,7 +1144,7 @@ if ($RemoteComputer) {
     # cleanup: remove OUR remote staging dir + session (documented in the plan)
     if ($session) {
         try {
-            if ($remoteOutDir) {
+            if ($remoteStagingOwned -and $remoteOutDir) {
                 Invoke-Command -Session $session -ScriptBlock {
                     param($dir)
                     if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
@@ -1061,6 +1164,12 @@ if ($RemoteComputer) {
 
     if ($remotePulledManifest) {
         $collectionManifest = $remotePulledManifest
+        $remotePulledManifest.safety = Get-RemoteSafetyBlock -RemoteTarget $RemoteComputer
+        $remoteManifestErrors = @()
+        if ($remotePulledManifest.PSObject.Properties.Name -contains 'collectionErrors') {
+            $remoteManifestErrors = @($remotePulledManifest.collectionErrors)
+        }
+        $remotePulledManifest.collectionErrors = @($remoteManifestErrors) + @($collectionErrors)
         $collectionManifest | Add-Member -NotePropertyName 'remote' -NotePropertyValue ([ordered]@{
             computerName = $RemoteComputer
             transport = 'winrm'
@@ -1109,8 +1218,12 @@ if ($RemoteComputer) {
         $collectionManifest = Add-CasePackageBlock -CollectionManifest $collectionManifest -OutputDirectory $resolvedOutputDirectory -ArtifactNames @($collectedArtifacts)
         Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
     }
-    Write-Output "Remote collection complete. Manifest written to $collectionManifestPath"
-    exit 0
+    if ($remoteStatus -eq 'completed') {
+        Write-Output "Remote collection complete. Manifest written to $collectionManifestPath"
+        exit 0
+    }
+    Write-Output "Remote collection failed. Manifest written to $collectionManifestPath"
+    exit 1
 }
 
 $collectedArtifacts = New-Object System.Collections.ArrayList

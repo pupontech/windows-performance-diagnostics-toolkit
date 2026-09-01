@@ -656,6 +656,35 @@ def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
 
 
+def test_run_diagnostics_bat_reports_collection_failures():
+    """The basic launcher must not claim success when the collector exits
+    non-zero or fails to emit a manifest."""
+    text = (REPO_ROOT / "Run-Diagnostics.bat").read_bytes().decode("ascii")
+
+    assert "if errorlevel 1 goto :collection_failed" in text
+    assert 'if not exist "%OUTDIR%\\diagnostic-manifest.json" goto :collection_failed' in text
+    assert ":collection_failed" in text
+    failure_block = text.split(":collection_failed", 1)[1]
+    assert "exit /b 1" in failure_block
+
+
+def test_wpr_capture_completed_requires_zero_stop_exit_code():
+    """A non-zero WPR stop result must never be certified as completed, even
+    if a non-empty ETL happened to be left behind."""
+    source = (REPO_ROOT / "src" / "Invoke-WindowsPerformanceDiagnostics.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+    start = source.index("-StageName 'wpr-capture'")
+    end = source.index("if ($CaptureDefender)", start)
+    wpr_block = source[start:end]
+
+    assert "if ($stopExitCode -eq 0 -and" in wpr_block
+    assert "WprStopFailed" in wpr_block
+    completed_at = wpr_block.index("status = 'completed'")
+    stop_guard = wpr_block.index("if ($stopExitCode -eq 0 -and")
+    assert stop_guard < completed_at
+
+
 def test_plan_mode_lists_crash_analysis_action(tmp_path):
     """Plan mode must advertise crash-evidence analysis without running it."""
     output_directory = tmp_path / "plan-crash"
@@ -859,6 +888,33 @@ def test_crash_analysis_decodes_bugchecks_and_flags_unexplained_shutdowns():
     assert len(analysis["unexplainedShutdowns"]) == 1
 
 
+def test_crash_analysis_recognizes_real_windows_bugcheck_provider():
+    """Windows Event ID 1001 is commonly emitted by the
+    Microsoft-Windows-WER-SystemErrorReporting provider with BugCheck as its
+    event source. The analyzer must not require the legacy display name
+    'BugCheck' as the provider name."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-real-bugcheck-provider; "
+        "$r = Get-CrashAnalysis -Events @([pscustomobject]@{"
+        "ProviderName='Microsoft-Windows-WER-SystemErrorReporting';Id=1001;"
+        "TimeCreated=(Get-Date).AddMinutes(-2);"
+        "Message='The bugcheck was: 0x0000009F (0x1, 0x2, 0x3, 0x4)'"
+        "}); $r | ConvertTo-Json -Depth 6"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    analysis = json.loads(result.stdout)
+    assert len(analysis["bugchecks"]) == 1
+    assert analysis["bugchecks"][0]["BugcheckCode"] == "0x0000009F"
+
+
 def test_artifact_metadata_hashes_only_whitelisted_names(tmp_path):
     """Regression: the manifest must never certify files not written this run.
     Get-ArtifactMetadata with a Names whitelist ignores stale files in a
@@ -980,3 +1036,15 @@ def test_human_facing_release_metadata_matches_version():
     assert f"**Version:** {version}" in readme
     assert f"Version {version}" in readme_first
     assert f"## {version} — " in changelog
+
+
+def test_wpa_guide_matches_the_collector_wpr_profile():
+    """The WPA guide must describe the profile the collector actually starts.
+    A stale profile name sends an operator to a command that WPR rejects."""
+    guide = (REPO_ROOT / "docs" / "wpa-analysis-guide.md").read_text(encoding="utf-8")
+
+    assert "wpr.exe -start GeneralProfile -filemode" in guide
+    assert 'schema enum: `"GeneralProfile"`' in guide
+    assert "The `GeneralProfile` profile is First Level Triage" in guide
+    assert "wpr.exe -start General -filemode" not in guide
+    assert 'schema enum: `"General"`' not in guide

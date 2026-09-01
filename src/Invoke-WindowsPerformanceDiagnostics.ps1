@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
 # keeps the two in sync so drift fails CI.
-$script:ScriptVersion = '0.8.0'
+$script:ScriptVersion = '0.8.1'
 try {
     $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
 }
@@ -404,7 +404,12 @@ function Get-CrashAnalysis {
     )
 
     $bugchecks = @(
-        $Events | Where-Object { $_.ProviderName -eq 'BugCheck' -and $_.Id -eq 1001 } | ForEach-Object {
+        # Event Viewer may display this source as "BugCheck", while the
+        # underlying provider is usually Microsoft-Windows-WER-SystemErrorReporting.
+        $Events | Where-Object {
+            $_.Id -eq 1001 -and
+            ($_.ProviderName -eq 'BugCheck' -or $_.ProviderName -match 'WER-SystemErrorReporting')
+        } | ForEach-Object {
             $code = $null
             if ($_.Message -match '0x[0-9A-Fa-f]{8}') {
                 $code = $matches[0]
@@ -1421,7 +1426,12 @@ if ($CaptureWpr) {
                 & $wprExe -stop $etlPath
                 $stopExitCode = $LASTEXITCODE
                 $completedAtUtc = Get-UtcTimestamp
-                if ((Test-Path -LiteralPath $etlPath) -and (Get-Item -LiteralPath $etlPath).Length -gt 0) {
+                $etlExists = Test-Path -LiteralPath $etlPath -PathType Leaf
+                $etlBytes = 0
+                if ($etlExists) {
+                    $etlBytes = (Get-Item -LiteralPath $etlPath).Length
+                }
+                if ($stopExitCode -eq 0 -and $etlExists -and $etlBytes -gt 0) {
                     [void]$collectedArtifacts.Add('wpr-trace.etl')
                     return [ordered]@{
                         status = 'completed'
@@ -1433,9 +1443,17 @@ if ($CaptureWpr) {
                     }
                 }
                 else {
+                    if ($stopExitCode -ne 0) {
+                        $wprStopErrorId = 'WprStopFailed'
+                        $wprStopMessage = "wpr.exe -stop reported exit code $stopExitCode; WPR capture failed (etlExists=$etlExists, etlBytes=$etlBytes)"
+                    }
+                    else {
+                        $wprStopErrorId = 'WprEtlMissing'
+                        $wprStopMessage = "wpr.exe -stop succeeded but no non-empty wpr-trace.etl was produced (etlExists=$etlExists, etlBytes=$etlBytes)"
+                    }
                     Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                        [System.Exception]::new("wpr.exe -stop reported exit code $stopExitCode but no wpr-trace.etl was produced"),
-                        'WprEtlMissing',
+                        [System.Exception]::new($wprStopMessage),
+                        $wprStopErrorId,
                         [System.Management.Automation.ErrorCategory]::InvalidData,
                         $null
                     ))

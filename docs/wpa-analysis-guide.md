@@ -60,13 +60,13 @@ If `wpr.status` is anything other than `completed`, there is NO `wpr-trace.etl`
 to analyze. Do not open WPA looking for one. The CSV/JSON evidence still stands
 on its own.
 
-The toolkit captures with the built-in `General` profile in file mode:
+The toolkit captures with the built-in `GeneralProfile` profile in file mode:
 
-  wpr.exe -start General -filemode
+  wpr.exe -start GeneralProfile -filemode
   wpr.exe -stop <etl path>
 
-That is the only profile the toolkit uses today (schema enum: `"General"`).
-The `General` profile is First Level Triage: CPU (sampled), Disk I/O, process
+That is the only profile the toolkit uses today (schema enum: `"GeneralProfile"`).
+The `GeneralProfile` profile is First Level Triage: CPU (sampled), Disk I/O, process
 lifetimes, and reference set / memory working-set data. Treat it as a broad
 overview capture, not a targeted profile for one subsystem.
 
@@ -370,7 +370,7 @@ not causation. Apply these rules every time you write a finding.
      (Sampled) names process A but CPU Usage (Precise) shows A was READY-starved
      by B, the lead is B, not A. The sampled view misleads on its own.
 
-  6. BOUNDS of the capture. The General profile is First Level Triage, not a
+  6. BOUNDS of the capture. The GeneralProfile profile is First Level Triage, not a
      targeted profile. Absence of evidence in this trace is NOT evidence of
      absence -- a missing table means the profile did not record that detail, or
      the symptom fell outside the 30 s window. Say "not captured", never "did not

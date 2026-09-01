@@ -2,7 +2,7 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.8.0
+**Version:** 0.8.1
 
 **Status:** Read-only local collection plus consent-gated WPR/Defender performance captures, crash evidence, network-state diagnostics, optional local case packaging, and consent-gated remote WinRM collection with SHA-256 verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM.
 

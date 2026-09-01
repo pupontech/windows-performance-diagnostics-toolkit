@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.8.1 — 2026-09-01
+
+Evidence-contract hardening release.
+
+- **Crash evidence accuracy**: `Get-CrashAnalysis` now recognizes Event ID 1001 from the `Microsoft-Windows-WER-SystemErrorReporting` provider as well as the legacy `BugCheck` provider name, so real Windows bugchecks are not silently omitted from the report.
+- **WPR completion integrity**: WPR is marked `completed` only when `wpr.exe -stop` returns exit code 0 and `wpr-trace.etl` exists as a non-empty file. Non-zero stop results are recorded as `WprStopFailed`.
+- **Launcher outcome integrity**: `Run-Diagnostics.bat` now returns failure when PowerShell exits non-zero or no diagnostic manifest is produced, instead of claiming collection completed unconditionally.
+- **WPA documentation drift**: `docs/wpa-analysis-guide.md` now uses the actual `GeneralProfile` WPR profile name and matching schema enum.
+- Linux regression coverage now covers the real bugcheck provider, WPR stop-code guard, launcher failure path, and WPA profile documentation; safety contracts remain unchanged.
+
 ## 0.8.0 — 2026-09-01
 
 WPR/Defender capture deduplication and WinRE puller release.

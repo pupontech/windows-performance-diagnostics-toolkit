@@ -108,9 +108,9 @@ both modes). `plannedActions` items are unenumerated (no change). `safety` uncha
 
 ## 6. Launcher changes
 
-- `START-HERE.bat`: options 1 (full) and 3 (full+Defender) gain the four new flags; new
-  **option 5 — "Crash evidence only (minidumps + boot-failure logs, no WPR)"** (Exit moved to
-  option 6); manifest-completion echo lists the new `minidumps\` / `bootfailure\` folders.
+- `START-HERE.bat`: the three-mode menu keeps crash evidence inside the single
+  Collect flow (alongside the four consent flags); Verify is available as mode 3.
+  The manifest-completion echo lists the `minidumps\` / `bootfailure\` folders.
 - `Run-Diagnostics.bat`: gains the four new flags.
 
 ## 7. Tests (`tests/test_plan_mode.py`)
@@ -120,7 +120,7 @@ both modes). `plannedActions` items are unenumerated (no change). `safety` uncha
 - Collect refuses without `-ConfirmMinidumpCollection` (exact message).
 - Collect refuses without `-ConfirmBootFailureLogCollection` (exact message).
 - Both pass consent still refuse non-Windows hosts.
-- START-HERE menu test: option 6 + new flag strings.
+- START-HERE mode test: the three-mode menu and the new flag strings.
 - Schema test: `minidumps` / `bootFailureLogs` present.
 
 ## 8. WinRE runbook (documentation only)

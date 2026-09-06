@@ -33,17 +33,15 @@ All collection is gated by explicit consent prompts. Nothing runs silently.
 
 QUICK START
 -----------
-Option A (full collection, recommended):
+Option A (START-HERE modes):
   Double-click START-HERE.bat in the extracted folder.
-  Accept the UAC (administrator) prompt, then choose from the menu:
-    1 - Full collection + WPR trace        (recommended)
-    2 - Basic collection                   (no WPR)
-    3 - Full + WPR + Defender recording    (needs DefenderPerformance module)
-    4 - Plan preview only                  (writes plan, collects nothing)
-    5 - Crash evidence only                (minidumps + boot-failure logs)
-    6 - Exit
-  Every run is logged to C:\Temp\WPD-Case\diagnostics-run.log so the
-  result is always visible, even if the window closes.
+  Choose from the three operating modes (or Exit):
+    1 - Plan preview
+    2 - Collect diagnostics (recommended full read-only evidence)
+    3 - Verify an existing case
+    4 - Exit
+  Collect requests UAC only when administrator rights are needed. Every
+  collection run is logged to C:\Temp\WPD-Case\diagnostics-run.log.
 
 Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.
@@ -60,6 +58,14 @@ Option C (manual):
       -Mode Plan
 
   Review the plan, then switch -Mode Plan to -Mode Collect to begin.
+  After collection, verify the case without changing it:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass `
+      -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+      -Mode Verify -InputDirectory C:\Temp\WPD-Case
+
+  Verify returns exit code 0 only when the Collect manifest, listed artifacts,
+  and any recorded case ZIP pass validation.
 
 THE ZIP OR SCRIPT DISAPPEARED - FIX THIS FIRST
 -----------------------------------------------

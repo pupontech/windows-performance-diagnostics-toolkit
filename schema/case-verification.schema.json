@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Windows Performance Diagnostics Toolkit Case Verification Report",
+  "description": "Machine-readable result emitted by Verify mode. This report validates an existing Collect case without modifying the case directory.",
+  "type": "object",
+  "required": [
+    "reportType",
+    "verifierVersion",
+    "mode",
+    "status",
+    "inputDirectory",
+    "manifestPath",
+    "artifactCount",
+    "verifiedArtifactCount",
+    "package",
+    "errors",
+    "warnings",
+    "verifiedAtUtc"
+  ],
+  "properties": {
+    "reportType": {
+      "type": "string",
+      "enum": ["case-verification"]
+    },
+    "verifierVersion": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["Verify"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["verified", "failed"]
+    },
+    "inputDirectory": {
+      "type": "string"
+    },
+    "manifestPath": {
+      "type": ["string", "null"]
+    },
+    "artifactCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "verifiedArtifactCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "package": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["not-present", "not-verified", "failed", "verified"]
+        },
+        "path": {
+          "type": "string"
+        },
+        "entryCount": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verifiedAtUtc": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

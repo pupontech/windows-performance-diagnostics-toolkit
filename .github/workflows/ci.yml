@@ -158,17 +158,17 @@ jobs:
         shell: cmd
         run: call Run-Diagnostics.bat
 
-      - name: Run the START-HERE menu in auto mode (option 2, basic collect)
+      - name: Run the START-HERE menu in auto mode (option 2, collect)
         shell: cmd
         run: call START-HERE.bat 2
 
-      - name: Run the START-HERE menu in auto mode (option 4, plan only)
+      - name: Run the START-HERE menu in auto mode (option 1, plan)
         shell: cmd
-        run: call START-HERE.bat 4
+        run: call START-HERE.bat 1
 
-      - name: Run the START-HERE menu in auto mode (option 5, crash evidence only)
+      - name: Run the START-HERE menu in auto mode (option 3, verify)
         shell: cmd
-        run: call START-HERE.bat 5
+        run: call START-HERE.bat 3 C:\Temp\WPD-Case
 
       - name: Assert launchers produced the diagnostic artifacts
         shell: pwsh
@@ -725,17 +725,23 @@ jobs:
           $dst = $shell.Namespace($extract1)
           $dst.CopyHere($src.Items(), 0x14)
           $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($zipAbs)
-          $expectedCount = $zipArchive.Entries.Count
+          # Shell.Application hides dotfiles/dot-directories during Explorer-style
+          # extraction on the hosted runners. Count only visible file entries;
+          # required launcher files are checked explicitly below.
+          $expectedEntries = @($zipArchive.Entries | Where-Object {
+            -not [string]::IsNullOrEmpty($_.Name) -and $_.FullName -notmatch '(^|/)\.'
+          })
+          $expectedCount = $expectedEntries.Count
           $zipArchive.Dispose()
           $deadline = (Get-Date).AddSeconds(90)
           do {
             Start-Sleep -Milliseconds 500
-            $actualCount = @(Get-ChildItem -LiteralPath $extract1 -Recurse -File).Count
+            $actualCount = @(Get-ChildItem -LiteralPath $extract1 -Recurse -File -Force).Count
           } while ($actualCount -lt $expectedCount -and (Get-Date) -lt $deadline)
-          if ($actualCount -lt $expectedCount) { throw "WPD-11 FAIL: extraction incomplete ($actualCount/$expectedCount files)" }
+          if ($actualCount -lt $expectedCount) { throw "WPD-11 FAIL: extraction incomplete ($actualCount/$expectedCount visible files)" }
           $root = Join-Path $extract1 $state.base
           $ps1 = Join-Path $root 'src\Invoke-WindowsPerformanceDiagnostics.ps1'
-          "Extracted $actualCount files to $extract1 (zip has $expectedCount entries)" | Out-File -FilePath $evidence -Append -Encoding utf8
+          "Extracted $actualCount files to $extract1 (zip has $expectedCount visible file entries; dotfiles are omitted by Shell.Application)" | Out-File -FilePath $evidence -Append -Encoding utf8
           $ps1Item = Get-Item -LiteralPath $ps1 -ErrorAction SilentlyContinue
           if ($ps1Item) {
             $zi = Get-Item -LiteralPath $ps1 -Stream Zone.Identifier -ErrorAction SilentlyContinue

@@ -12,6 +12,7 @@ document defines the contract for those JSON files and their companion artifacts
 |------|-------------|
 | `diagnostic-plan.json` | Emitted in Plan mode. Lists planned actions and safety guarantees before any data is collected. |
 | `diagnostic-manifest.json` | Emitted in Collect mode. Records what was collected, when, where, and any errors encountered. |
+| `case-verification.schema.json` | Schema for the machine-readable report emitted by Verify mode. |
 | `performance-samples.csv` | Time-series samples of CPU load, available memory, and free disk space collected once per second. |
 | `top-processes.json` | Snapshot of the top 20 processes sorted by CPU usage, including PID, memory, and handle count. |
 | `system-events-last-24-hours.json` | System event log entries from the preceding 24 hours (up to MaxEventCount). |
@@ -141,6 +142,43 @@ is produced; the copy of the manifest inside the zip is the pre-package version
 (the wrapper is described by the manifest, not vice versa). A failed packaging
 attempt still records `status: "failed"` with a `case-package` entry in
 `collectionErrors`.
+
+## Case Verification Report
+
+Verify mode is the third and final top-level operating mode:
+
+```powershell
+powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Verify -InputDirectory C:\Temp\WPD-Case-001
+```
+
+It is deliberately read-only. It reads `diagnostic-manifest.json`, verifies the
+manifest's safety contract, checks every listed artifact's safe relative path,
+existence, byte count, and SHA-256, and validates a recorded case ZIP when one
+is present. ZIP validation requires the recorded size and hash, the exact
+artifact-plus-manifest whitelist, matching ZIP entry hashes, and agreement
+between the outer and in-ZIP artifact metadata.
+
+The verifier resolves a package by its recorded **filename beside the case
+directory**, so a case folder and ZIP can be moved together. It does not open an
+arbitrary absolute path from an untrusted manifest. Reparse-point input,
+artifact, and package paths are rejected. A successful report has
+`status: "verified"` and exit code `0`; any integrity or contract failure has
+`status: "failed"` and exit code `1`.
+
+The report is emitted to stdout and is described by
+`schema/case-verification.schema.json`. It is not a diagnostic manifest, so the
+manifest schema's `mode` enum remains limited to `Plan` and `Collect`.
+
+| Field | Meaning |
+|-------|---------|
+| `reportType` | Always `case-verification`. |
+| `status` | `verified` or `failed`. |
+| `artifactCount` | Number of artifact entries in the Collect manifest. |
+| `verifiedArtifactCount` | Number whose path, size, and SHA-256 matched. |
+| `package.status` | `not-present`, `not-verified`, `failed`, or `verified`. |
+| `errors` | Integrity or contract failures. Any entry causes exit code `1`. |
+| `warnings` | Reserved for non-fatal verifier notices. |
 
 ## Safety Object
 

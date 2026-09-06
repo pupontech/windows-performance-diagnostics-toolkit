@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Added the third and final top-level operating mode, `Verify`, alongside the
+  existing `Plan` and `Collect` modes. Verify is read-only and requires
+  `-InputDirectory`.
+- Verify validates the Collect manifest's safety contract, artifact paths,
+  existence, sizes, SHA-256 hashes, and any recorded case ZIP's hash, exact
+  whitelist, entry hashes, and in-ZIP metadata. It emits a separate
+  `case-verification` report and returns non-zero on any failure.
+- Added `schema/case-verification.schema.json` plus Linux regression coverage
+  for tampering, traversal, ZIP whitelist integrity, and no-write behavior.
+- Simplified `START-HERE.bat` to the same three-mode workflow (Plan, Collect,
+  Verify) plus Exit; collection-only UAC elevation and existing CI-safe logging
+  are preserved.
+
 ## 0.8.2 — 2026-09-01
 
 Remote integrity and release provenance hardening.

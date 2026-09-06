@@ -292,7 +292,7 @@ function Invoke-CasePackageVerification {
                     throw 'Manifest package comparison found an artifact without Name.'
                 }
                 $normalizedName = Get-ValidatedRemoteArtifactName -Name ([string]$nameValue)
-                $entryName = $normalizedName.Replace('\\', '/')
+                $entryName = $normalizedName.Replace('\', '/')
                 if ($expectedEntryMap.ContainsKey($entryName)) {
                     throw "Manifest package expected-entry list contains duplicate '$entryName'."
                 }
@@ -316,7 +316,7 @@ function Invoke-CasePackageVerification {
 
             foreach ($entryName in $outerArtifactsByName.Keys) {
                 $outerArtifact = $outerArtifactsByName[$entryName]
-                $zipEntryName = ([string](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'Name')).Replace('\\', '/')
+                $zipEntryName = ([string](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'Name')).Replace('\', '/')
                 $zipEntry = $entryMap[$zipEntryName]
                 $declaredEntrySize = [int64](Get-CaseJsonProperty -InputObject $outerArtifact -Name 'SizeBytes')
                 if ($zipEntry.Length -ne $declaredEntrySize) {

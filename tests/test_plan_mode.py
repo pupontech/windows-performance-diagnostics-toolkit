@@ -1234,11 +1234,22 @@ def test_verify_mode_validates_the_recorded_case_package(tmp_path):
     import zipfile
 
     case = _write_minimal_collect_case(tmp_path)
+    nested_path = case / "minidumps" / "sample.dmp"
+    nested_path.parent.mkdir()
+    nested_path.write_bytes(b"MINIDUMP")
     manifest_path = case / "diagnostic-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"].append(
+        {
+            "Name": r"minidumps\sample.dmp",
+            "SizeBytes": nested_path.stat().st_size,
+            "Sha256": hashlib.sha256(nested_path.read_bytes()).hexdigest(),
+        }
+    )
     zip_path = case.parent / "case-to-verify-20260901T000000.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("performance-samples.csv", (case / "performance-samples.csv").read_bytes())
+        archive.writestr("minidumps/sample.dmp", nested_path.read_bytes())
         archive.writestr("diagnostic-manifest.json", json.dumps(manifest))
     zip_bytes = zip_path.read_bytes()
     manifest["package"] = {
@@ -1257,7 +1268,7 @@ def test_verify_mode_validates_the_recorded_case_package(tmp_path):
     report = json.loads(result.stdout)
     assert report["status"] == "verified"
     assert report["package"]["status"] == "verified"
-    assert report["package"]["entryCount"] == 2
+    assert report["package"]["entryCount"] == 3
 
 
 def test_verify_mode_rejects_an_unexpected_case_package_entry(tmp_path):

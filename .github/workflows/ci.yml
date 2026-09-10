@@ -235,6 +235,92 @@ jobs:
           }
           Write-Output "Launchers OK: $manifest (toolVersion $($m.toolVersion)), $plan (toolVersion $($p.toolVersion)); network verdict $($m.network.dnsVsPing.verdict), security matches $($m.network.securitySoftwareMatches.processMatches)/$($m.network.securitySoftwareMatches.installedSoftwareMatches)"
 
+      - name: Assert findings/report/telemetry and Verify tamper refusal (current code)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $case = 'C:\Temp\WPD-Case'
+          $manifestPath = Join-Path $case 'diagnostic-manifest.json'
+          $m = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+
+          # Headline artifacts must exist AND be hash-registered.
+          foreach ($name in @('findings.json','report.html','disk-samples.json','performance-samples.csv','top-processes.json')) {
+            $p = Join-Path $case $name
+            if (-not (Test-Path -LiteralPath $p)) { throw "MISSING $name" }
+            if (@($m.artifacts | Where-Object { $_.Name -eq $name }).Count -ne 1) { throw "$name not listed in manifest artifacts" }
+          }
+
+          # Actual telemetry series: >=3 finite CPU readings and >=1 disk interval.
+          $samples = @(Import-Csv -LiteralPath (Join-Path $case 'performance-samples.csv'))
+          if ($samples.Count -lt 3) { throw "performance-samples.csv has only $($samples.Count) rows" }
+          $cpuFinite = @($samples | Where-Object { $_.AverageCpuLoadPercent -ne '' -and $null -ne $_.AverageCpuLoadPercent }).Count
+          if ($cpuFinite -lt 3) { throw "only $cpuFinite finite CPU readings in performance-samples.csv" }
+          $diskSeries = @(Get-Content -LiteralPath (Join-Path $case 'disk-samples.json') -Raw | ConvertFrom-Json)
+          if ($diskSeries.Count -lt 1) { throw 'disk-samples.json has no paired raw-counter intervals' }
+          if (-not ($diskSeries | Where-Object { $null -ne $_.CurrentQueueLength })) { throw 'disk-samples.json has no raw CurrentDiskQueueLength reading (raw class not read)' }
+
+          # Non-empty process snapshot. Individual processes may legitimately be
+          # 'unknown' (protected/new), but at least one interval CPU must be finite
+          # and the process-snapshot stage must not have errored.
+          $procs = @(Get-Content -LiteralPath (Join-Path $case 'top-processes.json') -Raw | ConvertFrom-Json)
+          if ($procs.Count -lt 1) { throw 'top-processes.json is empty' }
+          if (-not ($procs | Where-Object { $_.ProcessCpuPercent -ne 'unknown' })) { throw 'no process has a finite interval CPU percentage' }
+          $procErrors = @($m.collectionErrors | Where-Object { $_.Stage -eq 'process-snapshot' })
+          if ($procErrors.Count -gt 0) { throw "process-snapshot errors present: $($procErrors[0].Message)" }
+
+          # findings.json must be a non-empty JSON array.
+          $findings = @(Get-Content -LiteralPath (Join-Path $case 'findings.json') -Raw | ConvertFrom-Json)
+          if ($findings.Count -lt 1) { throw 'findings.json is empty' }
+
+          # Verify the intact case.
+          $verify = & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Verify -InputDirectory $case
+          if ($LASTEXITCODE -ne 0) { throw "Verify rejected the intact case (exit $LASTEXITCODE)" }
+          $v = $verify | ConvertFrom-Json
+          if ($v.status -ne 'verified') { throw "Verify status $($v.status)" }
+
+          # Tamper the report; Verify must refuse.
+          $report = Join-Path $case 'report.html'
+          $backup = "$report.bak"
+          Copy-Item -LiteralPath $report -Destination $backup -Force
+          Add-Content -LiteralPath $report -Value '<!-- tampered by CI -->'
+          $verify2 = & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Verify -InputDirectory $case
+          $exit2 = $LASTEXITCODE
+          Copy-Item -LiteralPath $backup -Destination $report -Force
+          Remove-Item -LiteralPath $backup -Force
+          if ($exit2 -eq 0) { throw 'Verify accepted a tampered report.html' }
+          $v2 = $verify2 | ConvertFrom-Json
+          if ($v2.status -ne 'failed') { throw "tampered Verify status $($v2.status)" }
+          if (-not ($v2.errors | Where-Object { $_ -match 'mismatch' })) { throw 'tampered Verify did not report a mismatch' }
+          Write-Output "Findings/report/telemetry OK; intact Verify=$($v.status); tampered Verify=$($v2.status) refused"
+
+      - name: Controlled low-impact workload behavioral test (interval CPU pipeline)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outDir = Join-Path $env:TEMP 'wpd-workload'
+          if (Test-Path -LiteralPath $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force }
+          # Controlled, bounded CPU workload (8s) so the interval-CPU pipeline has a
+          # live process to measure. Low impact; no system stress tooling installed.
+          $job = Start-Job -ScriptBlock {
+            $end = (Get-Date).AddSeconds(10)
+            $x = 0.0
+            while ((Get-Date) -lt $end) { $x += [math]::Sqrt([math]::Abs([math]::Sin((Get-Random))) ) }
+          }
+          try {
+            & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -ConfirmLocalCollection -DurationSeconds 8 -OutputDirectory $outDir
+            if ($LASTEXITCODE -ne 0) { throw "workload collect exited $LASTEXITCODE" }
+            $procs = @(Get-Content -LiteralPath (Join-Path $outDir 'top-processes.json') -Raw | ConvertFrom-Json)
+            if ($procs.Count -lt 1) { throw 'top-processes.json empty under workload' }
+            $finite = @($procs | Where-Object { $_.ProcessCpuPercent -ne 'unknown' })
+            if ($finite.Count -lt 1) { throw 'no finite interval CPU percentage under controlled workload' }
+            if (-not (Test-Path -LiteralPath (Join-Path $outDir 'findings.json'))) { throw 'findings.json missing under workload' }
+            if (-not (Test-Path -LiteralPath (Join-Path $outDir 'report.html'))) { throw 'report.html missing under workload' }
+            Write-Output "Workload behavioral test OK: $($finite.Count) finite interval-CPU processes"
+          } finally {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+          }
+
   # WPD-08/09/10: WPR consent + elevation gates on a real Windows VM
   # (GitHub-hosted windows-2022/windows-2025 runner = the owner-provided Windows
   #  environment; elevated by default, Windows PowerShell 5.1, real wpr.exe).
@@ -872,17 +958,21 @@ jobs:
           $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
           if ($manifest.mode -ne 'Collect') { throw "WPD-11 FAIL: manifest mode=$($manifest.mode) (expected Collect)" }
           if ($manifest.toolVersion -ne $state.ver) { throw "WPD-11 FAIL: manifest toolVersion=$($manifest.toolVersion) (expected $($state.ver))" }
+          $releaseVersion = [version]$state.ver
+          # The historical process-snapshot defect only ever existed before 0.9.0.
+          # It must not excuse a current (>=0.9.0) release, which must also ship the
+          # findings/report/disk-series surface.
+          $defectAllowed = $releaseVersion -lt [version]'0.9.0'
+          $requiredArtifacts = @('performance-samples.csv','top-processes.json','system-events-last-24-hours.json')
+          if (-not $defectAllowed) {
+            $requiredArtifacts += @('findings.json','report.html','disk-samples.json')
+          }
           $defectFound = $false
-          foreach ($a in @('performance-samples.csv','top-processes.json','system-events-last-24-hours.json')) {
+          foreach ($a in $requiredArtifacts) {
             if (-not (Test-Path -LiteralPath (Join-Path 'C:\Temp\WPD-Case' $a))) {
-              # Known defect in the released v0.4.0 zip: the process-snapshot stage
-              # aborted on Server SKUs ('Exception getting CPU / TotalSeconds'),
-              # so top-processes.json was not written. Fixed on main (v0.5.0+);
-              # record it as a finding instead of failing the gate, but FAIL if a
-              # future release misses the artifact without the recorded error.
               $procErr = @($manifest.collectionErrors | Where-Object { $_.Stage -eq 'process-snapshot' })
-              if ($a -eq 'top-processes.json' -and $procErr.Count -gt 0) {
-                Write-Output "WPD-11 DEFECT (release $($state.tag)): top-processes.json missing; process-snapshot error: $($procErr[0].Message) - fixed on main, ships with next release"
+              if ($defectAllowed -and $a -eq 'top-processes.json' -and $procErr.Count -gt 0) {
+                Write-Output "WPD-11 HISTORICAL DEFECT (release $($state.tag) < 0.9.0): top-processes.json missing; process-snapshot error: $($procErr[0].Message)"
                 $defectFound = $true
                 continue
               }
@@ -891,7 +981,7 @@ jobs:
             if (@($manifest.artifacts | Where-Object { $_.Name -eq $a }).Count -ne 1) { throw "WPD-11 FAIL: $a missing from manifest hashes" }
           }
           if ($defectFound) {
-            Write-Output "WPD-11 PASS (with documented defect): launcher ran, manifest produced (toolVersion $($manifest.toolVersion), mode $($manifest.mode)); top-processes.json defect recorded for release $($state.tag)"
+            Write-Output "WPD-11 PASS (with documented historical defect): launcher ran, manifest produced (toolVersion $($manifest.toolVersion), mode $($manifest.mode)); top-processes.json defect recorded for release $($state.tag)"
           } else {
             Write-Output "WPD-11 PASS: Run-Diagnostics.bat from extracted folder -> $manifestPath (toolVersion $($manifest.toolVersion), mode $($manifest.mode), artifacts hashed)"
           }

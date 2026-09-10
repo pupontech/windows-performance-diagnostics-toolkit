@@ -1,19 +1,74 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-09-10
 
-- Added the third and final top-level operating mode, `Verify`, alongside the
-  existing `Plan` and `Collect` modes. Verify is read-only and requires
-  `-InputDirectory`.
-- Verify validates the Collect manifest's safety contract, artifact paths,
-  existence, sizes, SHA-256 hashes, and any recorded case ZIP's hash, exact
-  whitelist, entry hashes, and in-ZIP metadata. It emits a separate
-  `case-verification` report and returns non-zero on any failure.
-- Added `schema/case-verification.schema.json` plus Linux regression coverage
-  for tampering, traversal, ZIP whitelist integrity, and no-write behavior.
-- Simplified `START-HERE.bat` to the same three-mode workflow (Plan, Collect,
-  Verify) plus Exit; collection-only UAC elevation and existing CI-safe logging
-  are preserved.
+Slowdown diagnosis milestone: symptom context, improved telemetry, findings
+engine, and standalone HTML report. Three-mode UI (Plan/Collect/Verify) was
+merged in the 0.8.x line but is first released here.
+
+- **Symptom context (`-SymptomContext` + `-Preset`)**: optional user-reported
+  symptom and collection preset recorded separately from the UTC collection
+  window in both Plan and Collect manifests (`symptom.reported`,
+  `symptom.collectionWindow.requestedAtUtc`). A preset is recorded even when no
+  symptom text is supplied. Schema version bumps to `1.1` when either is
+  present; existing `1.0` manifests remain valid. Remote forwarding passes
+  values via a named-parameter hashtable (no string interpolation into script
+  blocks), so punctuation and injection-looking text survive as data.
+- **Process CPU interval**: `Compare-ProcessCpuSnapshots` pairs a baseline
+  snapshot with the end enumeration by PID+StartTime, guarded per property so a
+  protected/exiting process cannot abort the stage. A monotonic
+  `[System.Diagnostics.Stopwatch]` brackets the two `Get-Process` snapshots so
+  the numerator and denominator cover the same interval. Unknown logical
+  processor count, reused/new/protected processes, invalid windows and
+  impossible (>100%) values yield `unknown` (never a guessed normalization or a
+  silent clamp). The cumulative `CPU` seconds label is preserved in
+  `top-processes.json`.
+- **Raw disk telemetry**: `Win32_PerfRawData_PerfDisk_PhysicalDisk` is paired
+  between in-window samples to derive read/write latency
+  (`(tick delta / Frequency_PerfTime) / operation-base delta`), read/write/total
+  throughput and instantaneous queue depth. No baseline, no I/O, counter reset,
+  missing frequency/property all yield `null` plus a coverage reason - never a
+  fake zero latency. Memory committed/limit/available and paging indicators come
+  from `Win32_PerfFormattedData_PerfOS_Memory`; per-volume free space comes from
+  `Win32_Volume` with null guards. Source errors are recorded as collection
+  errors rather than swallowed. CIM requests are bounded.
+- **Findings engine (`Evaluate-Findings`)**: pure Linux-testable function over
+  fixture data. Sustained rules (CPU >= 80%, commit >= 90%, `PagesInputPersec`
+  > 100, disk queue >= 2 or read latency >= 20 ms) find the longest qualifying
+  consecutive run ANYWHERE in the series (a burst followed by recovery is
+  found), count only finite readings (nulls break a streak) and cite the exact
+  start/end timestamp plus source artifact and metric. `PagesInputPersec` is
+  documented as pages read to resolve hard page faults, not an exact hard-fault
+  count. Missing/partial CPU/disk/memory produces coverage warnings; unknown is
+  never reported as healthy. No single post-run reading produces a finding, no
+  causal claims, no health score.
+- **Standalone offline report (`report.html`)**: generated on Collect, all
+  interpolated data HTML-encoded (including `SizeBytes`), fixed relative
+  evidence links, no scripts or external assets. `report.html` is hashed in the
+  final manifest but omitted from its own artifact index (a file cannot contain
+  its own hash); the manifest is not an artifact.
+- **Manifest ordering corrected**: `findings.json`, `report.html`,
+  `disk-samples.json` and `volume-metrics.json` are written and registered
+  before the final manifest artifact index is computed, so they are hashed,
+  included in the case ZIP and covered by Verify and remote pull.
+- **Three-mode UI**: `Verify` is read-only, requires `-InputDirectory`, and
+  validates the Collect manifest safety contract, artifact paths/sizes/hashes,
+  and any recorded case ZIP (hash, exact whitelist, entry hashes, in-ZIP
+  metadata). It emits a `case-verification` report and exits non-zero on
+  failure.
+- Automated fixture tests cover the production CPU pairing, raw disk counter
+  math, sustained-streak detection (including mid-series recovery), coverage
+  warnings, HTML encoding, the shared Collect tail with real Verify
+  tamper-detection, and Plan/Verify non-collection behavior.
+- Added `docs/ROADMAP.md` with completed first milestone vs remaining P2/P3.
+
+> **Verification status (honest scope):** the fixture/behavioral suite and the
+> PowerShell parser gates run in hosted Linux/Windows CI. The new raw disk
+> counters, in-window series and findings/report generation have **not** been
+> executed on an owner Windows client by this change; that owner-live matrix run
+> is a required follow-up (see `docs/ROADMAP.md` and
+> `docs/windows-live-test-matrix.md`). Hosted Windows CI runs a controlled
+> smoke collection only.
 
 ## 0.8.2 — 2026-09-01
 

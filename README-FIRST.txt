@@ -1,7 +1,7 @@
 WINDOWS PERFORMANCE DIAGNOSTICS TOOLKIT
 =======================================
 Read-Only Diagnostics Collector for Windows 10/11
-Version 0.8.2
+Version 0.9.0
 
 This toolkit collects read-only Windows performance diagnostics to help
 troubleshoot performance issues. It does NOT upload data, remediate problems,
@@ -99,7 +99,7 @@ HASH VERIFICATION
 -----------------
 Verify the downloaded zip against the published SHA-256 hash:
 
-    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.8.2.zip
+    Get-FileHash -Algorithm SHA256 .\windows-performance-diagnostics-toolkit-0.9.0.zip
 
 Compare the output hash to the value in the .sha256 file published alongside
 the release. They must match exactly.

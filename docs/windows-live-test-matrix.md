@@ -1,6 +1,12 @@
 # Windows Live Test Matrix
 
-This project is verified on Linux only for PowerShell parsing and safety-mode behavior. Run these tests on a disposable or approved Windows lab machine before using collection mode on a user endpoint.
+This project is verified in hosted CI for PowerShell parsing (5.1 + pwsh),
+fixture/behavioral tests, and a controlled Windows smoke collection. The new
+raw-disk/in-window telemetry and findings/report paths still need an
+**owner-live Windows client run** (WPD-19..WPD-23 below); hosted runners only
+prove the code paths execute, not real device counter values. Run these tests on
+a disposable or approved Windows lab machine before using collection mode on a
+user endpoint.
 
 ## Preconditions
 
@@ -31,6 +37,11 @@ This project is verified on Linux only for PowerShell parsing and safety-mode be
 | WPD-14 | Run the WPD-13 command from an **elevated** console with Defender platform 4.18.2108.7+ installed | `defender-performance.etl` exists with the manifest `defender.status` `completed`; ETL is listed in manifest hashes. | `defender-performance.etl`, manifest |
 | WPD-17 | Run a collection on a machine with a network problem (no internet, slow browsing, or DNS failure — or simulate by breaking DNS resolution or adding a hosts-file redirect) | `network-state.json` is produced and listed in manifest hashes; the manifest `network` block carries `status` `completed`, a `dnsVsPing.verdict` matching the fault (e.g. `dns-failure` when raw IPs ping but names do not resolve, `connectivity-failure` when neither works), and `securitySoftwareMatches` counts; per-section failures (if any) appear in `collectionErrors` with `network-state-<section>` stages. Verify on a standard (non-admin) account that collection still works (WPD-05). | Manifest `network` block, `network-state.json` |
 | WPD-18 | Run `-Mode Verify -InputDirectory <case>` on an intact Collect case, then modify a listed artifact and run it again | Intact case returns exit code 0 and report `status: "verified"`; tampered case returns exit code 1 with an artifact or package integrity error. The case directory is unchanged by verification. | JSON verification reports, before/after case listing |
+| WPD-19 | Run Collect with `-SymptomContext "Freeze at 12:30 — user typed <b>text</b> & punctuation"` and `-Preset cpu-heavy`, then run a second Collect with only `-Preset storage-io` | `manifest.symptom.reported` preserves the exact punctuation/injection text; `preset` recorded in both; the preset-only run records `symptom.preset` with no `symptom.reported`. | `diagnostic-manifest.json` (or `diagnostic-plan.json`) |
+| WPD-20 | Start a controlled low-impact CPU workload (e.g. a short PowerShell busy loop) and run a 10 s collection | `top-processes.json` is non-empty; at least one process has a finite `ProcessCpuPercent`; protected/new processes may be `unknown`; no `process-snapshot` entry in `collectionErrors`. | `top-processes.json`, manifest `collectionErrors` |
+| WPD-21 | Generate controlled disk I/O (copy a large file) during a 10 s collection, then run an idle 10 s collection | Under load, `disk-samples.json` has paired intervals with non-null read/write latency or throughput for the active disk and a queue reading. When idle/no I/O, latency is `null` with a coverage reason (never `0`), and no disk finding is fabricated from one reading. | `disk-samples.json`, `findings.json` |
+| WPD-22 | Inspect `findings.json` and `report.html` from a collection with a symptom | Findings cite `sourceArtifact`, `metric` and a real `windowStart`/`windowEnd` for sustained rules; report is standalone (no `<script>`, no external URLs), `SizeBytes` is entity-encoded, `report.html` is listed in manifest artifacts but omitted from its own index; insufficient/coverage data is clearly stated. | `findings.json`, `report.html`, manifest |
+| WPD-23 | Run `-Mode Verify` on the intact WPD-20/21 case, then append a byte to `report.html` and re-run | Intact case: exit 0, `status: "verified"`. Tampered report: exit 1, `status: "failed"` with a size/hash mismatch. Restore the report and confirm verification passes again. | JSON verification reports |
 
 ## Approved collection example
 

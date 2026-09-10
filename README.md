@@ -2,9 +2,9 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.8.2
+**Version:** 0.9.0
 
-**Status:** Read-only local collection plus consent-gated WPR/Defender performance captures, crash evidence, network-state diagnostics, optional local case packaging, consent-gated remote WinRM collection with SHA-256 verification, and read-only case verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM.
+**Status:** Slowdown diagnosis toolkit with symptom context, in-window telemetry (PID+StartTime interval CPU percentage, paired raw-disk latency/throughput/queue, memory committed/limit and paging, volume free space), findings engine with sustained-pressure rules and coverage warnings, standalone offline HTML report, and read-only case verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM. The new raw-disk/in-window telemetry and findings/report paths are covered by fixture tests and a hosted Windows smoke run; an **owner-live Windows client run is still required** before any remediation planning (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
 [![CI](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml)
 
@@ -161,6 +161,10 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - ✅ Reproducible packaging and artifact verification (`make-deploy-bundle.sh`, SHA-256, release asset verification)
 - ✅ Read-only case verification (`-Mode Verify -InputDirectory`, manifest/artifact/package integrity)
 - ✅ WPA-oriented analysis guidance (`docs/wpa-analysis-guide.md`)
+- ✅ Symptom context and collection presets (`-SymptomContext`, `-Preset`)
+- ✅ Findings engine with sustained-pressure rules and coverage warnings
+- ✅ Standalone offline HTML report (`report.html`) with XSS-safe encoding
+- 🔜 Baseline comparison and application diagnostics
 - 🔜 Windows lab test matrix execution before any live remediation capability
 
 ## Development workflow
@@ -186,6 +190,26 @@ Run-Diagnostics.bat               Defender-safe double-click launcher
 README-FIRST.txt                  quick start + Mark-of-the-Web recovery
 make-deploy-bundle.sh             reproducible release zip builder
 ```
+
+## Acknowledgements and open-source tools
+
+The collector is a single self-contained PowerShell script and bundles no
+third-party binaries. The following open-source tools are used to build, test
+and verify it (attribution, not redistribution):
+
+- [PowerShell](https://github.com/PowerShell/PowerShell) (MIT) — the collector
+  runtime on Windows PowerShell 5.1 and PowerShell 7+.
+- [pytest](https://github.com/pytest-dev/pytest) (MIT) — Linux/Windows
+  behavioral and fixture test harness.
+- [Python 3](https://www.python.org/) (PSF-2.0) — deterministic release bundling
+  (`make-deploy-bundle.sh`) and test tooling.
+- [Git](https://git-scm.com/) (GPL-2.0) — version control and release
+  provenance (`git archive`).
+
+Microsoft components (Windows Performance Recorder/Analyzer, Defender
+performance recording, Sysinternals Process Monitor/Autoruns) are referenced as
+Microsoft-supported diagnostic surfaces and are **not** bundled or executed by
+this toolkit; the operator installs and runs them under their own license.
 
 ## License
 

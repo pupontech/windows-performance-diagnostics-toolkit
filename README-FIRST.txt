@@ -41,7 +41,11 @@ Option A (START-HERE modes):
     3 - Verify an existing case
     4 - Exit
   Collect requests UAC only when administrator rights are needed. Every
-  collection run is logged to C:\Temp\WPD-Case\diagnostics-run.log.
+  collection run is logged to C:\Temp\WPD-Case\diagnostics-run.log. The default
+  full workflow has a 30-second baseline sample window followed by a separate
+  30-second WPR trace; event/log export, report generation, hashing, and ZIP
+  packaging take additional time. The console shows baseline sample/percentage
+  progress.
 
 Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.

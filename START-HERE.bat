@@ -83,7 +83,10 @@ goto :end_failed
 :run
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 echo.
-echo Collecting for 30 seconds. Output: %OUTDIR%
+echo Collecting: 30-second baseline sampling, then a separate 30-second WPR trace.
+echo The console shows baseline progress by sample and percentage.
+echo Allow additional time for event/log collection and final export, hashing, and ZIP packaging.
+echo Output: %OUTDIR%
 echo Run started: %date% %time% - mode Collect >> "%LOG%"
 echo ============================================================ >> "%LOG%"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1' -Mode Collect -ConfirmLocalCollection %EXTRA% -DurationSeconds 30 -OutputDirectory '%OUTDIR%' 2>&1 | Tee-Object -FilePath '%LOG%'"

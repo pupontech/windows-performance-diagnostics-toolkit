@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `DurationSeconds` now defines a wall-clock budget for baseline sampling. The
+  collector schedules samples against a monotonic stopwatch rather than adding
+  a one-second sleep after every CIM query, so normal query time no longer
+  extends the requested sampling window.
+- Collect writes live baseline progress to the console as completed sample
+  number and percentage. Both launchers and quick-start documentation explain
+  that WPR/Defender traces and final evidence export, hashing, and packaging
+  are additional stages.
+
 ## 0.9.0 — 2026-09-10
 
 Slowdown diagnosis milestone: symptom context, improved telemetry, findings

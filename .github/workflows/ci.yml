@@ -300,6 +300,10 @@ jobs:
           if ($v2.status -ne 'failed') { throw "tampered Verify status $($v2.status)" }
           if (-not ($v2.errors | Where-Object { $_ -match 'mismatch' })) { throw 'tampered Verify did not report a mismatch' }
           Write-Output "Findings/report/telemetry OK; intact Verify=$($v.status); tampered Verify=$($v2.status) refused"
+          # The tamper check intentionally ran Verify to a non-zero exit; the pwsh
+          # step wrapper exits with $LASTEXITCODE, so clear it or a PASSING step
+          # would still fail the job.
+          $global:LASTEXITCODE = 0
 
       - name: Controlled low-impact workload behavioral test (interval CPU pipeline)
         shell: pwsh

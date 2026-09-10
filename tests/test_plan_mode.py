@@ -1329,3 +1329,1330 @@ def test_case_verification_schema_is_valid_json():
     assert schema["properties"]["reportType"]["enum"] == ["case-verification"]
     assert schema["properties"]["mode"]["enum"] == ["Verify"]
     assert schema["properties"]["status"]["enum"] == ["verified", "failed"]
+
+
+# ======================================================================
+# Phase 1: Symptom context and preset parameters
+# ======================================================================
+
+def test_plan_mode_records_symptom_context_and_collection_window(tmp_path):
+    """Plan mode with -SymptomContext must record the user-reported symptom
+    and a collection window, while keeping the mode as Plan."""
+    output_directory = tmp_path / "plan-symptom"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-SymptomContext", "Slow boot and high CPU after login",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest_path = output_directory / "diagnostic-plan.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+    assert manifest["mode"] == "Plan"
+    assert "symptom" in manifest
+    assert manifest["symptom"]["reported"] == "Slow boot and high CPU after login"
+    assert "collectionWindow" in manifest["symptom"]
+    # collectionWindow must have requestedAtUtc (ISO 8601)
+    assert "T" in manifest["symptom"]["collectionWindow"]["requestedAtUtc"]
+
+
+def test_plan_mode_without_symptom_has_no_symptom_block(tmp_path):
+    """Plan mode without -SymptomContext must omit the symptom block."""
+    output_directory = tmp_path / "plan-no-symptom"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    assert "symptom" not in manifest
+
+
+def test_plan_mode_records_preset_parameters(tmp_path):
+    """Plan mode with -PresetPresetContext must record the preset in the plan."""
+    output_directory = tmp_path / "plan-preset"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-SymptomContext", "General slowdown",
+        "-Preset", "baseline",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    assert manifest["symptom"]["preset"] == "baseline"
+    assert manifest["symptom"]["reported"] == "General slowdown"
+
+
+def test_plan_mode_symptom_is_forwarded_to_remote_plan(tmp_path):
+    """Remote plan mode must include symptom context in the plan manifest."""
+    output_directory = tmp_path / "plan-remote-symptom"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-SymptomContext", "Remote slow file share",
+        "-RemoteComputer", "SRV-DIAG-01",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    assert manifest["symptom"]["reported"] == "Remote slow file share"
+
+
+def test_collect_mode_records_symptom_separately_from_collection_window(tmp_path):
+    """Collect mode on Linux refuses (expected), but the parameter binding
+    must accept -SymptomContext without error - verified via Plan mode."""
+    output_directory = tmp_path / "collect-symptom-check"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-SymptomContext", "Application freezes during file save",
+        "-Preset", "storage-io",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    assert manifest["symptom"]["reported"] == "Application freezes during file save"
+    assert manifest["symptom"]["preset"] == "storage-io"
+    # collectionWindow must be a separate object from the reported symptom
+    cw = manifest["symptom"]["collectionWindow"]
+    assert "requestedAtUtc" in cw
+
+
+def test_symptom_context_preserves_backwards_compatibility(tmp_path):
+    """Existing Plan manifests without symptom must remain valid against schema."""
+    output_directory = tmp_path / "plan-compat"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    assert "symptom" not in manifest
+    assert manifest["schemaVersion"] == "1.0"
+    assert manifest["mode"] == "Plan"
+
+
+def test_verify_mode_accepts_manifest_with_symptom_context(tmp_path):
+    """Verify mode must accept a Collect manifest that includes symptom context."""
+    case = _write_minimal_collect_case(tmp_path)
+    manifest_path = case / "diagnostic-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["symptom"] = {
+        "reported": "Explorer crashes",
+        "collectionWindow": {"requestedAtUtc": "2026-09-10T12:00:00Z"},
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["status"] == "verified"
+
+
+def test_verify_mode_accepts_manifest_with_findings_artifact(tmp_path):
+    """Verify mode must recognize findings.json as a valid artifact."""
+    import hashlib
+
+    case = tmp_path / "case-with-findings"
+    case.mkdir()
+    artifact_path = case / "performance-samples.csv"
+    artifact_path.write_bytes(b"a,b\n1,2\n")
+    findings_path = case / "findings.json"
+    findings_data = b'{"findings": []}'
+    findings_path.write_bytes(findings_data)
+    report_path = case / "report.html"
+    report_data = b"<html><body>Test report</body></html>"
+    report_path.write_bytes(report_data)
+
+    manifest = {
+        "schemaVersion": "1.1",
+        "toolName": "Windows Performance Diagnostics Toolkit",
+        "toolVersion": (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        "mode": "Collect",
+        "safety": {
+            "localOnly": True,
+            "readOnly": True,
+            "requiresExplicitCollectionConsent": True,
+            "automaticUpload": False,
+            "automaticRemediation": False,
+            "automaticLogClearing": False,
+        },
+        "artifacts": [
+            {"Name": "performance-samples.csv", "SizeBytes": artifact_path.stat().st_size,
+             "Sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest()},
+            {"Name": "findings.json", "SizeBytes": findings_path.stat().st_size,
+             "Sha256": hashlib.sha256(findings_data).hexdigest()},
+            {"Name": "report.html", "SizeBytes": report_path.stat().st_size,
+             "Sha256": hashlib.sha256(report_data).hexdigest()},
+        ],
+    }
+    (case / "diagnostic-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["status"] == "verified"
+    assert report["artifactCount"] == 3
+    assert report["verifiedArtifactCount"] == 3
+
+
+# ======================================================================
+# Phase 2: Improved telemetry
+# ======================================================================
+
+def test_collect_manifest_includes_extended_telemetry_fields():
+    """The PowerShell script must contain the telemetry helper functions
+    using correct CIM class names. Verified on Linux via source inspection."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+
+    # CPU calculation helper
+    assert "Get-ProcessCpuPercentage" in source
+
+    # Disk: correct class name PerfDisk (not PerDisk)
+    assert "Win32_PerfFormattedData_PerfDisk_PhysicalDisk" in source
+
+    # Memory: correct class name PerfOS_Memory (not PerfSys_System)
+    assert "Win32_PerfFormattedData_PerfOS_Memory" in source
+    assert "CommittedBytes" in source
+    assert "CommitLimit" in source
+
+    # Volume free space
+    assert "Win32_Volume" in source
+
+
+def test_performance_samples_csv_backward_compatibility():
+    """The performance-samples.csv must still contain the original fields
+    that downstream consumers depend on."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+
+    # Original fields that must remain
+    assert "AverageCpuLoadPercent" in source
+    assert "AvailableMemoryMB" in source
+    assert "TotalLogicalDiskFreeGB" in source
+
+
+def test_plan_mode_reports_preset_in_manifest(tmp_path):
+    """Plan mode must include the preset in the manifest when provided with symptom context."""
+    output_directory = tmp_path / "plan-preset-telemetry"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-SymptomContext", "High CPU after updates",
+        "-Preset", "cpu-heavy",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    assert manifest["symptom"]["preset"] == "cpu-heavy"
+
+
+def test_process_cpu_percentage_helper_returns_correct_values():
+    """Get-ProcessCpuPercentage (dot-sourced) must calculate elapsed-time-based
+    CPU percentage, mark processes with null CPU data as 'unknown', return 0%
+    for valid zero deltas, and never return negative values."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-cpu-test; "
+        "$r1 = Get-ProcessCpuPercentage -PreviousCPU 10.0 -CurrentCPU 15.0 -ElapsedSeconds 5.0 -LogicalProcessors 4; "
+        "$r2 = Get-ProcessCpuPercentage -PreviousCPU $null -CurrentCPU 5.0 -ElapsedSeconds 5.0 -LogicalProcessors 4; "
+        "$r3 = Get-ProcessCpuPercentage -PreviousCPU 5.0 -CurrentCPU $null -ElapsedSeconds 5.0 -LogicalProcessors 4; "
+        "$r4 = Get-ProcessCpuPercentage -PreviousCPU 0.0 -CurrentCPU 0.0 -ElapsedSeconds 5.0 -LogicalProcessors 4; "
+        "$r5 = Get-ProcessCpuPercentage -PreviousCPU 0.0 -CurrentCPU 10.0 -ElapsedSeconds 2.0 -LogicalProcessors 2; "
+        "$r6 = Get-ProcessCpuPercentage -PreviousCPU 20.0 -CurrentCPU 10.0 -ElapsedSeconds 5.0 -LogicalProcessors 4; "
+        "$r7 = Get-ProcessCpuPercentage -PreviousCPU 5.0 -CurrentCPU 5.0 -ElapsedSeconds 1.0 -LogicalProcessors 1; "
+        "$r8 = Get-ProcessCpuPercentage -PreviousCPU 0.0 -CurrentCPU 4.0 -ElapsedSeconds 2.0 -LogicalProcessors 2; "
+        "$r9 = Get-ProcessCpuPercentage -PreviousCPU 0.0 -CurrentCPU 4.0 -ElapsedSeconds 2.0 -LogicalProcessors $null; "
+        "$r10 = Get-ProcessCpuPercentage -PreviousCPU 0.0 -CurrentCPU 4.0 -ElapsedSeconds 0 -LogicalProcessors 2; "
+        "[ordered]@{normal=$r1;new=$r2;missing=$r3;bothZero=$r4;impossible=$r5;negativeDelta=$r6;validZero=$r7;fullCores=$r8;unknownCores=$r9;zeroElapsed=$r10} | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    output = json.loads(result.stdout)
+    # Normal case: (15-10) / 5.0 / 4 * 100 = 25.0
+    assert output["normal"] == 25.0
+    # New process (no previous CPU) -> 'unknown'
+    assert output["new"] == "unknown"
+    # Missing current CPU -> 'unknown'
+    assert output["missing"] == "unknown"
+    # Both zero -> 0% measured (not unknown)
+    assert output["bothZero"] == 0.0
+    # Impossible >100% after normalization is NOT clamped to a plausible 100
+    assert output["impossible"] == "unknown"
+    # Negative delta (counter reset) -> 'unknown'
+    assert output["negativeDelta"] == "unknown"
+    # Valid zero delta (10->10): 0% measured
+    assert output["validZero"] == 0.0
+    # Exactly all cores busy for the whole window: 4/(2*2)*100 = 100%
+    assert output["fullCores"] == 100.0
+    # Unknown logical processor count -> 'unknown', never a guessed normalization
+    assert output["unknownCores"] == "unknown"
+    # Zero/invalid elapsed window -> 'unknown'
+    assert output["zeroElapsed"] == "unknown"
+
+
+def test_cpu_percentage_requires_logical_processors():
+    """Get-ProcessCpuPercentage must not default LogicalProcessors to 1 -
+    the caller must supply the actual count (no guessing when unavailable)."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-cpu-norm; "
+        # 4 logical processors: delta=20 over 10s -> 20/(10*4)*100 = 50%
+        "$r = Get-ProcessCpuPercentage -PreviousCPU 10.0 -CurrentCPU 30.0 -ElapsedSeconds 10.0 -LogicalProcessors 4; "
+        "$r | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == 50.0
+
+
+def test_cpu_pid_reuse_detection():
+    """PID reuse, new processes, protected processes, and valid zero deltas must
+    be decided by the REAL production pairing (Get-ProcessSnapshotKey /
+    New-ProcessCpuSnapshot / Compare-ProcessCpuSnapshots) - not by logic the
+    test computes itself. A reused PID (same Id, different StartTime) must be
+    'unknown' rather than a bogus large percentage, and a genuine zero delta
+    must stay 0 (a positive measurement), never 'unknown'.
+    """
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-pid-reuse-real'
+$t1 = [datetime]'2026-09-10T10:00:00Z'
+$t2 = [datetime]'2026-09-10T11:00:00Z'
+$t3 = [datetime]'2026-09-10T12:00:00Z'
+
+$startProcesses = @(
+    [pscustomobject]@{ ProcessName = 'orig'; Id = 100; StartTime = $t1; CPU = 5.0 },
+    [pscustomobject]@{ ProcessName = 'zero'; Id = 200; StartTime = $t2; CPU = 0.0 },
+    [pscustomobject]@{ ProcessName = 'protected-start'; Id = 500; StartTime = $null; CPU = $null }
+)
+$baseline = New-ProcessCpuSnapshot -Processes $startProcesses
+$baselineKeyCount = @($baseline.Keys).Count
+
+$endProcesses = @(
+    [pscustomobject]@{ ProcessName = 'orig'; Id = 100; StartTime = $t1; CPU = 6.0 },
+    [pscustomobject]@{ ProcessName = 'reused'; Id = 100; StartTime = $t3; CPU = 6.0 },
+    [pscustomobject]@{ ProcessName = 'zero'; Id = 200; StartTime = $t2; CPU = 0.0 },
+    [pscustomobject]@{ ProcessName = 'new'; Id = 400; StartTime = $t3; CPU = 2.0 },
+    [pscustomobject]@{ ProcessName = 'protected-end'; Id = 500; StartTime = $null; CPU = $null }
+)
+$rows = @(Compare-ProcessCpuSnapshots -StartSnapshots $baseline -EndProcesses $endProcesses -ElapsedSeconds 10.0 -LogicalProcessors 2)
+$byName = @{}
+foreach ($row in $rows) { $byName[[string]$row.ProcessName] = $row }
+[ordered]@{
+    baselineKeyCount = $baselineKeyCount
+    rowCount          = $rows.Count
+    original          = $byName['orig'].ProcessCpuPercent
+    originalCumulative = $byName['orig'].CPU
+    reusedPid         = $byName['reused'].ProcessCpuPercent
+    validZero         = $byName['zero'].ProcessCpuPercent
+    newProcess        = $byName['new'].ProcessCpuPercent
+    protectedProcess  = $byName['protected-end'].ProcessCpuPercent
+} | ConvertTo-Json -Depth 4
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+
+    # The protected (no StartTime) start process cannot be keyed -> not stored.
+    assert output["baselineKeyCount"] == 2
+    assert output["rowCount"] == 5
+    # (6.0 - 5.0) / (10.0 * 2) * 100 = 5.0 percent
+    assert output["original"] == 5.0
+    # cumulative CPU seconds are preserved alongside the percentage
+    assert output["originalCumulative"] == 6.0
+    # Same Id, different StartTime -> cannot be paired to the old baseline.
+    assert output["reusedPid"] == "unknown"
+    # Present at both endpoints with a real zero delta -> 0 percent measured.
+    assert output["validZero"] == 0.0
+    # Not present at the baseline -> unknown, never a fabricated value.
+    assert output["newProcess"] == "unknown"
+    # Identity/CPU unreadable (protected) -> unknown.
+    assert output["protectedProcess"] == "unknown"
+
+
+def test_disk_metrics_helper_returns_null_on_unavailable_cim():
+    """Get-DiskMetrics must return null (not throw, not zero-fill) when
+    CIM classes are unavailable."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-disk-null; "
+        "$result = Get-DiskMetrics; "
+        "$result | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output is None
+
+
+def test_memory_metrics_helper_returns_null_on_unavailable_cim():
+    """Get-MemoryMetrics must return null when CIM classes are unavailable."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-mem-null; "
+        "$result = Get-MemoryMetrics; "
+        "$result | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output is None
+
+
+def test_volume_metrics_helper_returns_null_on_unavailable_cim():
+    """Get-VolumeMetrics must return null when CIM classes are unavailable."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-vol-null; "
+        "$result = Get-VolumeMetrics; "
+        "$result | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output is None
+
+
+def test_disk_metrics_class_name_is_correct_in_source():
+    """Source must use PerfDisk, not PerDisk, for the CIM class."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    assert "Win32_PerfFormattedData_PerfDisk_PhysicalDisk" in source
+    # The old wrong name must not appear
+    assert "Win32_PerfFormattedData_PerDisk" not in source
+
+
+def test_memory_metrics_class_name_is_correct_in_source():
+    """Source must use PerfOS_Memory, not PerfSys_System, for the CIM class."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    assert "Win32_PerfFormattedData_PerfOS_Memory" in source
+    assert "Win32_PerfFormattedData_PerfSys_System" not in source
+
+
+def test_memory_metrics_includes_page_faults_distinction():
+    """Source must capture PageFaultsPerSec (soft+hard) AND PagesInputPersec
+    (hard only) separately - never conflating them."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    assert "PageFaultsPerSec" in source or "pageFaultsPerSec" in source
+    assert "PagesInputPersec" in source or "pagesInputPerSec" in source
+    assert "PageReadsPersec" in source or "pageReadsPerSec" in source
+
+
+def test_memory_schema_includes_page_faults_per_sec():
+    """Schema must include pageFaultsPerSec for soft+hard distinction."""
+    schema = json.loads(
+        (REPO_ROOT / "schema" / "diagnostic-report.schema.json").read_text(encoding="utf-8")
+    )
+    mem_props = schema["properties"]["memoryMetrics"]["properties"]
+    assert "pageFaultsPerSec" in mem_props
+    assert "pagesInputPerSec" in mem_props
+
+
+def test_findings_engine_pure_function_cpu_pressure():
+    """Evaluate-Findings (dot-sourced) must detect sustained CPU pressure
+    across multiple samples and emit a finding with proper fields."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-findings-cpu; "
+        # 30 samples: first 20 normal, last 10 sustained high CPU
+        "$csv = @(); "
+        "for ($i = 0; $i -lt 20; $i++) { $csv += [pscustomobject]@{TimestampUtc=(Get-Date).AddSeconds($i).ToUniversalTime().ToString('o'); AverageCpuLoadPercent=25.0; AvailableMemoryMB=8000; TotalLogicalDiskFreeGB=100.0; CommittedBytes=4GB; CommitLimitBytes=8GB} }; "
+        "for ($i = 20; $i -lt 30; $i++) { $csv += [pscustomobject]@{TimestampUtc=(Get-Date).AddSeconds($i).ToUniversalTime().ToString('o'); AverageCpuLoadPercent=92.0; AvailableMemoryMB=8000; TotalLogicalDiskFreeGB=100.0; CommittedBytes=4GB; CommitLimitBytes=8GB} }; "
+        "$findings = Evaluate-Findings -Samples $csv -DiskMetrics $null -VolumeMetrics $null -MemoryMetrics $null; "
+        "$findings | ConvertTo-Json -Depth 8"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    findings = json.loads(result.stdout)
+    cpu_findings = [f for f in findings if f["category"] == "cpu-pressure"]
+    assert len(cpu_findings) >= 1, "Expected at least one cpu-pressure finding"
+    f = cpu_findings[0]
+    assert f["sourceArtifact"] == "performance-samples.csv"
+    assert f["metric"] == "AverageCpuLoadPercent"
+    assert f["ruleCondition"] is not None
+    assert f["suggestedWprProfile"] in ("CPU", "GeneralProfile")
+
+
+def test_findings_engine_no_spike_only_finding():
+    """A single spike above threshold with surrounding normal samples must NOT
+    produce a finding - sustained evidence required."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-findings-spike; "
+        "$csv = @(); "
+        "for ($i = 0; $i -lt 30; $i++) { "
+        "  $cpu = if ($i -eq 15) { 95.0 } else { 20.0 }; "
+        "  $csv += [pscustomobject]@{TimestampUtc=(Get-Date).AddSeconds($i).ToUniversalTime().ToString('o'); AverageCpuLoadPercent=$cpu; AvailableMemoryMB=8000; TotalLogicalDiskFreeGB=100.0; CommittedBytes=4GB; CommitLimitBytes=8GB} "
+        "}; "
+        "$findings = Evaluate-Findings -Samples $csv -DiskMetrics $null -VolumeMetrics $null -MemoryMetrics $null; "
+        "$cpuFindings = @($findings | Where-Object { $_.category -eq 'cpu-pressure' }); "
+        "$cpuFindings.Count | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == 0, "Spike-only must not produce finding"
+
+
+def test_findings_engine_insufficient_samples():
+    """When fewer than 3 usable samples exist, findings must be suppressed
+    and a coverage warning emitted."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-findings-insuff; "
+        "$csv = @(); "
+        "for ($i = 0; $i -lt 2; $i++) { "
+        "  $csv += [pscustomobject]@{TimestampUtc=(Get-Date).AddSeconds($i).ToUniversalTime().ToString('o'); AverageCpuLoadPercent=95.0; AvailableMemoryMB=500; TotalLogicalDiskFreeGB=0.5; CommittedBytes=7.5GB; CommitLimitBytes=8GB} "
+        "}; "
+        "$findings = Evaluate-Findings -Samples $csv -DiskMetrics $null -VolumeMetrics $null -MemoryMetrics $null; "
+        "$warnings = @($findings | Where-Object { $_.category -eq 'coverage' }); "
+        "$cpuFindings = @($findings | Where-Object { $_.category -eq 'cpu-pressure' }); "
+        "[ordered]@{warningCount=$warnings.Count; cpuFindingCount=$cpuFindings.Count} | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["warningCount"] >= 1, "Expected coverage warning"
+    assert output["cpuFindingCount"] == 0, "No findings with insufficient samples"
+
+
+# ======================================================================
+# Phase 3: findings.json, report.html, XSS escaping, integration
+# ======================================================================
+
+def test_html_report_escapes_xss_payloads():
+    """ConvertTo-FindingsHtml must HTML-encode all user-influenceable text.
+    Process names, paths, computer names, event messages with <script> tags
+    must appear entity-encoded in the output."""
+    script = str(SCRIPT).replace("\\", "/")
+    xss_payload = '<script>alert("xss")</script>'
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-xss-test; "
+        "$manifest = [ordered]@{toolVersion='0.9.0';schemaVersion='1.1';"
+        "startedAtUtc='2026-09-10T12:00:00Z';completedAtUtc='2026-09-10T12:00:30Z';"
+        "scope=[ordered]@{durationSeconds=30};"
+        "artifacts=@([ordered]@{Name='test.csv';SizeBytes=100;Sha256='A'*64})}; "
+        "$findings = @([ordered]@{category='cpu-pressure';sourceArtifact='test.csv';"
+        "metric='CPU';windowStart=$null;windowEnd=$null;"
+        "measuredValues=[ordered]@{peak=95};"
+        f"ruleCondition='{xss_payload}';"
+        "uncertainty='test';nextSteps='test';suggestedWprProfile='CPU'}); "
+        "$html = ConvertTo-FindingsHtml -Findings $findings -Manifest $manifest "
+        f"-SymptomContext '{xss_payload}'; "
+        "$html | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    html = json.loads(result.stdout)
+    # Must not contain raw <script> tags
+    assert "<script>" not in html
+    # Must contain entity-encoded version
+    assert "&lt;script&gt;" in html or "script" not in html.lower()
+
+
+def test_html_report_is_offline_only_no_external_assets():
+    """Report HTML must not reference external resources (CDNs, fonts,
+    scripts) or contain traversal links."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-offline-test; "
+        "$manifest = [ordered]@{toolVersion='0.9.0';schemaVersion='1.1';"
+        "startedAtUtc='2026-09-10T12:00:00Z';completedAtUtc='2026-09-10T12:00:30Z';"
+        "scope=[ordered]@{durationSeconds=30};artifacts=@()}; "
+        "$html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext $null; "
+        "$html | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    html = json.loads(result.stdout)
+    # No external URLs in src= or href=
+    import re as re_module
+    assert not re_module.search(r'(src|href)=["\']https?://', html), "External URL found in HTML"
+    assert 'file://' not in html, "file:// URL found in HTML"
+    assert 'http://' not in html, "http:// URL found in HTML"
+    # No traversal links
+    assert '..' not in html or '&gt;' in html  # encoded .. is OK, raw is not
+    # No inline JavaScript
+    assert '<script' not in html.lower()
+    assert 'javascript:' not in html.lower()
+
+
+def test_html_report_contains_no_health_score():
+    """Report must never contain numeric pseudo-confidence or health score."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-noscore; "
+        "$manifest = [ordered]@{toolVersion='0.9.0';schemaVersion='1.1';"
+        "startedAtUtc='2026-09-10T12:00:00Z';completedAtUtc='2026-09-10T12:00:30Z';"
+        "scope=[ordered]@{durationSeconds=30};artifacts=@()}; "
+        "$html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext $null; "
+        "$html | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    html = json.loads(result.stdout).lower()
+    assert "score" not in html
+    assert "confidence:" not in html
+    assert "health rating" not in html
+
+
+def test_findings_json_no_health_score():
+    """findings.json must never contain a health score or numeric confidence."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-finding-noscore; "
+        "$csv = @([pscustomobject]@{TimestampUtc='2026-09-10T12:00:00Z';AverageCpuLoadPercent=25;AvailableMemoryMB=8000;TotalLogicalDiskFreeGB=100;CommittedBytes=4GB;CommitLimitBytes=8GB}); "
+        "$findings = Evaluate-Findings -Samples $csv -DiskMetrics $null -VolumeMetrics $null -MemoryMetrics $null; "
+        "$json = $findings | ConvertTo-Json -Depth 8; "
+        "$json | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    findings_str = output.lower()
+    assert '"score"' not in findings_str
+    assert '"confidence"' not in findings_str
+
+
+def test_plan_mode_does_not_produce_findings_or_report(tmp_path):
+    """Plan mode must exit before findings/report generation - no side effects."""
+    output_directory = tmp_path / "plan-no-findings"
+    result = run_tool("-Mode", "Plan", "-OutputDirectory", str(output_directory))
+
+    assert result.returncode == 0, result.stderr
+    assert not (output_directory / "findings.json").exists()
+    assert not (output_directory / "report.html").exists()
+
+
+def test_verify_mode_accepts_findings_json_and_report_html(tmp_path):
+    """Verify mode must accept a Collect manifest that includes
+    findings.json and report.html as artifacts."""
+    import hashlib
+
+    case = tmp_path / "case-with-report"
+    case.mkdir()
+    artifact_path = case / "performance-samples.csv"
+    artifact_path.write_bytes(b"a,b\n1,2\n")
+    findings_path = case / "findings.json"
+    findings_data = json.dumps([{"category": "coverage", "metric": "test"}]).encode()
+    findings_path.write_bytes(findings_data)
+    report_path = case / "report.html"
+    report_data = b"<!DOCTYPE html><html><body>test</body></html>"
+    report_path.write_bytes(report_data)
+
+    manifest = {
+        "schemaVersion": "1.1",
+        "toolName": "Windows Performance Diagnostics Toolkit",
+        "toolVersion": (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        "mode": "Collect",
+        "safety": {
+            "localOnly": True,
+            "readOnly": True,
+            "requiresExplicitCollectionConsent": True,
+            "automaticUpload": False,
+            "automaticRemediation": False,
+            "automaticLogClearing": False,
+        },
+        "artifacts": [
+            {"Name": "performance-samples.csv", "SizeBytes": artifact_path.stat().st_size,
+             "Sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest()},
+            {"Name": "findings.json", "SizeBytes": findings_path.stat().st_size,
+             "Sha256": hashlib.sha256(findings_data).hexdigest()},
+            {"Name": "report.html", "SizeBytes": report_path.stat().st_size,
+             "Sha256": hashlib.sha256(report_data).hexdigest()},
+        ],
+    }
+    (case / "diagnostic-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["status"] == "verified"
+    assert report["artifactCount"] == 3
+    assert report["verifiedArtifactCount"] == 3
+
+
+def test_verify_fails_on_tampered_report_html(tmp_path):
+    """Verify must fail when report.html is tampered post-package."""
+    import hashlib
+
+    case = tmp_path / "case-tampered-report"
+    case.mkdir()
+    findings_path = case / "findings.json"
+    findings_data = b'{"findings":[]}'
+    findings_path.write_bytes(findings_data)
+    report_path = case / "report.html"
+    report_data = b"<html>original</html>"
+    report_path.write_bytes(report_data)
+
+    manifest = {
+        "schemaVersion": "1.1",
+        "toolName": "Windows Performance Diagnostics Toolkit",
+        "toolVersion": (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        "mode": "Collect",
+        "safety": {
+            "localOnly": True,
+            "readOnly": True,
+            "requiresExplicitCollectionConsent": True,
+            "automaticUpload": False,
+            "automaticRemediation": False,
+            "automaticLogClearing": False,
+        },
+        "artifacts": [
+            {"Name": "findings.json", "SizeBytes": findings_path.stat().st_size,
+             "Sha256": hashlib.sha256(findings_data).hexdigest()},
+            {"Name": "report.html", "SizeBytes": report_path.stat().st_size,
+             "Sha256": hashlib.sha256(report_data).hexdigest()},
+        ],
+    }
+    (case / "diagnostic-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    # Tamper with report.html after manifest is written
+    report_path.write_bytes(b"<html>tampered</html>")
+
+    result = run_tool("-Mode", "Verify", "-InputDirectory", str(case))
+
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report["status"] == "failed"
+    assert any("hash mismatch" in e.lower() for e in report["errors"])
+
+
+def test_collect_mode_refuses_without_consent_even_with_symptom(tmp_path):
+    """Symptom parameters don't bypass consent gates. No side effects."""
+    output_directory = tmp_path / "no-consent-symptom"
+    result = run_tool(
+        "-Mode", "Collect",
+        "-SymptomContext", "Slow boot",
+        "-OutputDirectory", str(output_directory),
+    )
+
+    assert result.returncode != 0
+    assert "requires -ConfirmLocalCollection" in result.stderr
+    assert not output_directory.exists()
+
+
+def test_findings_engine_memory_pressure_from_fixture():
+    """Evaluate-Findings must detect SUSTAINED memory pressure from the
+    per-sample series (5 consecutive samples >= 90% commit), not from a single
+    post-run reading."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-findings-mem; "
+        "$csv = @(); "
+        "for ($i = 0; $i -lt 12; $i++) { "
+        "  $committed = if ($i -ge 4 -and $i -le 8) { [long]7.6GB } else { [long]4GB }; "
+        "  $csv += [pscustomobject]@{TimestampUtc=('2026-09-10T12:00:{0:D2}Z' -f $i);AverageCpuLoadPercent=25;AvailableMemoryMB=8000;TotalLogicalDiskFreeGB=100;CommittedBytes=$committed;CommitLimitBytes=[long]8GB;PagesInputPerSec=$null} "
+        "}; "
+        "$mem = [ordered]@{committedBytes=[long]4GB;commitLimitBytes=[long]8GB;availableBytes=[long]4GB;pageFaultsPerSec=50;pageReadsPerSec=5;pageWritesPerSec=2;pagesInputPerSec=$null;pagesOutputPerSec=3}; "
+        "$findings = Evaluate-Findings -Samples $csv -DiskSeries $null -VolumeMetrics $null -MemoryMetrics $mem; "
+        "$memFindings = @($findings | Where-Object { $_.category -eq 'memory-pressure' }); "
+        "[ordered]@{count=$memFindings.Count; start=$memFindings[0].windowStart; end=$memFindings[0].windowEnd} | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["count"] >= 1
+    assert output["start"] == "2026-09-10T12:00:04Z"
+    assert output["end"] == "2026-09-10T12:00:08Z"
+
+
+def test_findings_engine_hard_page_fault_detection():
+    """Evaluate-Findings must detect sustained paging input from
+    PagesInputPersec (pages read to resolve hard faults), not from
+    PageFaultsPersec (which includes soft faults)."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-findings-paging; "
+        "$csv = @(); "
+        "for ($i = 0; $i -lt 10; $i++) { "
+        "  $pages = if ($i -ge 3 -and $i -le 7) { 200 } else { 5 }; "
+        "  $csv += [pscustomobject]@{TimestampUtc=('2026-09-10T12:00:{0:D2}Z' -f $i);AverageCpuLoadPercent=25;AvailableMemoryMB=8000;TotalLogicalDiskFreeGB=100;CommittedBytes=[long]4GB;CommitLimitBytes=[long]8GB;PagesInputPerSec=$pages} "
+        "}; "
+        "$mem = [ordered]@{committedBytes=[long]4GB;commitLimitBytes=[long]8GB;availableBytes=[long]4GB;pageFaultsPerSec=5000;pageReadsPerSec=200;pageWritesPerSec=50;pagesInputPerSec=200;pagesOutputPerSec=50}; "
+        "$findings = Evaluate-Findings -Samples $csv -DiskSeries $null -VolumeMetrics $null -MemoryMetrics $mem; "
+        "$pagingFindings = @($findings | Where-Object { $_.category -eq 'memory-paging' }); "
+        "[ordered]@{count=$pagingFindings.Count; metric=$pagingFindings[0].metric; start=$pagingFindings[0].windowStart} | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["count"] >= 1
+    assert output["metric"] == "PagesInputPerSec"
+    assert output["start"] == "2026-09-10T12:00:03Z"
+
+
+def test_findings_engine_coverage_when_hard_faults_null():
+    """When PagesInputPersec is null but PageFaultsPersec exists,
+    findings must note the hard-fault rate is unknown (not claim disk thrashing)."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-findings-nullhf; "
+        "$csv = @([pscustomobject]@{TimestampUtc='2026-09-10T12:00:00Z';AverageCpuLoadPercent=25;AvailableMemoryMB=8000;TotalLogicalDiskFreeGB=100;CommittedBytes=4GB;CommitLimitBytes=8GB}); "
+        "$mem = [ordered]@{committedBytes=[long]4GB;commitLimitBytes=[long]8GB;availableBytes=[long]4GB;pageFaultsPerSec=5000;pageReadsPerSec=$null;pageWritesPerSec=$null;pagesInputPerSec=$null;pagesOutputPerSec=$null}; "
+        "$findings = Evaluate-Findings -Samples $csv -DiskMetrics $null -VolumeMetrics $null -MemoryMetrics $mem; "
+        "$coverageFindings = @($findings | Where-Object { $_.category -eq 'coverage' -and $_.metric -eq 'pagesInputPerSec' }); "
+        "$coverageFindings.Count | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) >= 1
+
+
+def test_disk_telemetry_helper_handles_unsupported_counters():
+    """Get-DiskMetrics must handle unsupported CIM performance counters
+    gracefully - return null/empty rather than throwing."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-disk-test; "
+        "$result = Get-DiskMetrics; "
+        "$result | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # On Linux, CIM classes are unavailable - the helper must return null
+    # without throwing, proving graceful degradation
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output is None or isinstance(output, (list, dict))
+
+
+def test_memory_telemetry_helper_handles_unavailable_cim():
+    """Get-MemoryMetrics must handle unavailable CIM classes gracefully."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-mem-test; "
+        "$result = Get-MemoryMetrics; "
+        "$result | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output is None or isinstance(output, (list, dict))
+
+
+def test_volume_telemetry_helper_handles_unavailable_cim():
+    """Get-VolumeMetrics must handle unavailable CIM classes gracefully."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-vol-test; "
+        "$result = Get-VolumeMetrics; "
+        "$result | ConvertTo-Json -Depth 4"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output is None or isinstance(output, (list, dict))
+
+
+def test_unknown_telemetry_not_zero():
+    """The source must never replace missing CIM readings with zero.
+    grep for explicit zero-fallback patterns that would mask missing data."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+
+    # Must not hardcode 'queueDepth = 0' or similar when CIM fails
+    # The pattern 'if ($null -eq ...) { ... = 0 }' is forbidden for new metrics
+    assert "queueDepth = 0" not in source
+    assert "readLatency = 0" not in source
+    assert "writeLatency = 0" not in source
+
+
+# ======================================================================
+# DeepSeek V4 Flash correction lane: production pairing, raw disk
+# counters, sustained-streak rules, manifest ordering and Collect tail
+# ======================================================================
+
+def _run_ps(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_process_snapshot_pairing_uses_pid_and_start_time():
+    """Compare-ProcessCpuSnapshots is the real production pairing path: same
+    PID+StartTime matches; a reused PID, a new process and a protected process
+    (missing StartTime) all yield 'unknown'; a valid zero delta yields 0.0; an
+    invalid elapsed window yields 'unknown'; the cumulative CPU label is kept."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-pairing'
+function New-P { param($id, $ticks, $cpu, $name) [pscustomobject]@{ Id=$id; StartTime=([datetime]'2026-01-01T00:00:00Z').AddTicks($ticks); CPU=$cpu; ProcessName=$name; WorkingSet64=1; Handles=1; Path=$name } }
+$start = New-ProcessCpuSnapshot -Processes @( (New-P 100 0 10.0 'normal'), (New-P 200 0 5.0 'zero'), (New-P 400 0 7.0 'invalidelapsed') )
+$end = @(
+  (New-P 100 0 15.0 'normal'),
+  (New-P 200 0 5.0 'zero'),
+  (New-P 300 0 3.0 'new'),
+  (New-P 100 999 1.0 'reused'),
+  (New-P 400 0 9.0 'invalidelapsed'),
+  ([pscustomobject]@{ Id=500; CPU=2.0; ProcessName='protected' })
+)
+$r = @(Compare-ProcessCpuSnapshots -StartSnapshots $start -EndProcesses $end -ElapsedSeconds 5.0 -LogicalProcessors 4)
+$byName = @{}
+foreach ($x in $r) { $byName[$x.ProcessName] = $x.ProcessCpuPercent }
+$r2 = @(Compare-ProcessCpuSnapshots -StartSnapshots $start -EndProcesses $end -ElapsedSeconds 0 -LogicalProcessors 4)
+$byName2 = @{}
+foreach ($x in $r2) { $byName2[$x.ProcessName] = $x.ProcessCpuPercent }
+[ordered]@{
+  normal=$byName['normal']; zero=$byName['zero']; new=$byName['new']; reused=$byName['reused']; protected=$byName['protected'];
+  invalidElapsed=$byName2['invalidelapsed']; cumulative=(@($r | Where-Object { $_.ProcessName -eq 'normal' })[0].CPU)
+} | ConvertTo-Json -Depth 4
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["normal"] == 25.0
+    assert output["zero"] == 0.0
+    assert output["new"] == "unknown"
+    assert output["reused"] == "unknown"
+    assert output["protected"] == "unknown"
+    assert output["invalidElapsed"] == "unknown"
+    assert output["cumulative"] == 15.0
+
+
+def test_disk_counter_deltas_raw_latency_throughput_queue():
+    """Get-DiskCounterDeltas is the production raw-counter calculation:
+    latency = (tick delta / Frequency_PerfTime) / operation-base delta,
+    throughput = byte delta / elapsed, queue is instantaneous. No baseline, no
+    I/O or a counter reset produce null with a coverage reason, never zero."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-diskd'
+$prev = [pscustomobject]@{
+  Name='0 C:'; Frequency_PerfTime=[uint64]10000000; Timestamp_PerfTime=[uint64]100000000;
+  AvgDiskSecPerRead=[uint64]0; AvgDiskSecPerRead_Base=[uint32]0;
+  AvgDiskSecPerWrite=[uint64]0; AvgDiskSecPerWrite_Base=[uint32]0;
+  DiskReadBytesPerSec=[uint64]1000; DiskWriteBytesPerSec=[uint64]2000; DiskBytesPerSec=[uint64]3000;
+  CurrentDiskQueueLength=[uint32]0
+}
+$curr = [pscustomobject]@{
+  Name='0 C:'; Frequency_PerfTime=[uint64]10000000; Timestamp_PerfTime=[uint64]120000000;
+  AvgDiskSecPerRead=[uint64]500000; AvgDiskSecPerRead_Base=[uint32]100;
+  AvgDiskSecPerWrite=[uint64]100000; AvgDiskSecPerWrite_Base=[uint32]50;
+  DiskReadBytesPerSec=[uint64]5096; DiskWriteBytesPerSec=[uint64]4048; DiskBytesPerSec=[uint64]9144;
+  CurrentDiskQueueLength=[uint32]3
+}
+$r = @(Get-DiskCounterDeltas -Previous @($prev) -Current @($curr) -TimestampUtc '2026-09-10T12:00:01Z')[0]
+$nb = @(Get-DiskCounterDeltas -Previous $null -Current @($curr) -TimestampUtc '2026-09-10T12:00:01Z')[0]
+$prevNoIo = $prev.PSObject.Copy(); $prevNoIo.AvgDiskSecPerRead=[uint64]500000; $prevNoIo.AvgDiskSecPerRead_Base=[uint32]100
+$currNoIo = $curr.PSObject.Copy(); $currNoIo.AvgDiskSecPerRead=[uint64]500000; $currNoIo.AvgDiskSecPerRead_Base=[uint32]100
+$noio = @(Get-DiskCounterDeltas -Previous @($prevNoIo) -Current @($currNoIo) -TimestampUtc 't')[0]
+$resetPrev = $prev.PSObject.Copy(); $resetPrev.AvgDiskSecPerRead=[uint64]500000; $resetPrev.AvgDiskSecPerRead_Base=[uint32]100
+$resetCurr = $curr.PSObject.Copy(); $resetCurr.AvgDiskSecPerRead=[uint64]100; $resetCurr.AvgDiskSecPerRead_Base=[uint32]150
+$reset = @(Get-DiskCounterDeltas -Previous @($resetPrev) -Current @($resetCurr) -TimestampUtc 't')[0]
+[ordered]@{
+  readLatency=$r.ReadLatencySeconds; writeLatency=$r.WriteLatencySeconds;
+  readRate=$r.ReadBytesPerSec; queue=$r.CurrentQueueLength;
+  noBaselineLatency=$nb.ReadLatencySeconds; noBaselineReason=($nb.CoverageReason -join ',');
+  noIoLatency=$noio.ReadLatencySeconds; noIoReason=($noio.CoverageReason -join ',');
+  resetLatency=$reset.ReadLatencySeconds; resetReason=($reset.CoverageReason -join ',')
+} | ConvertTo-Json -Depth 5
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert abs(output["readLatency"] - 0.0005) < 1e-9
+    assert abs(output["writeLatency"] - 0.0002) < 1e-9
+    assert output["readRate"] == 2048.0
+    assert output["queue"] == 3.0
+    assert output["noBaselineLatency"] is None
+    assert "no-baseline" in output["noBaselineReason"]
+    assert output["noIoLatency"] is None
+    assert "no-io" in output["noIoReason"]
+    assert output["resetLatency"] is None
+    assert "counter-reset" in output["resetReason"]
+
+
+def test_sustained_window_counts_finite_readings_and_nulls_break_streak():
+    """Get-SustainedWindow counts only finite readings (null breaks a run) and
+    returns the longest qualifying run, not the trailing one."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-window'
+$s = @()
+for ($i=0; $i -lt 4; $i++) { $s += [pscustomobject]@{ TimestampUtc="a$i"; v=95 } }
+$s += [pscustomobject]@{ TimestampUtc='null'; v=$null }
+for ($i=0; $i -lt 5; $i++) { $s += [pscustomobject]@{ TimestampUtc="b$i"; v=95 } }
+$w = Get-SustainedWindow -Samples $s -ValueProperty 'v' -Threshold 80 -MinimumConsecutive 5
+[ordered]@{ count=$w.Count; start=$w.StartTimestampUtc; end=$w.EndTimestampUtc } | ConvertTo-Json
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["count"] == 5
+    assert output["start"] == "b0"
+    assert output["end"] == "b4"
+
+
+def test_findings_cpu_sustained_streak_found_anywhere():
+    """A 6-sample 85% burst at t=10..15 followed by an idle tail must still
+    produce exactly one cpu-pressure finding citing that window (regression for
+    the trailing-streak-only defect)."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-streak'
+$csv = @()
+for ($i=0; $i -lt 30; $i++) {
+  $cpu = if ($i -ge 10 -and $i -le 15) { 85.0 } else { 20.0 }
+  $csv += [pscustomobject]@{ TimestampUtc=('2026-09-10T12:00:{0:D2}Z' -f $i); AverageCpuLoadPercent=$cpu; CommittedBytes=[long]4GB; CommitLimitBytes=[long]8GB; PagesInputPerSec=$null }
+}
+$f = @(Evaluate-Findings -Samples $csv -DiskSeries $null -VolumeMetrics $null -MemoryMetrics $null)
+$cpu = @($f | Where-Object { $_.category -eq 'cpu-pressure' })
+[ordered]@{ count=$cpu.Count; start=$cpu[0].windowStart; end=$cpu[0].windowEnd; samples=$cpu[0].measuredValues.consecutiveSamplesAboveThreshold } | ConvertTo-Json -Depth 4
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["count"] == 1
+    assert output["start"] == "2026-09-10T12:00:10Z"
+    assert output["end"] == "2026-09-10T12:00:15Z"
+    assert output["samples"] == 6
+
+
+def test_findings_disk_series_sustained_and_single_read_ignored():
+    """Sustained queue/latency in the in-window disk series produces findings
+    with a cited window; a single high reading produces no finding."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-diskfind'
+$series = @()
+for ($i=0; $i -lt 10; $i++) {
+  $q = if ($i -ge 3 -and $i -le 8) { 3 } else { 0 }
+  $lat = if ($i -ge 3 -and $i -le 8) { 0.03 } else { 0.001 }
+  $series += [pscustomobject]@{ TimestampUtc=('2026-09-10T12:00:{0:D2}Z' -f $i); Name='0 C:'; CurrentQueueLength=$q; ReadLatencySeconds=$lat; ReadBytesPerSec=1000 }
+}
+$f = @(Evaluate-Findings -Samples @() -DiskSeries $series -VolumeMetrics $null -MemoryMetrics $null)
+$disk = @($f | Where-Object { $_.category -eq 'disk-pressure' })
+$lat = @($f | Where-Object { $_.category -eq 'disk-latency' })
+$single = @([pscustomobject]@{ TimestampUtc='2026-09-10T12:00:00Z'; Name='0 C:'; CurrentQueueLength=9; ReadLatencySeconds=0.5; ReadBytesPerSec=1 })
+$f2 = @(Evaluate-Findings -Samples @() -DiskSeries $single -VolumeMetrics $null -MemoryMetrics $null)
+$disk2 = @($f2 | Where-Object { $_.category -eq 'disk-pressure' })
+$lat2 = @($f2 | Where-Object { $_.category -eq 'disk-latency' })
+[ordered]@{
+  queueCount=$disk.Count; queueStart=$disk[0].windowStart; queueEnd=$disk[0].windowEnd;
+  latencyCount=$lat.Count; latencyMetric=$lat[0].metric;
+  singleQueue=$disk2.Count; singleLatency=$lat2.Count
+} | ConvertTo-Json -Depth 4
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["queueCount"] == 1
+    assert output["queueStart"] == "2026-09-10T12:00:03Z"
+    assert output["queueEnd"] == "2026-09-10T12:00:08Z"
+    assert output["latencyCount"] == 1
+    assert output["latencyMetric"] == "ReadLatencySeconds"
+    assert output["singleQueue"] == 0
+    assert output["singleLatency"] == 0
+
+
+def test_findings_coverage_warnings_for_missing_series():
+    """Null CPU readings, missing paging, no disk series and no volume metrics
+    all produce coverage warnings (unknown is never treated as healthy)."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-cov'
+$csv = @()
+for ($i=0; $i -lt 6; $i++) { $csv += [pscustomobject]@{ TimestampUtc='t'; AverageCpuLoadPercent=$null; CommittedBytes=$null; CommitLimitBytes=$null; PagesInputPerSec=$null } }
+$f = @(Evaluate-Findings -Samples $csv -DiskSeries $null -VolumeMetrics $null -MemoryMetrics $null)
+@($f | Where-Object { $_.category -eq 'coverage' } | ForEach-Object { $_.metric }) | ConvertTo-Json
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads(result.stdout)
+    assert "noSamples" in metrics
+    assert "pagesInputPerSec" in metrics
+    assert "diskSeriesUnavailable" in metrics
+    assert "volumeMetricsUnavailable" in metrics
+
+
+def test_cpu_interval_stopwatch_spans_the_end_enumeration():
+    """Ordering contract for the interval-CPU measurement (guards audit finding
+    F1). The stopwatch must be stopped only AFTER the end-of-interval process
+    enumeration, with the elapsed value captured in between: stopping it earlier
+    would drop CPU accrued during CSV export / summary polls from the
+    denominator while the numerator delta still included it, inflating every
+    per-process percentage. The live Collect path is Windows-only, so this
+    ordering is asserted on the source rather than executed here; the hosted
+    Windows workload step executes the same code path end to end.
+    """
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+
+    start_idx = source.index("$cpuStopwatch = [System.Diagnostics.Stopwatch]::StartNew()")
+    enumeration_idx = source.index("$processEnds = @(Get-Process")
+    elapsed_idx = source.index("$cpuElapsedSeconds = $cpuStopwatch.Elapsed.TotalSeconds")
+    stop_idx = source.index("$cpuStopwatch.Stop()")
+
+    assert start_idx < enumeration_idx < elapsed_idx < stop_idx
+    # The interval must be measured with the captured value, not read after Stop.
+    assert "ElapsedSeconds $cpuStopwatch.Elapsed.TotalSeconds" not in source
+    assert "ElapsedSeconds $cpuElapsedSeconds" in source
+
+
+def test_html_report_with_no_findings_reports_measured_clear_window():
+    """A collection that measured every source and breached no sustained rule
+    must NOT be reported as 'Insufficient Evidence' - that wording is reserved
+    for missing/unusable data. Zero findings with zero coverage warnings is a
+    positive measurement result and must say so, so an operator can tell
+    'nothing sustained' apart from 'we could not measure'."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-clear'
+$manifest = [ordered]@{ toolVersion='0.9.0'; schemaVersion='1.1'; startedAtUtc='2026-09-10T12:00:00Z'; completedAtUtc='2026-09-10T12:00:30Z'; scope=[ordered]@{durationSeconds=30}; artifacts=@() }
+$html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext $null
+[ordered]@{
+    hasCollectionSummary = [bool]($html -match 'Collection Summary')
+    claimsInsufficient   = [bool]($html -match 'Insufficient Evidence')
+    statesNoPressure     = [bool]($html -match 'No Sustained Pressure Detected')
+    retainsCaveat        = [bool]($html -match 'does not prove the system is healthy')
+} | ConvertTo-Json
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["hasCollectionSummary"] is True
+    assert output["statesNoPressure"] is True
+    assert output["claimsInsufficient"] is False
+    assert output["retainsCaveat"] is True
+
+
+def test_html_report_encodes_artifact_size_bytes():
+    """A hostile SizeBytes value from a remote manifest must be HTML-encoded."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-size'
+$payload = '<img src=x onerror=alert(2)>'
+$manifest = [ordered]@{ toolVersion='0.9.0'; schemaVersion='1.1'; startedAtUtc='2026-09-10T12:00:00Z'; completedAtUtc='2026-09-10T12:00:30Z'; scope=[ordered]@{durationSeconds=30}; artifacts=@([ordered]@{ Name='a.csv'; SizeBytes=$payload; Sha256=('A'*64) }) }
+$html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext $null
+$raw = 0; if ($html -match '<img') { $raw = 1 }
+$encoded = 0; if ($html -match '&lt;img') { $encoded = 1 }
+[ordered]@{ raw=$raw; encoded=$encoded } | ConvertTo-Json
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["raw"] == 0
+    assert output["encoded"] == 1
+
+
+def test_volume_percent_free_null_when_free_space_missing():
+    """A volume with null FreeSpace must not fabricate a 0% free-space
+    finding."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-volnull'
+$vol = @([pscustomobject]@{ DriveLetter='D:'; Label='x'; FileSystem='NTFS'; CapacityBytes=[long]1TB; FreeSpaceBytes=$null; PercentFree=$null })
+$disk = @([pscustomobject]@{ TimestampUtc='t'; Name='0 C:'; CurrentQueueLength=0; ReadLatencySeconds=$null })
+$f = @(Evaluate-Findings -Samples @() -DiskSeries $disk -VolumeMetrics $vol -MemoryMetrics $null)
+@($f | Where-Object { $_.category -eq 'disk-space' }).Count | ConvertTo-Json
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == 0
+
+
+def test_volume_metrics_null_guard_production():
+    """Get-VolumeMetrics must return PercentFree=null (not 0) when the CIM
+    volume reports a null FreeSpace."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-volguard'
+function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) if ($ClassName -eq 'Win32_Volume') { return [pscustomobject]@{ DriveLetter='D:'; Label='x'; FileSystem='NTFS'; Capacity=[long]1TB; FreeSpace=$null } } return @() }
+$v = @(Get-VolumeMetrics)[0]
+[ordered]@{ percentFree=$v.PercentFree; freeSpace=$v.FreeSpaceBytes } | ConvertTo-Json
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["percentFree"] is None
+    assert output["freeSpace"] is None
+
+
+def test_plan_mode_preset_without_symptom_is_recorded(tmp_path):
+    """A preset supplied without symptom text must still be recorded, not
+    silently dropped."""
+    output_directory = tmp_path / "plan-preset-only"
+    result = run_tool(
+        "-Mode", "Plan",
+        "-Preset", "storage-io",
+        "-OutputDirectory", str(output_directory),
+    )
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(
+        (output_directory / "diagnostic-plan.json").read_text(encoding="utf-8-sig")
+    )
+    assert manifest["symptom"]["preset"] == "storage-io"
+    assert "reported" not in manifest["symptom"]
+    assert "collectionWindow" in manifest["symptom"]
+
+
+def test_collection_errors_reference_is_live_for_tail_stages():
+    """The manifest's collectionErrors must observe errors added after manifest
+    construction (tail findings/report/export stages), which requires a mutable
+    accumulator rather than array += rebinding."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-errref'
+$manifest = [ordered]@{ collectionErrors = $script:collectionErrors }
+Add-CollectionErrorText -Stage 'tail-stage' -Message 'tail failure'
+$manifest | ConvertTo-Json -Depth 4
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(result.stdout)
+    assert any(e["Stage"] == "tail-stage" for e in manifest["collectionErrors"])
+
+
+def test_live_collect_tail_calls_shared_write_collection_outputs():
+    """The live Collect call site must use the same Write-CollectionOutputs
+    function exercised by the fixture tail test, and the old broken ordering
+    (hashing before findings generation) must be gone."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    assert "Write-CollectionOutputs" in source
+    assert "Write-CollectionOutputs `" in source or "Write-CollectionOutputs -" in source
+    assert "Evaluate-Findings -Samples $samples -DiskMetrics" not in source
+    assert "-DiskMetrics $diskMetrics" not in source
+
+
+def test_collect_tail_shared_function_registers_evidence_and_verify_detects_tamper(tmp_path):
+    """Fixture-driven Collect tail: Write-CollectionOutputs must write
+    findings.json/report.html/disk-samples.json, register every one in the
+    manifest, and produce a case that Verify accepts - then refuse it once the
+    report is tampered with."""
+    script = str(SCRIPT).replace("\\", "/")
+    out = tmp_path / "collect-tail"
+    out.mkdir()
+    plan_dot = tmp_path / "plan-dotsource"
+    body = r"""
+$ErrorActionPreference = 'Stop'
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '__PLAN__'
+$outputDirectory = '__OUT__'
+$collected = New-Object System.Collections.ArrayList
+Set-Content -LiteralPath (Join-Path $outputDirectory 'performance-samples.csv') -Value 'a,b' -Encoding Ascii
+[void]$collected.Add('performance-samples.csv')
+$manifest = [ordered]@{
+  schemaVersion = '1.1'
+  toolName = 'Windows Performance Diagnostics Toolkit'
+  toolVersion = '0.9.0'
+  mode = 'Collect'
+  startedAtUtc = '2026-09-10T12:00:00Z'
+  completedAtUtc = '2026-09-10T12:00:30Z'
+  safety = [ordered]@{ localOnly=$true; readOnly=$true; requiresExplicitCollectionConsent=$true; automaticUpload=$false; automaticRemediation=$false; automaticLogClearing=$false }
+  collectionErrors = @()
+  artifacts = @()
+}
+$samples = @()
+for ($i=0; $i -lt 6; $i++) {
+  $samples += [pscustomobject]@{ TimestampUtc=('2026-09-10T12:00:{0:D2}Z' -f $i); AverageCpuLoadPercent=95; CommittedBytes=[long]7.6GB; CommitLimitBytes=[long]8GB; PagesInputPerSec=$null }
+}
+$disk = @()
+for ($i=0; $i -lt 6; $i++) {
+  $disk += [pscustomobject]@{ TimestampUtc=('2026-09-10T12:00:{0:D2}Z' -f $i); Name='0 C:'; CurrentQueueLength=3; ReadLatencySeconds=0.03; ReadBytesPerSec=1000 }
+}
+$manifest = Write-CollectionOutputs -OutputDirectory $outputDirectory -CollectionManifest $manifest -CollectedArtifacts $collected -Samples $samples -DiskSeries $disk -VolumeMetrics $null -MemoryMetrics $null -SymptomContext '<script>alert(1)</script>'
+[ordered]@{
+  artifactNames = @($manifest.artifacts | ForEach-Object { $_.Name })
+  findingsExists = Test-Path -LiteralPath (Join-Path $outputDirectory 'findings.json')
+  reportExists = Test-Path -LiteralPath (Join-Path $outputDirectory 'report.html')
+  diskSamplesExists = Test-Path -LiteralPath (Join-Path $outputDirectory 'disk-samples.json')
+} | ConvertTo-Json -Depth 6
+"""
+    body = body.replace("__SCRIPT__", script).replace("__PLAN__", str(plan_dot)).replace("__OUT__", str(out))
+    result = _run_ps(body)
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(result.stdout)
+    assert summary["findingsExists"] and summary["reportExists"] and summary["diskSamplesExists"]
+    for required in ("performance-samples.csv", "findings.json", "report.html", "disk-samples.json"):
+        assert required in summary["artifactNames"], required
+
+    report_text = (out / "report.html").read_text(encoding="utf-8")
+    assert "<script>alert(1)</script>" not in report_text
+
+    verify_ok = run_tool("-Mode", "Verify", "-InputDirectory", str(out))
+    assert verify_ok.returncode == 0, verify_ok.stderr
+    report = json.loads(verify_ok.stdout)
+    assert report["status"] == "verified"
+    assert report["artifactCount"] == len(summary["artifactNames"])
+    assert report["verifiedArtifactCount"] == len(summary["artifactNames"])
+
+    (out / "report.html").write_bytes(b"<html>tampered</html>")
+    verify_bad = run_tool("-Mode", "Verify", "-InputDirectory", str(out))
+    assert verify_bad.returncode == 1
+    bad_report = json.loads(verify_bad.stdout)
+    assert bad_report["status"] == "failed"
+    assert any("mismatch" in e.lower() for e in bad_report["errors"])

@@ -42,7 +42,12 @@ param(
 
     [System.Management.Automation.PSCredential]$Credential,
 
-    [switch]$ConfirmRemoteCollection
+    [switch]$ConfirmRemoteCollection,
+
+    [string]$SymptomContext,
+
+    [ValidateSet('baseline', 'cpu-heavy', 'memory-pressure', 'storage-io', 'network-io', 'boot-slowdown', 'application-freeze')]
+    [string]$Preset
 )
 
 Set-StrictMode -Version Latest
@@ -51,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
 # keeps the two in sync so drift fails CI.
-$script:ScriptVersion = '0.8.2'
+$script:ScriptVersion = '0.9.0'
 try {
     $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
 }
@@ -64,6 +69,31 @@ catch {
 # recorded as metadata only and never copied.
 $script:MaxMinidumpTotalBytes = 512MB
 $script:MaxBootFailureLogBytes = 100MB
+
+# Collection-error accumulator and its helpers are defined before any mode
+# dispatch so the shared Collect-tail function (Write-CollectionOutputs) can be
+# exercised by fixture tests that dot-source the script in Plan mode.
+# ArrayList (not @()) so the manifest can hold a live reference: array += would
+# rebind the variable and tail-stage errors added after manifest construction
+# would silently not appear in the written manifest.
+$script:collectionErrors = New-Object System.Collections.ArrayList
+function Add-CollectionError {
+    param([string]$Stage, [System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    [void]$script:collectionErrors.Add([pscustomobject]@{
+        Stage = $Stage
+        Message = $ErrorRecord.Exception.Message
+    })
+}
+
+function Add-CollectionErrorText {
+    param([string]$Stage, [string]$Message)
+
+    [void]$script:collectionErrors.Add([pscustomobject]@{
+        Stage = $Stage
+        Message = $Message
+    })
+}
 
 function Write-JsonFile {
     param(
@@ -1267,6 +1297,1155 @@ if ($Mode -eq 'Verify') {
     exit 0
 }
 
+# ---- Telemetry helpers (used by Collect mode, dot-sourceable for tests) ----
+
+function Get-SafeObjectProperty {
+    <#
+      StrictMode-safe property read for arbitrary objects (processes, CIM
+      instances, raw counter snapshots). Returns $null when the property is
+      absent or its getter throws - protected/exiting process properties such
+      as StartTime, CPU or Path can throw even though the process object exists,
+      and one bad process must not abort the whole snapshot stage.
+    #>
+    param(
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ($null -eq $InputObject) { return $null }
+    try {
+        $property = $InputObject.PSObject.Properties[$Name]
+        if ($null -ne $property) { return $property.Value }
+    }
+    catch { }
+    return $null
+}
+
+function Get-ProcessSnapshotKey {
+    <#
+      Identity key for a process snapshot: PID + process start time ticks.
+      PID alone is unsafe because Windows reuses PIDs; the start time
+      distinguishes a reused PID from the original process. Returns $null when
+      the PID or StartTime is unavailable (protected/exiting process), which
+      makes the pairing report 'unknown' instead of mis-attributing CPU.
+    #>
+    param([AllowNull()][object]$Process)
+
+    $id = Get-SafeObjectProperty -InputObject $Process -Name 'Id'
+    if ($null -eq $id) { return $null }
+    $start = Get-SafeObjectProperty -InputObject $Process -Name 'StartTime'
+    if ($null -eq $start) { return $null }
+    try {
+        $ticks = ([datetime]$start).Ticks
+    }
+    catch {
+        return $null
+    }
+    return ('{0}_{1}' -f $id, $ticks)
+}
+
+function New-ProcessCpuSnapshot {
+    <#
+      Builds the baseline dictionary keyed by PID+StartTime ticks with the
+      cumulative CPU seconds observed at snapshot time. Processes whose identity
+      or CPU value cannot be read are skipped; their interval result is
+      'unknown', never zero.
+    #>
+    param([AllowNull()][object[]]$Processes)
+
+    $snapshot = @{}
+    foreach ($process in @($Processes)) {
+        $key = Get-ProcessSnapshotKey -Process $process
+        if ($null -eq $key) { continue }
+        $cpu = Get-SafeObjectProperty -InputObject $process -Name 'CPU'
+        if ($null -ne $cpu) {
+            try { $cpu = [double]$cpu } catch { $cpu = $null }
+        }
+        $snapshot[$key] = [pscustomobject]@{ CPU = $cpu }
+    }
+    return $snapshot
+}
+
+function Compare-ProcessCpuSnapshots {
+    <#
+      Pure pairing of a baseline snapshot with the end-process enumeration. Only
+      processes present at BOTH endpoints with the same PID+StartTime are
+      matched; reused PIDs, new processes and processes whose properties are
+      protected return 'unknown'. ElapsedSeconds is the monotonic stopwatch
+      window that brackets the two CPU snapshots so numerator and denominator
+      describe the same interval. The cumulative CPU seconds are preserved
+      alongside the normalized percentage.
+    #>
+    param(
+        [AllowNull()][object]$StartSnapshots,
+        [AllowNull()][object[]]$EndProcesses,
+        [AllowNull()][object]$ElapsedSeconds,
+        [AllowNull()][object]$LogicalProcessors
+    )
+
+    $results = @()
+    foreach ($process in @($EndProcesses)) {
+        if ($null -eq $process) { continue }
+        $key = Get-ProcessSnapshotKey -Process $process
+        $currentCpu = Get-SafeObjectProperty -InputObject $process -Name 'CPU'
+        if ($null -ne $currentCpu) {
+            try { $currentCpu = [double]$currentCpu } catch { $currentCpu = $null }
+        }
+        $previousCpu = $null
+        if ($null -ne $key -and $null -ne $StartSnapshots -and $StartSnapshots.ContainsKey($key)) {
+            $previousCpu = $StartSnapshots[$key].CPU
+        }
+        $percent = Get-ProcessCpuPercentage -PreviousCPU $previousCpu -CurrentCPU $currentCpu -ElapsedSeconds $ElapsedSeconds -LogicalProcessors $LogicalProcessors
+        $results += [pscustomobject]@{
+            ProcessName = Get-SafeObjectProperty -InputObject $process -Name 'ProcessName'
+            Id = Get-SafeObjectProperty -InputObject $process -Name 'Id'
+            CPU = $currentCpu
+            ProcessCpuPercent = $percent
+            WorkingSet64 = Get-SafeObjectProperty -InputObject $process -Name 'WorkingSet64'
+            Handles = Get-SafeObjectProperty -InputObject $process -Name 'Handles'
+            Path = Get-SafeObjectProperty -InputObject $process -Name 'Path'
+        }
+    }
+    return $results
+}
+
+function Get-ProcessCpuPercentage {
+    <#
+      Calculate elapsed-time-based CPU percentage for a single process.
+      Returns 'unknown' when PreviousCPU/CurrentCPU is missing, when the elapsed
+      window is invalid, or when the logical processor count is unknown - the
+      percentage cannot be normalized without it, so guessing a count would
+      fabricate a measurement. A valid zero delta is a measured 0%. Impossible
+      values (> 100% after normalization, e.g. a CPU counter reset or mismatched
+      windows) are reported as 'unknown' rather than clamped to a plausible
+      number.
+    #>
+    param(
+        [AllowNull()]
+        $PreviousCPU,
+
+        [AllowNull()]
+        $CurrentCPU,
+
+        [AllowNull()]
+        $ElapsedSeconds,
+
+        [AllowNull()]
+        $LogicalProcessors
+    )
+
+    if ($null -eq $PreviousCPU -or $null -eq $CurrentCPU) { return 'unknown' }
+    if ($null -eq $ElapsedSeconds) { return 'unknown' }
+    if ($null -eq $LogicalProcessors) { return 'unknown' }
+
+    $elapsed = 0.0
+    $cores = 0
+    try { $elapsed = [double]$ElapsedSeconds } catch { return 'unknown' }
+    try { $cores = [int]$LogicalProcessors } catch { return 'unknown' }
+    if ($elapsed -le 0 -or $cores -lt 1) { return 'unknown' }
+
+    $previous = 0.0
+    $current = 0.0
+    try {
+        $previous = [double]$PreviousCPU
+        $current = [double]$CurrentCPU
+    }
+    catch {
+        return 'unknown'
+    }
+    if ([double]::IsNaN($previous) -or [double]::IsNaN($current) -or
+        [double]::IsInfinity($previous) -or [double]::IsInfinity($current)) {
+        return 'unknown'
+    }
+
+    $delta = $current - $previous
+    if ($delta -lt 0) { return 'unknown' }
+    $perProcessorSeconds = $elapsed * $cores
+    if ($perProcessorSeconds -le 0) { return 'unknown' }
+    $pct = [Math]::Round(($delta / $perProcessorSeconds) * 100, 2)
+    if ($pct -gt 100) { return 'unknown' }
+    return $pct
+}
+
+function Get-DiskMetrics {
+    <#
+      Reads per-disk I/O metrics via Win32_PerfFormattedData_PerfDisk_PhysicalDisk.
+      Uses formatted counters (rates computed by the CIM provider between polls).
+      A single 1 Hz poll yields noisy/zero rates for sub-second bursts; this is
+      documented as a sampling limitation. Returns null when CIM classes are
+      unavailable (e.g. Linux, restricted tokens). Never replaces missing readings
+      with zero. _Total instance is excluded.
+    #>
+    param()
+
+    try {
+        $counters = @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfDisk_PhysicalDisk' -ErrorAction Stop |
+            Where-Object { $_.Name -ne '_Total' } |
+            Select-Object -First 64)
+        if ($counters.Count -eq 0) { return $null }
+        return @($counters | ForEach-Object {
+            [pscustomobject]@{
+                Name = $_.Name
+                PercentDiskTime = $_.PercentDiskTime
+                PercentDiskReadTime = $_.PercentDiskReadTime
+                PercentDiskWriteTime = $_.PercentDiskWriteTime
+                DiskReadsPerSec = $_.DiskReadsPerSec
+                DiskWritesPerSec = $_.DiskWritesPerSec
+                DiskBytesPerSec = $_.DiskBytesPerSec
+                DiskReadBytesPerSec = $_.DiskReadBytesPerSec
+                DiskWriteBytesPerSec = $_.DiskWriteBytesPerSec
+                CurrentDiskQueueLength = $_.CurrentDiskQueueLength
+                AvgDiskReadQueueLength = $_.AvgDiskReadQueueLength
+                AvgDiskWriteQueueLength = $_.AvgDiskWriteQueueLength
+            }
+        })
+    }
+    catch {
+        Add-CollectionErrorText -Stage 'disk-metrics' -Message "Win32_PerfFormattedData_PerfDisk_PhysicalDisk unavailable: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-RawDiskMetrics {
+    <#
+      Reads the raw physical-disk performance class
+      (Win32_PerfRawData_PerfDisk_PhysicalDisk; invariant CIM class, documented
+      at https://learn.microsoft.com/en-us/previous-versions/aa394308(v=vs.85)).
+      Raw counters are cumulative, so latency/throughput are computed by
+      Get-DiskCounterDeltas between two snapshots. Returns a bounded snapshot
+      plus a source error string when the class is unavailable. Missing data is
+      never replaced with zero, and the request/output is bounded.
+    #>
+    param([int]$MaxDisks = 64)
+
+    $result = [ordered]@{ Disks = $null; Error = $null }
+    try {
+        $counters = @(Get-CimInstance -ClassName 'Win32_PerfRawData_PerfDisk_PhysicalDisk' -ErrorAction Stop |
+            Where-Object { $_.Name -ne '_Total' } |
+            Select-Object -First $MaxDisks)
+        if ($counters.Count -gt 0) {
+            $result.Disks = @($counters)
+        }
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+    }
+    return $result
+}
+
+function Get-FiniteNumericDelta {
+    <#
+      Difference between two raw counter readings, or $null when either reading
+      is missing or not a finite number. Never coerces $null to zero.
+    #>
+    param(
+        [AllowNull()][object]$Previous,
+        [AllowNull()][object]$Current,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $previousRaw = Get-SafeObjectProperty -InputObject $Previous -Name $Name
+    $currentRaw = Get-SafeObjectProperty -InputObject $Current -Name $Name
+    if ($null -eq $previousRaw -or $null -eq $currentRaw) { return $null }
+    try {
+        $previousValue = [double]$previousRaw
+        $currentValue = [double]$currentRaw
+    }
+    catch {
+        return $null
+    }
+    if ([double]::IsNaN($previousValue) -or [double]::IsNaN($currentValue) -or
+        [double]::IsInfinity($previousValue) -or [double]::IsInfinity($currentValue)) {
+        return $null
+    }
+    return ($currentValue - $previousValue)
+}
+
+function Get-AverageTimerDelta {
+    <#
+      Raw PERF_AVERAGE_TIMER conversion used for AvgDiskSecPerRead /
+      AvgDiskSecPerWrite: (value delta / Frequency_PerfTime) / operation-base
+      delta. Returns $null with a coverage reason when there is no baseline, no
+      I/O, a counter reset, a missing property or a missing frequency - never a
+      fake zero latency.
+    #>
+    param(
+        [AllowNull()][object]$Previous,
+        [AllowNull()][object]$Current,
+        [Parameter(Mandatory = $true)][string]$ValueProperty,
+        [Parameter(Mandatory = $true)][string]$BaseProperty,
+        [AllowNull()][object]$FrequencyPerfTime
+    )
+
+    if ($null -eq $Previous -or $null -eq $Current) {
+        return [pscustomobject]@{ Value = $null; Reason = 'no-baseline' }
+    }
+    if ($null -eq $FrequencyPerfTime) {
+        return [pscustomobject]@{ Value = $null; Reason = 'missing-frequency' }
+    }
+    $frequency = 0.0
+    try { $frequency = [double]$FrequencyPerfTime } catch { return [pscustomobject]@{ Value = $null; Reason = 'missing-frequency' } }
+    if ($frequency -le 0) { return [pscustomobject]@{ Value = $null; Reason = 'missing-frequency' } }
+
+    $valueDelta = Get-FiniteNumericDelta -Previous $Previous -Current $Current -Name $ValueProperty
+    if ($null -eq $valueDelta) { return [pscustomobject]@{ Value = $null; Reason = 'missing-counter' } }
+    if ($valueDelta -lt 0) { return [pscustomobject]@{ Value = $null; Reason = 'counter-reset' } }
+    $baseDelta = Get-FiniteNumericDelta -Previous $Previous -Current $Current -Name $BaseProperty
+    if ($null -eq $baseDelta) { return [pscustomobject]@{ Value = $null; Reason = 'missing-counter' } }
+    if ($baseDelta -le 0) { return [pscustomobject]@{ Value = $null; Reason = 'no-io' } }
+
+    $seconds = ($valueDelta / $frequency) / $baseDelta
+    if ([double]::IsNaN($seconds) -or [double]::IsInfinity($seconds) -or $seconds -lt 0) {
+        return [pscustomobject]@{ Value = $null; Reason = 'invalid-result' }
+    }
+    return [pscustomobject]@{ Value = [Math]::Round($seconds, 6); Reason = $null }
+}
+
+function Get-RateFromDelta {
+    <#
+      Cumulative-counter rate: (current - previous) / elapsed seconds. Returns
+      $null for a missing/reset counter or invalid window, never zero.
+    #>
+    param(
+        [AllowNull()][object]$Previous,
+        [AllowNull()][object]$Current,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()]$ElapsedSeconds
+    )
+
+    if ($null -eq $ElapsedSeconds) { return $null }
+    $elapsed = 0.0
+    try { $elapsed = [double]$ElapsedSeconds } catch { return $null }
+    if ($elapsed -le 0) { return $null }
+    $delta = Get-FiniteNumericDelta -Previous $Previous -Current $Current -Name $Name
+    if ($null -eq $delta -or $delta -lt 0) { return $null }
+    $rate = $delta / $elapsed
+    if ([double]::IsNaN($rate) -or [double]::IsInfinity($rate) -or $rate -lt 0) { return $null }
+    return [Math]::Round($rate, 2)
+}
+
+function Get-DiskCounterDeltas {
+    <#
+      Pure per-disk derived metrics from two raw Win32_PerfRawData snapshots.
+      Computes read/write latency, throughput and instantaneous queue depth.
+      Returns null fields with a coverage reason when a counter cannot be paired
+      - missing data is never reported as zero. Bounded by the number of disks
+      supplied.
+    #>
+    param(
+        [AllowNull()][object[]]$Previous,
+        [AllowNull()][object[]]$Current,
+        [AllowNull()][string]$TimestampUtc
+    )
+
+    $results = @()
+    if ($null -eq $Current) { return $results }
+
+    $previousByName = @{}
+    foreach ($previousDisk in @($Previous)) {
+        $name = Get-SafeObjectProperty -InputObject $previousDisk -Name 'Name'
+        if ($null -ne $name) { $previousByName[[string]$name] = $previousDisk }
+    }
+
+    foreach ($disk in @($Current)) {
+        $name = Get-SafeObjectProperty -InputObject $disk -Name 'Name'
+        if ($null -eq $name) { continue }
+        $name = [string]$name
+        $previousDisk = $null
+        if ($previousByName.ContainsKey($name)) { $previousDisk = $previousByName[$name] }
+
+        $frequency = Get-SafeObjectProperty -InputObject $disk -Name 'Frequency_PerfTime'
+        $coverage = @()
+
+        $readLatency = Get-AverageTimerDelta -Previous $previousDisk -Current $disk -ValueProperty 'AvgDiskSecPerRead' -BaseProperty 'AvgDiskSecPerRead_Base' -FrequencyPerfTime $frequency
+        $writeLatency = Get-AverageTimerDelta -Previous $previousDisk -Current $disk -ValueProperty 'AvgDiskSecPerWrite' -BaseProperty 'AvgDiskSecPerWrite_Base' -FrequencyPerfTime $frequency
+
+        $elapsed = $null
+        if ($null -ne $previousDisk) {
+            $previousTimestamp = Get-SafeObjectProperty -InputObject $previousDisk -Name 'Timestamp_PerfTime'
+            $currentTimestamp = Get-SafeObjectProperty -InputObject $disk -Name 'Timestamp_PerfTime'
+            if ($null -ne $frequency -and $null -ne $previousTimestamp -and $null -ne $currentTimestamp) {
+                try {
+                    $frequencyValue = [double]$frequency
+                    $tickDelta = [double]$currentTimestamp - [double]$previousTimestamp
+                    if ($frequencyValue -gt 0 -and $tickDelta -gt 0) {
+                        $elapsed = $tickDelta / $frequencyValue
+                    }
+                }
+                catch { $elapsed = $null }
+            }
+        }
+
+        $readBytesPerSec = $null
+        $writeBytesPerSec = $null
+        $totalBytesPerSec = $null
+        if ($null -ne $elapsed -and $elapsed -gt 0 -and $null -ne $previousDisk) {
+            $readBytesPerSec = Get-RateFromDelta -Previous $previousDisk -Current $disk -Name 'DiskReadBytesPerSec' -ElapsedSeconds $elapsed
+            $writeBytesPerSec = Get-RateFromDelta -Previous $previousDisk -Current $disk -Name 'DiskWriteBytesPerSec' -ElapsedSeconds $elapsed
+            $totalBytesPerSec = Get-RateFromDelta -Previous $previousDisk -Current $disk -Name 'DiskBytesPerSec' -ElapsedSeconds $elapsed
+        }
+        else {
+            $coverage += 'no-throughput-window'
+        }
+
+        $queueRaw = Get-SafeObjectProperty -InputObject $disk -Name 'CurrentDiskQueueLength'
+        $queue = $null
+        if ($null -ne $queueRaw) {
+            try {
+                $queueValue = [double]$queueRaw
+                if (-not ([double]::IsNaN($queueValue) -or [double]::IsInfinity($queueValue))) { $queue = $queueValue }
+            }
+            catch { $queue = $null }
+        }
+        if ($null -eq $queue) { $coverage += 'missing-queue' }
+
+        foreach ($latency in @($readLatency, $writeLatency)) {
+            if ($null -ne $latency -and $null -ne $latency.Reason) { $coverage += $latency.Reason }
+        }
+
+        $results += [pscustomobject]@{
+            TimestampUtc = $TimestampUtc
+            Name = $name
+            ReadLatencySeconds = $readLatency.Value
+            WriteLatencySeconds = $writeLatency.Value
+            ReadBytesPerSec = $readBytesPerSec
+            WriteBytesPerSec = $writeBytesPerSec
+            TotalBytesPerSec = $totalBytesPerSec
+            CurrentQueueLength = $queue
+            CoverageReason = @($coverage | Select-Object -Unique)
+        }
+    }
+    return $results
+}
+
+function Get-MemoryMetrics {
+    <#
+      Reads memory committed bytes, commit limit, and paging-file activity from
+      Win32_PerfFormattedData_PerfOS_Memory. AvailableBytes is read from this
+      class (not Win32_OperatingSystem which lacks CommittedBytes/CommitLimit).
+      Page faults (soft+hard) are in PageFaultsPerSec; hard-fault input is
+      PagesInputPersec/PageReadsPersec. Returns null when CIM classes are
+      unavailable. Per-source errors are captured, never silently zero-filled.
+    #>
+    param()
+
+    $result = [ordered]@{
+        committedBytes = $null
+        commitLimitBytes = $null
+        availableBytes = $null
+        pageFaultsPerSec = $null
+        pageReadsPerSec = $null
+        pageWritesPerSec = $null
+        pagesInputPerSec = $null
+        pagesOutputPerSec = $null
+        _errors = @()
+    }
+
+    try {
+        $mem = Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_Memory' -ErrorAction Stop
+        $result.committedBytes = $mem.CommittedBytes
+        $result.commitLimitBytes = $mem.CommitLimit
+        $result.availableBytes = $mem.AvailableBytes
+        $result.pageFaultsPerSec = $mem.PageFaultsPerSec
+        $result.pageReadsPerSec = $mem.PageReadsPersec
+        $result.pageWritesPerSec = $mem.PageWritesPersec
+        $result.pagesInputPerSec = $mem.PagesInputPersec
+        $result.pagesOutputPerSec = $mem.PagesOutputPersec
+    }
+    catch {
+        $result._errors += "PerfOS_Memory: $($_.Exception.Message)"
+    }
+
+    # If all core fields are null, treat the whole result as unavailable
+    if ($null -eq $result.committedBytes -and $null -eq $result.availableBytes) {
+        return $null
+    }
+    return $result
+}
+
+function Get-VolumeMetrics {
+    <#
+      Reads per-volume free space and total capacity via Win32_Volume.
+      Returns null when CIM classes are unavailable.
+    #>
+    param()
+
+    try {
+        $volumes = @(Get-CimInstance -ClassName 'Win32_Volume' -Filter "DriveType = 3" -ErrorAction Stop)
+        if ($volumes.Count -eq 0) { return $null }
+        return @($volumes | ForEach-Object {
+            [pscustomobject]@{
+                DriveLetter = $_.DriveLetter
+                Label = $_.Label
+                FileSystem = $_.FileSystem
+                CapacityBytes = $_.Capacity
+                FreeSpaceBytes = $_.FreeSpace
+                PercentFree = if ($null -ne $_.FreeSpace -and $null -ne $_.Capacity -and [double]$_.Capacity -gt 0) {
+                    [Math]::Round(([double]$_.FreeSpace / [double]$_.Capacity) * 100, 2)
+                } else { $null }
+            }
+        })
+    }
+    catch {
+        Add-CollectionErrorText -Stage 'volume-metrics' -Message "Win32_Volume unavailable: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function ConvertTo-HtmlEncoded {
+    <#
+      HTML-encode text for safe embedding. Uses [System.Net.WebUtility]::HtmlEncode
+      which is available on PS 5.1 and pwsh 7. Never produces raw <, >, &, or " in
+      output. No external assets or scripts.
+    #>
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode($Text)
+}
+
+function Get-SampleTimestamp {
+    param([AllowNull()][object]$Sample)
+
+    if ($null -eq $Sample) { return $null }
+    $value = Get-SafeObjectProperty -InputObject $Sample -Name 'TimestampUtc'
+    if ($null -eq $value) { return $null }
+    return [string]$value
+}
+
+function Get-FiniteNumericCount {
+    <#
+      Counts samples whose named property is a finite real number. This is the
+      coverage denominator - array length alone would count nulls as data.
+    #>
+    param(
+        [AllowNull()][object[]]$Samples,
+        [Parameter(Mandatory = $true)][string]$ValueProperty
+    )
+
+    $count = 0
+    foreach ($sample in @($Samples)) {
+        $raw = Get-SafeObjectProperty -InputObject $sample -Name $ValueProperty
+        if ($null -eq $raw) { continue }
+        try {
+            $value = [double]$raw
+            if (-not ([double]::IsNaN($value) -or [double]::IsInfinity($value))) { $count++ }
+        }
+        catch { }
+    }
+    return $count
+}
+
+function Get-SustainedWindow {
+    <#
+      Finds the longest run of consecutive samples whose selected value meets
+      the threshold ANYWHERE in the series (including mid-run followed by
+      recovery). Only finite numeric readings count; a null/non-numeric reading
+      breaks the run. Returns the window (count, start/end timestamp, peak) or
+      $null. Pure and fixture-testable.
+    #>
+    param(
+        [AllowNull()][object[]]$Samples,
+        [string]$ValueProperty,
+        [AllowNull()][scriptblock]$ValueSelector,
+        [double]$Threshold,
+        [int]$MinimumConsecutive = 5,
+        [ValidateSet('ge', 'gt')][string]$Comparator = 'ge'
+    )
+
+    $best = $null
+    $run = 0
+    $runStart = $null
+    $runEnd = $null
+    $runPeak = $null
+    $sampleList = @($Samples)
+    for ($i = 0; $i -lt $sampleList.Count; $i++) {
+        $sample = $sampleList[$i]
+        $raw = $null
+        if ($null -ne $ValueSelector) {
+            try { $raw = & $ValueSelector $sample } catch { $raw = $null }
+        }
+        elseif (-not [string]::IsNullOrEmpty($ValueProperty)) {
+            $raw = Get-SafeObjectProperty -InputObject $sample -Name $ValueProperty
+        }
+        $value = 0.0
+        $isFinite = $false
+        if ($null -ne $raw) {
+            try {
+                $value = [double]$raw
+                $isFinite = -not ([double]::IsNaN($value) -or [double]::IsInfinity($value))
+            }
+            catch { $isFinite = $false }
+        }
+        $meets = $false
+        if ($isFinite) {
+            if ($Comparator -eq 'gt') { $meets = $value -gt $Threshold }
+            else { $meets = $value -ge $Threshold }
+        }
+        if ($meets) {
+            if ($run -eq 0) { $runStart = $i; $runPeak = $value }
+            $run++
+            $runEnd = $i
+            if ($value -gt $runPeak) { $runPeak = $value }
+            if ($run -ge $MinimumConsecutive -and ($null -eq $best -or $run -gt $best.Count)) {
+                $best = [pscustomobject]@{
+                    Count = $run
+                    StartIndex = $runStart
+                    EndIndex = $runEnd
+                    StartTimestampUtc = Get-SampleTimestamp -Sample $sampleList[$runStart]
+                    EndTimestampUtc = Get-SampleTimestamp -Sample $sampleList[$runEnd]
+                    Peak = $runPeak
+                }
+            }
+        }
+        else {
+            $run = 0
+            $runStart = $null
+            $runEnd = $null
+            $runPeak = $null
+        }
+    }
+    return $best
+}
+
+function Evaluate-Findings {
+    <#
+      Pure evaluation function over collected telemetry. Produces findings with
+      source artifact, metric, window, measured values, rule conditions,
+      uncertainty, next steps, and suggested WPR profile. Sustained evidence is
+      required and the qualifying run may occur ANYWHERE in the series (a burst
+      followed by recovery is found). Only finite readings count; nulls break a
+      streak. Coverage warnings report missing/insufficient CPU/disk/memory
+      data. Never reports unknown as healthy. No causal claims, no health score.
+    #>
+    param(
+        [object[]]$Samples,
+
+        [AllowNull()]
+        [object[]]$DiskSeries,
+
+        [AllowNull()]
+        [object]$VolumeMetrics,
+
+        [AllowNull()]
+        [object]$MemoryMetrics,
+
+        [AllowNull()]
+        [string]$WindowStart,
+
+        [AllowNull()]
+        [string]$WindowEnd
+    )
+
+    $findings = @()
+    $sustainedThreshold = 5
+    $sampleList = @($Samples)
+    $cpuValidCount = Get-FiniteNumericCount -Samples $sampleList -ValueProperty 'AverageCpuLoadPercent'
+
+    # ---- CPU: sustained >= 80% anywhere in the series ----
+    $cpuWindow = Get-SustainedWindow -Samples $sampleList -ValueProperty 'AverageCpuLoadPercent' -Threshold 80 -MinimumConsecutive $sustainedThreshold -Comparator 'ge'
+    if ($null -ne $cpuWindow) {
+        $findings += [pscustomobject]@{
+            category = 'cpu-pressure'
+            sourceArtifact = 'performance-samples.csv'
+            metric = 'AverageCpuLoadPercent'
+            windowStart = $cpuWindow.StartTimestampUtc
+            windowEnd = $cpuWindow.EndTimestampUtc
+            measuredValues = [ordered]@{
+                consecutiveSamplesAboveThreshold = $cpuWindow.Count
+                peakValue = $cpuWindow.Peak
+                validCpuReadings = $cpuValidCount
+                totalSamples = $sampleList.Count
+            }
+            ruleCondition = "AverageCpuLoadPercent >= 80% for $($cpuWindow.Count) consecutive samples"
+            uncertainty = 'CPU load does not identify the responsible process; correlation is not causation'
+            nextSteps = 'Collect a WPR CPU trace to identify the top CPU consumer during the cited window'
+            suggestedWprProfile = 'CPU'
+        }
+    }
+
+    if ($cpuValidCount -eq 0) {
+        $findings += [pscustomobject]@{
+            category = 'coverage'
+            sourceArtifact = 'performance-samples.csv'
+            metric = 'noSamples'
+            windowStart = $null
+            windowEnd = $null
+            measuredValues = [ordered]@{ validCpuReadings = 0; totalSamples = $sampleList.Count }
+            ruleCondition = 'No finite CPU readings collected'
+            uncertainty = 'Insufficient evidence - cannot assess CPU pressure'
+            nextSteps = 'Check for CIM/WMI errors and re-run collection'
+            suggestedWprProfile = $null
+        }
+    }
+    elseif ($cpuValidCount -lt 3) {
+        $findings += [pscustomobject]@{
+            category = 'coverage'
+            sourceArtifact = 'performance-samples.csv'
+            metric = 'insufficientSamples'
+            windowStart = $null
+            windowEnd = $null
+            measuredValues = [ordered]@{ validCpuReadings = $cpuValidCount; totalSamples = $sampleList.Count }
+            ruleCondition = 'Fewer than 3 finite CPU readings collected'
+            uncertainty = 'Findings based on insufficient data are unreliable'
+            nextSteps = 'Re-run collection with a longer duration or check for CIM errors'
+            suggestedWprProfile = $null
+        }
+    }
+
+    # ---- Memory: sustained commit pressure (per-sample series) ----
+    $commitWindow = Get-SustainedWindow -Samples $sampleList -ValueSelector {
+        param($sample)
+        $committed = Get-SafeObjectProperty -InputObject $sample -Name 'CommittedBytes'
+        $limit = Get-SafeObjectProperty -InputObject $sample -Name 'CommitLimitBytes'
+        if ($null -eq $committed -or $null -eq $limit) { return $null }
+        try {
+            $committedValue = [double]$committed
+            $limitValue = [double]$limit
+            if ($limitValue -le 0) { return $null }
+            return ($committedValue / $limitValue) * 100
+        }
+        catch { return $null }
+    } -Threshold 90 -MinimumConsecutive $sustainedThreshold -Comparator 'ge'
+
+    if ($null -ne $commitWindow) {
+        $peakCommitted = Get-SafeObjectProperty -InputObject $sampleList[$commitWindow.EndIndex] -Name 'CommittedBytes'
+        $peakLimit = Get-SafeObjectProperty -InputObject $sampleList[$commitWindow.EndIndex] -Name 'CommitLimitBytes'
+        $findings += [pscustomobject]@{
+            category = 'memory-pressure'
+            sourceArtifact = 'performance-samples.csv'
+            metric = 'CommittedBytes'
+            windowStart = $commitWindow.StartTimestampUtc
+            windowEnd = $commitWindow.EndTimestampUtc
+            measuredValues = [ordered]@{
+                consecutiveSamplesAtOrAbove90Percent = $commitWindow.Count
+                peakCommitPercent = $commitWindow.Peak
+                committedBytesAtPeak = $peakCommitted
+                commitLimitBytesAtPeak = $peakLimit
+            }
+            ruleCondition = "Committed bytes at or above 90% of the commit limit for $($commitWindow.Count) consecutive samples"
+            uncertainty = 'High commit charge does not alone cause disk thrashing; paging depends on available physical memory and working set'
+            nextSteps = 'Check the paging indicator finding; if elevated, collect a WPR GeneralProfile trace covering the cited window'
+            suggestedWprProfile = 'GeneralProfile'
+        }
+    }
+
+    # ---- Memory: sustained paging input (pages read to resolve hard faults) ----
+    $pagingWindow = Get-SustainedWindow -Samples $sampleList -ValueProperty 'PagesInputPerSec' -Threshold 100 -MinimumConsecutive $sustainedThreshold -Comparator 'gt'
+    if ($null -ne $pagingWindow) {
+        $findings += [pscustomobject]@{
+            category = 'memory-paging'
+            sourceArtifact = 'performance-samples.csv'
+            metric = 'PagesInputPerSec'
+            windowStart = $pagingWindow.StartTimestampUtc
+            windowEnd = $pagingWindow.EndTimestampUtc
+            measuredValues = [ordered]@{
+                consecutiveSamplesAbove100 = $pagingWindow.Count
+                peakPagesInputPerSec = $pagingWindow.Peak
+            }
+            ruleCondition = "PagesInputPersec > 100 for $($pagingWindow.Count) consecutive samples"
+            uncertainty = 'PagesInputPersec counts pages read to resolve hard page faults (a paging volume indicator, not an exact hard-fault count) and does not identify the responsible process'
+            nextSteps = 'Collect a WPR GeneralProfile trace covering the cited window to identify the process with the largest working-set change'
+            suggestedWprProfile = 'GeneralProfile'
+        }
+    }
+
+    $pagingValidCount = Get-FiniteNumericCount -Samples $sampleList -ValueProperty 'PagesInputPerSec'
+    if ($pagingValidCount -eq 0) {
+        $findings += [pscustomobject]@{
+            category = 'coverage'
+            sourceArtifact = 'performance-samples.csv'
+            metric = 'pagesInputPerSec'
+            windowStart = $null
+            windowEnd = $null
+            measuredValues = [ordered]@{
+                pagesInputPerSec = $null
+                pageFaultsPerSec = if ($MemoryMetrics) { $MemoryMetrics.pageFaultsPerSec } else { $null }
+            }
+            ruleCondition = 'PagesInputPersec unavailable; cannot determine the hard page fault paging rate'
+            uncertainty = 'PageFaultsPerSec includes soft faults; the hard-fault paging rate is unknown'
+            nextSteps = 'Verify elevation or re-run with administrator privileges for complete memory counters'
+            suggestedWprProfile = $null
+        }
+    }
+
+    # ---- Disk: sustained queue depth / latency per disk, from the in-window series ----
+    $diskRows = @()
+    if ($null -ne $DiskSeries) { $diskRows = @($DiskSeries) }
+    if ($diskRows.Count -gt 0) {
+        $diskNames = @($diskRows | ForEach-Object { Get-SafeObjectProperty -InputObject $_ -Name 'Name' } | Where-Object { $null -ne $_ -and "$_" -ne '' } | Select-Object -Unique)
+        foreach ($diskName in $diskNames) {
+            $rows = @($diskRows | Where-Object { (Get-SafeObjectProperty -InputObject $_ -Name 'Name') -eq $diskName })
+            $queueWindow = Get-SustainedWindow -Samples $rows -ValueProperty 'CurrentQueueLength' -Threshold 2 -MinimumConsecutive $sustainedThreshold -Comparator 'ge'
+            if ($null -ne $queueWindow) {
+                $findings += [pscustomobject]@{
+                    category = 'disk-pressure'
+                    sourceArtifact = 'disk-samples.json'
+                    metric = 'CurrentQueueLength'
+                    windowStart = $queueWindow.StartTimestampUtc
+                    windowEnd = $queueWindow.EndTimestampUtc
+                    measuredValues = [ordered]@{
+                        disk = $diskName
+                        consecutiveSamplesAtOrAbove2 = $queueWindow.Count
+                        peakQueueLength = $queueWindow.Peak
+                    }
+                    ruleCondition = "CurrentDiskQueueLength >= 2 on $diskName for $($queueWindow.Count) consecutive intervals"
+                    uncertainty = 'Disk queue depth indicates I/O contention; process attribution requires a disk I/O trace'
+                    nextSteps = 'Collect a WPR DiskIO trace covering the cited window to identify the process generating I/O'
+                    suggestedWprProfile = 'DiskIO'
+                }
+            }
+            $latencyWindow = Get-SustainedWindow -Samples $rows -ValueProperty 'ReadLatencySeconds' -Threshold 0.02 -MinimumConsecutive $sustainedThreshold -Comparator 'ge'
+            if ($null -ne $latencyWindow) {
+                $findings += [pscustomobject]@{
+                    category = 'disk-latency'
+                    sourceArtifact = 'disk-samples.json'
+                    metric = 'ReadLatencySeconds'
+                    windowStart = $latencyWindow.StartTimestampUtc
+                    windowEnd = $latencyWindow.EndTimestampUtc
+                    measuredValues = [ordered]@{
+                        disk = $diskName
+                        consecutiveSamplesAtOrAbove20ms = $latencyWindow.Count
+                        peakReadLatencySeconds = $latencyWindow.Peak
+                    }
+                    ruleCondition = "Read latency >= 20 ms on $diskName for $($latencyWindow.Count) consecutive intervals"
+                    uncertainty = 'Latency is derived from paired raw disk counters; it does not identify the requesting process'
+                    nextSteps = 'Collect a WPR DiskIO trace covering the cited window'
+                    suggestedWprProfile = 'DiskIO'
+                }
+            }
+        }
+    }
+    else {
+        $findings += [pscustomobject]@{
+            category = 'coverage'
+            sourceArtifact = 'disk-samples.json'
+            metric = 'diskSeriesUnavailable'
+            windowStart = $null
+            windowEnd = $null
+            measuredValues = [ordered]@{ intervalCount = 0 }
+            ruleCondition = 'No paired raw disk counter intervals were collected'
+            uncertainty = 'Cannot assess sustained disk contention'
+            nextSteps = 'Run as Administrator to enable disk performance counters and re-run collection'
+            suggestedWprProfile = $null
+        }
+    }
+
+    # ---- Volume: low free space (state captured inside the window) ----
+    if ($null -ne $VolumeMetrics) {
+        foreach ($volume in @($VolumeMetrics)) {
+            $percentFree = Get-SafeObjectProperty -InputObject $volume -Name 'PercentFree'
+            if ($null -eq $percentFree) {
+                $findings += [pscustomobject]@{
+                    category = 'coverage'
+                    sourceArtifact = 'volume-metrics.json'
+                    metric = 'volumeFreeSpaceUnavailable'
+                    windowStart = $null
+                    windowEnd = $null
+                    measuredValues = [ordered]@{ driveLetter = Get-SafeObjectProperty -InputObject $volume -Name 'DriveLetter' }
+                    ruleCondition = 'Free space or capacity unavailable for this volume'
+                    uncertainty = 'Cannot assess free space on this volume'
+                    nextSteps = 'Verify CIM access or run as Administrator'
+                    suggestedWprProfile = $null
+                }
+                continue
+            }
+            try { $percentValue = [double]$percentFree } catch { continue }
+            if ($percentValue -lt 10) {
+                $findings += [pscustomobject]@{
+                    category = 'disk-space'
+                    sourceArtifact = 'volume-metrics.json'
+                    metric = 'PercentFree'
+                    windowStart = $WindowStart
+                    windowEnd = $WindowEnd
+                    measuredValues = [ordered]@{
+                        driveLetter = Get-SafeObjectProperty -InputObject $volume -Name 'DriveLetter'
+                        percentFree = $percentValue
+                        freeSpaceBytes = Get-SafeObjectProperty -InputObject $volume -Name 'FreeSpaceBytes'
+                        capacityBytes = Get-SafeObjectProperty -InputObject $volume -Name 'CapacityBytes'
+                    }
+                    ruleCondition = "Free space below 10% on $(Get-SafeObjectProperty -InputObject $volume -Name 'DriveLetter')"
+                    uncertainty = 'Low free space can degrade performance but does not alone cause slowness'
+                    nextSteps = 'Review large files and consider volume cleanup'
+                    suggestedWprProfile = $null
+                }
+            }
+        }
+    }
+    else {
+        $findings += [pscustomobject]@{
+            category = 'coverage'
+            sourceArtifact = 'volume-metrics.json'
+            metric = 'volumeMetricsUnavailable'
+            windowStart = $null
+            windowEnd = $null
+            measuredValues = [ordered]@{ available = $false }
+            ruleCondition = 'Volume metrics unavailable'
+            uncertainty = 'Cannot assess disk space'
+            nextSteps = 'Verify CIM access or run as Administrator'
+            suggestedWprProfile = $null
+        }
+    }
+
+    if ($null -eq $MemoryMetrics) {
+        $findings += [pscustomobject]@{
+            category = 'coverage'
+            sourceArtifact = 'performance-samples.csv'
+            metric = 'memoryMetricsUnavailable'
+            windowStart = $null
+            windowEnd = $null
+            measuredValues = [ordered]@{ available = $false }
+            ruleCondition = 'Memory performance counters unavailable'
+            uncertainty = 'Cannot assess memory pressure or paging'
+            nextSteps = 'Run as Administrator to enable memory performance counters'
+            suggestedWprProfile = $null
+        }
+    }
+
+    return $findings
+}
+
+function ConvertTo-FindingsHtml {
+    <#
+      Generate a standalone offline report.html from findings and manifest data.
+      No external assets/scripts, no traversal links, all text HTML-encoded.
+      Uses [System.Net.WebUtility]::HtmlEncode for PS 5.1 compatibility.
+    #>
+    param(
+        [object[]]$Findings,
+
+        [AllowNull()]
+        [object]$Manifest,
+
+        [AllowNull()]
+        [string]$SymptomContext
+    )
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<!DOCTYPE html>')
+    [void]$sb.AppendLine('<html lang="en">')
+    [void]$sb.AppendLine('<head>')
+    [void]$sb.AppendLine('<meta charset="utf-8">')
+    [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
+    [void]$sb.AppendLine('<title>Windows Performance Diagnostics Report</title>')
+    [void]$sb.AppendLine('<style>')
+    [void]$sb.AppendLine('body{font-family:system-ui,sans-serif;margin:2em;color:#222;line-height:1.5}')
+    [void]$sb.AppendLine('h1,h2,h3{margin-top:1.2em}')
+    [void]$sb.AppendLine('table{border-collapse:collapse;width:100%;margin:1em 0}')
+    [void]$sb.AppendLine('th,td{border:1px solid #ccc;padding:.5em;text-align:left}')
+    [void]$sb.AppendLine('th{background:#f5f5f5}')
+    [void]$sb.AppendLine('.finding{border:1px solid #ddd;padding:1em;margin:1em 0;border-radius:4px}')
+    [void]$sb.AppendLine('.warning{background:#fff3cd;border-color:#ffc107}')
+    [void]$sb.AppendLine('.coverage{background:#e2e3e5;border-color:#6c757d}')
+    [void]$sb.AppendLine('.pressure{background:#f8d7da;border-color:#dc3545}')
+    [void]$sb.AppendLine('.info{background:#d1ecf1;border-color:#17a2b8}')
+    [void]$sb.AppendLine('a{color:#0066cc}')
+    [void]$sb.AppendLine('.no-external{font-size:.85em;color:#666}')
+    [void]$sb.AppendLine('</style>')
+    [void]$sb.AppendLine('</head>')
+    [void]$sb.AppendLine('<body>')
+
+    [void]$sb.AppendLine('<h1>Windows Performance Diagnostics Report</h1>')
+
+    if ($Manifest) {
+        [void]$sb.AppendLine('<h2>Collection Summary</h2>')
+        [void]$sb.AppendLine('<table>')
+        [void]$sb.AppendLine("<tr><th>Tool Version</th><td>$(ConvertTo-HtmlEncoded (Get-CaseJsonProperty -InputObject $Manifest -Name 'toolVersion'))</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Schema Version</th><td>$(ConvertTo-HtmlEncoded (Get-CaseJsonProperty -InputObject $Manifest -Name 'schemaVersion'))</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Collection Window</th><td>$(ConvertTo-HtmlEncoded (Get-CaseJsonProperty -InputObject $Manifest -Name 'startedAtUtc')) to $(ConvertTo-HtmlEncoded (Get-CaseJsonProperty -InputObject $Manifest -Name 'completedAtUtc'))</td></tr>")
+        $scopeValue = Get-CaseJsonProperty -InputObject $Manifest -Name 'scope'
+        if ($null -ne $scopeValue) {
+            $durationValue = Get-CaseJsonProperty -InputObject $scopeValue -Name 'durationSeconds'
+            if ($null -ne $durationValue) {
+                [void]$sb.AppendLine("<tr><th>Duration</th><td>$(ConvertTo-HtmlEncoded $durationValue) seconds</td></tr>")
+            }
+        }
+        [void]$sb.AppendLine('</table>')
+    }
+
+    if ($SymptomContext) {
+        [void]$sb.AppendLine('<h2>Reported Symptom</h2>')
+        [void]$sb.AppendLine("<p>$(ConvertTo-HtmlEncoded $SymptomContext)</p>")
+    }
+    $manifestSymptom = if ($Manifest) { Get-CaseJsonProperty -InputObject $Manifest -Name 'symptom' } else { $null }
+    if ($null -ne $manifestSymptom) {
+        $presetValue = Get-CaseJsonProperty -InputObject $manifestSymptom -Name 'preset'
+        if ($null -ne $presetValue -and "$presetValue" -ne '') {
+            [void]$sb.AppendLine("<p>Collection preset: $(ConvertTo-HtmlEncoded $presetValue)</p>")
+        }
+    }
+
+    # Separate findings by category
+    $pressureFindings = @($Findings | Where-Object { $_.category -match 'pressure|paging|disk' })
+    $coverageFindings = @($Findings | Where-Object { $_.category -eq 'coverage' })
+
+    if ($pressureFindings.Count -gt 0) {
+        [void]$sb.AppendLine('<h2>Observed Pressure</h2>')
+        [void]$sb.AppendLine('<p class="no-external">These findings describe measured system pressure. Correlation is not causation.</p>')
+        foreach ($finding in $pressureFindings) {
+            $cssClass = 'finding pressure'
+            [void]$sb.AppendLine("<div class='$cssClass'>")
+            [void]$sb.AppendLine("<h3>$(ConvertTo-HtmlEncoded $finding.category)</h3>")
+            [void]$sb.AppendLine("<table>")
+            [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Metric</th><td>$(ConvertTo-HtmlEncoded $finding.metric)</td></tr>")
+            if ($finding.windowStart) {
+                [void]$sb.AppendLine("<tr><th>Window</th><td>$(ConvertTo-HtmlEncoded $finding.windowStart) to $(ConvertTo-HtmlEncoded $finding.windowEnd)</td></tr>")
+            }
+            [void]$sb.AppendLine("<tr><th>Rule</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
+            if ($finding.suggestedWprProfile) {
+                [void]$sb.AppendLine("<tr><th>Suggested WPR Profile</th><td>$(ConvertTo-HtmlEncoded $finding.suggestedWprProfile)</td></tr>")
+            }
+            [void]$sb.AppendLine('</table>')
+            [void]$sb.AppendLine('</div>')
+        }
+    }
+
+    if ($coverageFindings.Count -gt 0) {
+        [void]$sb.AppendLine('<h2>Coverage Warnings</h2>')
+        [void]$sb.AppendLine('<p class="no-external">The following data sources were unavailable or had insufficient samples. Unknown does not mean healthy.</p>')
+        foreach ($finding in $coverageFindings) {
+            $cssClass = 'finding coverage'
+            [void]$sb.AppendLine("<div class='$cssClass'>")
+            [void]$sb.AppendLine("<h3>$(ConvertTo-HtmlEncoded $finding.metric)</h3>")
+            [void]$sb.AppendLine("<table>")
+            [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Condition</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
+            [void]$sb.AppendLine('</table>')
+            [void]$sb.AppendLine('</div>')
+        }
+    }
+
+    if ($pressureFindings.Count -eq 0 -and $coverageFindings.Count -eq 0) {
+        # Every source was usable and no sustained rule threshold was breached.
+        # That is a completed measurement with a clear result, not missing
+        # evidence - 'Insufficient Evidence' is reserved for the coverage
+        # section above, so an operator can tell 'nothing sustained' apart from
+        # 'we could not measure this'.
+        [void]$sb.AppendLine('<div class="finding info">')
+        [void]$sb.AppendLine('<h3>No Sustained Pressure Detected</h3>')
+        [void]$sb.AppendLine('<p>The collected window was measured and no pressure rule was breached for a sustained period. This does not prove the system is healthy - a short or intermittent slowdown can fall outside the sampled window. did not trigger any pressure rules. Consider re-running with a longer duration or different WPR profile.</p>')
+        [void]$sb.AppendLine('</div>')
+    }
+
+    # Artifacts list. Every interpolated field is HTML-encoded, including
+    # SizeBytes (a remote manifest is not trusted to constrain it). Links are
+    # fixed relative names that have already been validated by the caller.
+    $manifestArtifacts = if ($Manifest) { Get-CaseJsonProperty -InputObject $Manifest -Name 'artifacts' } else { $null }
+    if ($null -ne $manifestArtifacts -and @($manifestArtifacts).Count -gt 0) {
+        [void]$sb.AppendLine('<h2>Collected Artifacts</h2>')
+        [void]$sb.AppendLine('<p class="no-external">Links are relative to this report. report.html is hashed in diagnostic-manifest.json but is omitted from this index because a report cannot contain its own hash; diagnostic-manifest.json is the manifest, not an artifact.</p>')
+        [void]$sb.AppendLine('<table>')
+        [void]$sb.AppendLine('<tr><th>Name</th><th>Size (bytes)</th><th>SHA-256</th></tr>')
+        foreach ($artifact in @($manifestArtifacts)) {
+            $nameValue = [string]$artifact.Name
+            $safeName = ConvertTo-HtmlEncoded $nameValue
+            $safeSize = ConvertTo-HtmlEncoded ([string]$artifact.SizeBytes)
+            $safeHash = ConvertTo-HtmlEncoded ([string]$artifact.Sha256)
+            $linkValue = ConvertTo-HtmlEncoded ($nameValue.Replace('\', '/'))
+            [void]$sb.AppendLine("<tr><td><a href=`"$linkValue`">$safeName</a></td><td>$safeSize</td><td><code>$safeHash</code></td></tr>")
+        }
+        [void]$sb.AppendLine('</table>')
+    }
+
+    [void]$sb.AppendLine('<footer class="no-external">Generated by Windows Performance Diagnostics Toolkit. No external assets or scripts.</footer>')
+    [void]$sb.AppendLine('</body>')
+    [void]$sb.AppendLine('</html>')
+
+    return $sb.ToString()
+}
+
+function Write-CollectionOutputs {
+    <#
+      Shared Collect tail (local and fixture-testable): generate findings.json,
+      then build the manifest artifact index, then generate report.html against
+      that index, then recompute the index so report.html is hashed too, then
+      write the manifest. The report is deliberately generated before its own
+      hash exists (a file cannot contain its own SHA-256); report.html is still
+      registered in the final manifest and therefore in the case package and
+      Verify. Returns the updated manifest object.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+
+        [Parameter(Mandatory = $true)][object]$CollectionManifest,
+
+        [Parameter(Mandatory = $true)][System.Collections.ArrayList]$CollectedArtifacts,
+
+        [object[]]$Samples = @(),
+
+        [AllowNull()][object[]]$DiskSeries,
+
+        [AllowNull()][object]$VolumeMetrics,
+
+        [AllowNull()][object]$MemoryMetrics,
+
+        [AllowNull()][string]$SymptomContext
+    )
+
+    $windowStart = Get-CaseJsonProperty -InputObject $CollectionManifest -Name 'startedAtUtc'
+    $windowEnd = Get-CaseJsonProperty -InputObject $CollectionManifest -Name 'completedAtUtc'
+
+    # Disk interval series (raw paired counters) and volume state are evidence:
+    # write and register them here so the shared tail - not the Windows-only
+    # loop - owns artifact registration and the fixture test covers it.
+    try {
+        $diskSeriesOutput = @()
+        if ($null -ne $DiskSeries) { $diskSeriesOutput = @($DiskSeries) }
+        Write-JsonFile -InputObject $diskSeriesOutput -Path (Join-Path -Path $OutputDirectory -ChildPath 'disk-samples.json')
+        if (-not $CollectedArtifacts.Contains('disk-samples.json')) { [void]$CollectedArtifacts.Add('disk-samples.json') }
+    }
+    catch {
+        Add-CollectionError -Stage 'disk-series-export' -ErrorRecord $_
+    }
+
+    try {
+        # Always emit the artifact (empty array when unavailable) so coverage
+        # findings never cite a source artifact that does not exist.
+        $volumeOutput = @()
+        if ($null -ne $VolumeMetrics) { $volumeOutput = @($VolumeMetrics) }
+        Write-JsonFile -InputObject $volumeOutput -Path (Join-Path -Path $OutputDirectory -ChildPath 'volume-metrics.json')
+        if (-not $CollectedArtifacts.Contains('volume-metrics.json')) { [void]$CollectedArtifacts.Add('volume-metrics.json') }
+    }
+    catch {
+        Add-CollectionError -Stage 'volume-metrics-export' -ErrorRecord $_
+    }
+
+    $findingsList = @()
+    try {
+        $findingsList = @(Evaluate-Findings -Samples $Samples -DiskSeries $DiskSeries -VolumeMetrics $VolumeMetrics -MemoryMetrics $MemoryMetrics -WindowStart $windowStart -WindowEnd $windowEnd)
+        Write-JsonFile -InputObject $findingsList -Path (Join-Path -Path $OutputDirectory -ChildPath 'findings.json')
+        if (-not $CollectedArtifacts.Contains('findings.json')) { [void]$CollectedArtifacts.Add('findings.json') }
+    }
+    catch {
+        Add-CollectionError -Stage 'findings-generation' -ErrorRecord $_
+    }
+
+    # Index BEFORE report generation: excludes report.html (self-hash impossible).
+    $CollectionManifest.artifacts = Get-ArtifactMetadata -Directory $OutputDirectory -Names @($CollectedArtifacts)
+
+    try {
+        $reportHtml = ConvertTo-FindingsHtml -Findings $findingsList -Manifest $CollectionManifest -SymptomContext $SymptomContext
+        [System.IO.File]::WriteAllText((Join-Path -Path $OutputDirectory -ChildPath 'report.html'), $reportHtml, (New-Object System.Text.UTF8Encoding($false)))
+        if (-not $CollectedArtifacts.Contains('report.html')) { [void]$CollectedArtifacts.Add('report.html') }
+    }
+    catch {
+        Add-CollectionError -Stage 'report-generation' -ErrorRecord $_
+    }
+
+    # Final index includes report.html so Verify/package/remote pull cover it.
+    $CollectionManifest.artifacts = Get-ArtifactMetadata -Directory $OutputDirectory -Names @($CollectedArtifacts)
+
+    Write-JsonFile -InputObject $CollectionManifest -Path (Join-Path -Path $OutputDirectory -ChildPath 'diagnostic-manifest.json')
+    return $CollectionManifest
+}
+
 try {
     $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 }
@@ -1275,7 +2454,7 @@ catch {
 }
 
 $planManifest = [ordered]@{
-    schemaVersion = '1.0'
+    schemaVersion = if ($SymptomContext) { '1.1' } else { '1.0' }
     toolName = 'Windows Performance Diagnostics Toolkit'
     toolVersion = $ScriptVersion
     mode = 'Plan'
@@ -1376,6 +2555,17 @@ if ($RemoteComputer) {
     }
 }
 
+if ($SymptomContext -or $Preset) {
+    $symptomBlock = [ordered]@{
+        collectionWindow = [ordered]@{
+            requestedAtUtc = Get-UtcTimestamp
+        }
+    }
+    if ($SymptomContext) { $symptomBlock.reported = $SymptomContext }
+    if ($Preset) { $symptomBlock.preset = $Preset }
+    $planManifest.symptom = $symptomBlock
+}
+
 if ($Mode -eq 'Plan') {
     try {
         New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
@@ -1426,24 +2616,7 @@ catch {
     throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
 }
 
-$collectionErrors = @()
-function Add-CollectionError {
-    param([string]$Stage, [System.Management.Automation.ErrorRecord]$ErrorRecord)
-
-    $script:collectionErrors += [pscustomobject]@{
-        Stage = $Stage
-        Message = $ErrorRecord.Exception.Message
-    }
-}
-
-function Add-CollectionErrorText {
-    param([string]$Stage, [string]$Message)
-
-    $script:collectionErrors += [pscustomobject]@{
-        Stage = $Stage
-        Message = $Message
-    }
-}
+$script:collectionErrors = New-Object System.Collections.ArrayList
 
 if ($RemoteComputer) {
     # ---- Remote collection over WinRM (remote-exec, pull-back, verified) ----
@@ -1506,6 +2679,12 @@ if ($RemoteComputer) {
             ConfirmLocalCollection = $true
             OutputDirectory = $remoteOutDir
             DurationSeconds = $DurationSeconds
+        }
+        if ($SymptomContext) {
+            $remoteParams.SymptomContext = $SymptomContext
+        }
+        if ($Preset) {
+            $remoteParams.Preset = $Preset
         }
         if ($CaptureWpr) {
             $remoteParams.CaptureWpr = $true
@@ -1676,31 +2855,93 @@ catch {
     Add-CollectionError -Stage 'system-summary' -ErrorRecord $_
 }
 
-$samples = @()
+# Logical processor count: when unknown the per-process CPU percentage is
+# reported as 'unknown' rather than normalizing against a guessed count.
+$logicalProcessorCount = $null
+try {
+    $procInfo = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue
+    if ($procInfo) {
+        $logicalSum = @($procInfo | ForEach-Object { Get-SafeObjectProperty -InputObject $_ -Name 'NumberOfLogicalProcessors' } | Where-Object { $null -ne $_ } | Measure-Object -Sum).Sum
+        if ($null -ne $logicalSum -and [int]$logicalSum -ge 1) { $logicalProcessorCount = [int]$logicalSum }
+    }
+}
+catch { }
+if ($null -eq $logicalProcessorCount) {
+    Add-CollectionErrorText -Stage 'logical-processor-count' -Message 'Logical processor count unavailable; per-process CPU percentages are reported as unknown.'
+}
+
+# Monotonic stopwatch brackets the two CPU snapshots so the CPU-delta window
+# matches the elapsed denominator exactly. It is stopped only after the end
+# enumeration (see the process-snapshot stage below): stopping it before that
+# would exclude CPU accrued during CSV export / summary polls from the
+# denominator while the numerator delta still included it.
+$cpuStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$processStartSnapshots = New-ProcessCpuSnapshot -Processes @(Get-Process -ErrorAction SilentlyContinue)
+
+$samples = New-Object System.Collections.ArrayList
+$diskSeries = New-Object System.Collections.ArrayList
+$volumeMetrics = $null
+$previousDiskRaw = $null
+$diskSourceError = $null
 $consecutiveSampleFailures = 0
 for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
     try {
         $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
         $processors = Get-CimInstance -ClassName Win32_Processor
         $logicalDisks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 3"
-        $cpuLoads = @($processors | ForEach-Object { $_.LoadPercentage } | Where-Object { $null -ne $_ })
+        $sampleTimestamp = Get-UtcTimestamp
+        $cpuLoads = @($processors | ForEach-Object { Get-SafeObjectProperty -InputObject $_ -Name 'LoadPercentage' } | Where-Object { $null -ne $_ })
         $averageCpuLoad = $null
         if ($cpuLoads.Count -gt 0) {
             $averageCpuLoad = [Math]::Round((($cpuLoads | Measure-Object -Average).Average), 2)
         }
-        $samples += [pscustomobject]@{
-            TimestampUtc = Get-UtcTimestamp
-            AverageCpuLoadPercent = $averageCpuLoad
-            AvailableMemoryMB = [Math]::Round(($operatingSystem.FreePhysicalMemory / 1024), 2)
-            TotalLogicalDiskFreeGB = [Math]::Round((($logicalDisks | Measure-Object -Property FreeSpace -Sum).Sum / 1GB), 2)
+
+        $memMetrics = Get-MemoryMetrics
+
+        # Per-volume free space captured inside the sample window (first sample).
+        if ($null -eq $volumeMetrics) {
+            $volumeMetrics = Get-VolumeMetrics
         }
+
+        # Raw disk counters sampled inside the window; derived metrics need a
+        # baseline interval, so the first sample only establishes the baseline.
+        $rawDisk = Get-RawDiskMetrics
+        if ($null -ne $rawDisk.Error) { $diskSourceError = $rawDisk.Error }
+        if ($null -ne $previousDiskRaw -and $null -ne $rawDisk.Disks) {
+            foreach ($deltaRow in @(Get-DiskCounterDeltas -Previous $previousDiskRaw -Current $rawDisk.Disks -TimestampUtc $sampleTimestamp)) {
+                [void]$diskSeries.Add($deltaRow)
+            }
+        }
+        if ($null -ne $rawDisk.Disks) { $previousDiskRaw = $rawDisk.Disks }
+
+        $availableMemoryMB = $null
+        if ($null -ne $operatingSystem.FreePhysicalMemory) {
+            $availableMemoryMB = [Math]::Round(([double]$operatingSystem.FreePhysicalMemory / 1024), 2)
+        }
+        $totalLogicalDiskFreeGB = $null
+        $freeSpaceMeasure = $logicalDisks | Where-Object { $null -ne (Get-SafeObjectProperty -InputObject $_ -Name 'FreeSpace') } | Measure-Object -Property FreeSpace -Sum
+        if ($null -ne $freeSpaceMeasure -and $freeSpaceMeasure.Count -gt 0) {
+            $totalLogicalDiskFreeGB = [Math]::Round(([double]$freeSpaceMeasure.Sum / 1GB), 2)
+        }
+
+        [void]$samples.Add([pscustomobject]@{
+            TimestampUtc = $sampleTimestamp
+            AverageCpuLoadPercent = $averageCpuLoad
+            AvailableMemoryMB = $availableMemoryMB
+            TotalLogicalDiskFreeGB = $totalLogicalDiskFreeGB
+            CommittedBytes = if ($memMetrics) { $memMetrics.committedBytes } else { $null }
+            CommitLimitBytes = if ($memMetrics) { $memMetrics.commitLimitBytes } else { $null }
+            AvailableBytes = if ($memMetrics) { $memMetrics.availableBytes } else { $null }
+            PageFaultsPerSec = if ($memMetrics) { $memMetrics.pageFaultsPerSec } else { $null }
+            PageReadsPerSec = if ($memMetrics) { $memMetrics.pageReadsPerSec } else { $null }
+            PagesInputPerSec = if ($memMetrics) { $memMetrics.pagesInputPerSec } else { $null }
+            PagesOutputPerSec = if ($memMetrics) { $memMetrics.pagesOutputPerSec } else { $null }
+        })
         $consecutiveSampleFailures = 0
     }
     catch {
         Add-CollectionError -Stage 'performance-sample' -ErrorRecord $_
         $consecutiveSampleFailures++
-        # one transient CIM failure must not empty the whole CSV; give up only
-        # after several consecutive failures
         if ($consecutiveSampleFailures -ge 3) {
             break
         }
@@ -1711,6 +2952,14 @@ for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
     }
 }
 
+$completedAtSamplingUtc = Get-UtcTimestamp
+
+# Formatted summary counters (manifest convenience only; findings use the series).
+$diskMetrics = Get-DiskMetrics
+if ($null -ne $diskSourceError) {
+    Add-CollectionErrorText -Stage 'disk-metrics' -Message "Win32_PerfRawData_PerfDisk_PhysicalDisk unavailable: $diskSourceError"
+}
+
 try {
     $samples | Export-Csv -LiteralPath (Join-Path -Path $resolvedOutputDirectory -ChildPath 'performance-samples.csv') -NoTypeInformation -Encoding UTF8
     [void]$collectedArtifacts.Add('performance-samples.csv')
@@ -1719,23 +2968,18 @@ catch {
     Add-CollectionError -Stage 'performance-export' -ErrorRecord $_
 }
 
+# disk-samples.json / volume-metrics.json are written and registered by the
+# shared Write-CollectionOutputs tail (exercised by the fixture regression).
+
 try {
-    # CPU access can throw for individual processes (observed on Windows Server
-    # VMs: 'Exception getting "CPU": The property TotalSeconds cannot be found'),
-    # which previously aborted the whole snapshot. Guard per process and drop
-    # processes without a comparable CPU value before sorting.
-    $processes = @(Get-Process -ErrorAction SilentlyContinue) | ForEach-Object {
-        $cpu = $null
-        try { $cpu = $_.CPU } catch { }
-        [pscustomobject]@{
-            ProcessName = $_.ProcessName
-            Id = $_.Id
-            CPU = $cpu
-            WorkingSet64 = $_.WorkingSet64
-            Handles = $_.Handles
-            Path = $_.Path
-        }
-    } | Where-Object { $null -ne $_.CPU } | Sort-Object -Property CPU -Descending | Select-Object -First 20
+    $processEnds = @(Get-Process -ErrorAction SilentlyContinue)
+    # Capture elapsed and stop here so the numerator (CPU delta between the two
+    # snapshots) and the denominator (this stopwatch) cover the same interval.
+    $cpuElapsedSeconds = $cpuStopwatch.Elapsed.TotalSeconds
+    $cpuStopwatch.Stop()
+    $processes = @(Compare-ProcessCpuSnapshots -StartSnapshots $processStartSnapshots -EndProcesses $processEnds -ElapsedSeconds $cpuElapsedSeconds -LogicalProcessors $logicalProcessorCount) |
+        Sort-Object -Property { if ($_.ProcessCpuPercent -ne 'unknown') { [double]$_.ProcessCpuPercent } else { -1 } } -Descending |
+        Select-Object -First 20
     Write-JsonFile -InputObject $processes -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'top-processes.json')
     [void]$collectedArtifacts.Add('top-processes.json')
 }
@@ -2043,7 +3287,7 @@ if ($CaptureDefender) {
 
 $completedAtUtc = Get-UtcTimestamp
 $collectionManifest = [ordered]@{
-    schemaVersion = '1.0'
+    schemaVersion = if ($SymptomContext) { '1.1' } else { '1.0' }
     toolName = 'Windows Performance Diagnostics Toolkit'
     toolVersion = $ScriptVersion
     mode = 'Collect'
@@ -2079,7 +3323,7 @@ $collectionManifest = [ordered]@{
         sectionErrorCount = $networkSectionErrorCount
     }
     collectionErrors = $collectionErrors
-    artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
+    artifacts = @()
 }
 
 if ($systemLogInfo -and $safeEvents) {
@@ -2159,8 +3403,52 @@ if ($CollectBootFailureLogs) {
     }
 }
 
+if ($diskMetrics) {
+    $collectionManifest.diskMetrics = $diskMetrics
+}
+
+if ($volumeMetrics) {
+    $collectionManifest.volumeMetrics = $volumeMetrics
+}
+
+$finalMemMetrics = Get-MemoryMetrics
+if ($finalMemMetrics) {
+    $memErrors = $finalMemMetrics._errors
+    $finalMemMetrics.Remove('_errors')
+    $collectionManifest.memoryMetrics = $finalMemMetrics
+    foreach ($memErr in $memErrors) {
+        Add-CollectionErrorText -Stage 'memory-metrics' -Message $memErr
+    }
+}
+
+# Symptom context is recorded whenever either the free text or the preset is
+# supplied - a preset-only run must not silently drop the preset.
+if ($SymptomContext -or $Preset) {
+    $collectionManifest.symptom = [ordered]@{
+        collectionWindow = [ordered]@{
+            requestedAtUtc = Get-UtcTimestamp
+            startedAtUtc = $startedAtUtc
+            completedAtUtc = $completedAtUtc
+        }
+    }
+    if ($SymptomContext) { $collectionManifest.symptom.reported = $SymptomContext }
+    if ($Preset) { $collectionManifest.symptom.preset = $Preset }
+}
+
+# Generate findings.json/report.html, hash ALL evidence into the manifest, then
+# package. Write-CollectionOutputs is the same function exercised by the
+# fixture-driven Collect-tail regression test.
+$collectionManifest = Write-CollectionOutputs `
+    -OutputDirectory $resolvedOutputDirectory `
+    -CollectionManifest $collectionManifest `
+    -CollectedArtifacts $collectedArtifacts `
+    -Samples @($samples) `
+    -DiskSeries @($diskSeries) `
+    -VolumeMetrics $volumeMetrics `
+    -MemoryMetrics $finalMemMetrics `
+    -SymptomContext $SymptomContext
+
 $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
-Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"
 
 if ($ZipOutput) {

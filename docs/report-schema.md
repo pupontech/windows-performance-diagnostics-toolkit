@@ -13,10 +13,14 @@ document defines the contract for those JSON files and their companion artifacts
 | `diagnostic-plan.json` | Emitted in Plan mode. Lists planned actions and safety guarantees before any data is collected. |
 | `diagnostic-manifest.json` | Emitted in Collect mode. Records what was collected, when, where, and any errors encountered. |
 | `case-verification.schema.json` | Schema for the machine-readable report emitted by Verify mode. |
-| `performance-samples.csv` | Time-series samples of CPU load, available memory, and free disk space collected once per second. |
-| `top-processes.json` | Snapshot of the top 20 processes sorted by CPU usage, including PID, memory, and handle count. |
+| `performance-samples.csv` | Time-series samples of CPU load, available memory, free disk space, and memory committed/limit/paging indicators collected once per second inside the sample window. |
+| `top-processes.json` | Snapshot of the top 20 processes sorted by interval CPU percentage, including PID, cumulative CPU seconds, memory, and handle count. |
 | `system-events-last-24-hours.json` | System event log entries from the preceding 24 hours (up to MaxEventCount). |
 | `network-state.json` | Read-only network-state snapshot: IP configuration, adapter status, DNS servers/cache, routes, ARP table, a DNS-vs-ping split test, hosts-file entries, proxy settings, active TCP connections, and a security/VPN/filtering software inventory. |
+| `disk-samples.json` | Per-interval, per-disk derived metrics from paired raw `Win32_PerfRawData_PerfDisk_PhysicalDisk` snapshots: read/write latency, throughput and instantaneous queue depth, with coverage reasons for unavailable counters. |
+| `volume-metrics.json` | Per-volume capacity/free space with null guards (missing free space is `null`, never `0`). |
+| `findings.json` | Machine-readable findings: category, source artifact, metric, window, measured values, rule condition, uncertainty, next steps and suggested WPR profile, plus coverage warnings. |
+| `report.html` | Standalone offline HTML report (no scripts/external assets, all data HTML-encoded, fixed relative evidence links). |
 | `wpr-trace.etl` | Windows Performance Recorder ETL trace, only present when `-CaptureWpr` and `-ConfirmWprCapture` are used. |
 | `defender-performance.etl` | Microsoft Defender Antivirus performance recording (Microsoft-Antimalware-Engine and NT kernel process events), only present when `-CaptureDefender` and `-ConfirmDefenderCapture` are used. |
 
@@ -30,7 +34,8 @@ The `schemaVersion` field is independent of the `toolVersion` field.
   script's own `$ScriptVersion` variable. Increments with every release regardless
   of schema changes.
 
-Current schema version: `1.0`.
+Current schema version: `1.1` when symptom context or a preset is present
+(`symptom` block), otherwise `1.0`. Both are valid.
 
 When a new schema version is introduced, both versions remain valid during a
 transition window. Consumers should accept any `schemaVersion` present in the
@@ -225,6 +230,38 @@ itself) has a corresponding entry in the `artifacts` array with a SHA-256 hash.
 The manifest file is never self-referenced. This allows consumers to verify
 integrity of all collected files by recomputing hashes and comparing against the
 manifest.
+
+`findings.json`, `report.html`, `disk-samples.json` and `volume-metrics.json` are
+written and registered **before** the final manifest artifact index is computed,
+so they are hashed, included in the case ZIP and covered by Verify and remote
+pull. `report.html` is generated before its own hash exists, so its artifact
+index intentionally omits itself (a file cannot contain its own SHA-256); the
+final manifest still lists `report.html` and Verify recomputes it.
+
+## Findings and Report
+
+`findings.json` is an array of finding objects:
+
+| Field | Meaning |
+|-------|---------|
+| `category` | `cpu-pressure`, `memory-pressure`, `memory-paging`, `disk-pressure`, `disk-latency`, `disk-space`, or `coverage`. |
+| `sourceArtifact` | The artifact the metric came from (`performance-samples.csv`, `disk-samples.json`, `volume-metrics.json`). |
+| `metric` | The measured field (for example `AverageCpuLoadPercent`, `ReadLatencySeconds`). |
+| `windowStart` / `windowEnd` | UTC timestamps of the first/last contributing sample. Sustained findings cite a real window; state/coverage findings may be `null`. |
+| `measuredValues` | The measured numbers behind the finding. |
+| `ruleCondition` | The human-readable rule that fired. |
+| `uncertainty` | What the metric does **not** prove (correlation is not causation). |
+| `nextSteps` | Suggested next evidence-gathering step. |
+| `suggestedWprProfile` | A profile from the `-WprProfile` ValidateSet, or `null`. |
+
+Sustained rules require a minimum number of consecutive finite readings, search
+the whole series (a burst followed by recovery is found), treat a null reading as
+breaking the streak and never infer from a single post-run reading.
+`PagesInputPersec` is documented as pages read to resolve hard page faults, not
+an exact hard-fault count.
+
+`report.html` renders the same findings with all interpolated data
+HTML-encoded, fixed relative evidence links and no scripts or external assets.
 
 ## System Event Log Block
 

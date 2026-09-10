@@ -478,6 +478,45 @@
       },
       "additionalProperties": false
     },
+    "symptom": {
+      "type": "object",
+      "description": "Optional user-reported symptom context. Present in both Plan and Collect modes when -SymptomContext is provided. Records the reported symptom separately from the collection window timestamps.",
+      "properties": {
+        "reported": {
+          "type": ["string", "null"],
+          "description": "The user-provided symptom description. Absent when only a preset was supplied."
+        },
+        "preset": {
+          "type": "string",
+          "enum": ["baseline", "cpu-heavy", "memory-pressure", "storage-io", "network-io", "boot-slowdown", "application-freeze"],
+          "description": "Optional collection preset chosen by the user."
+        },
+        "collectionWindow": {
+          "type": "object",
+          "description": "Timestamps recording when the symptom was reported and when collection occurred.",
+          "properties": {
+            "requestedAtUtc": {
+              "type": "string",
+              "format": "date-time",
+              "description": "UTC timestamp when the user reported the symptom."
+            },
+            "startedAtUtc": {
+              "type": "string",
+              "format": "date-time",
+              "description": "UTC timestamp when collection started (Collect mode only)."
+            },
+            "completedAtUtc": {
+              "type": "string",
+              "format": "date-time",
+              "description": "UTC timestamp when collection completed (Collect mode only)."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["collectionWindow"],
+      "additionalProperties": false
+    },
     "collectionErrors": {
       "type": "array",
       "items": {
@@ -493,6 +532,59 @@
         },
         "additionalProperties": false
       }
+    },
+    "diskMetrics": {
+      "type": "array",
+      "description": "Per-disk I/O summary metrics from Win32_PerfFormattedData_PerfDisk_PhysicalDisk (last sample). Null when CIM classes are unavailable (e.g. non-Windows hosts, restricted tokens). Sustained disk findings use the paired raw-counter series in the disk-samples.json artifact, not this summary.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "Name": { "type": "string" },
+          "PercentDiskTime": { "type": ["integer", "null"] },
+          "PercentDiskReadTime": { "type": ["integer", "null"] },
+          "PercentDiskWriteTime": { "type": ["integer", "null"] },
+          "DiskReadsPerSec": { "type": ["integer", "null"] },
+          "DiskWritesPerSec": { "type": ["integer", "null"] },
+          "DiskBytesPerSec": { "type": ["integer", "null"] },
+          "DiskReadBytesPerSec": { "type": ["integer", "null"] },
+          "DiskWriteBytesPerSec": { "type": ["integer", "null"] },
+          "CurrentDiskQueueLength": { "type": ["integer", "null"] },
+          "AvgDiskReadQueueLength": { "type": ["number", "null"] },
+          "AvgDiskWriteQueueLength": { "type": ["number", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "volumeMetrics": {
+      "type": "array",
+      "description": "Per-volume free space from Win32_Volume. Null when CIM classes are unavailable.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "DriveLetter": { "type": ["string", "null"] },
+          "Label": { "type": ["string", "null"] },
+          "FileSystem": { "type": ["string", "null"] },
+          "CapacityBytes": { "type": ["integer", "null"] },
+          "FreeSpaceBytes": { "type": ["integer", "null"] },
+          "PercentFree": { "type": ["number", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "memoryMetrics": {
+      "type": "object",
+      "description": "Memory committed bytes, commit limit, available bytes, and paging indicators from Win32_PerfFormattedData_PerfOS_Memory. Null when CIM classes are unavailable.",
+      "properties": {
+        "committedBytes": { "type": ["integer", "null"] },
+        "commitLimitBytes": { "type": ["integer", "null"] },
+        "availableBytes": { "type": ["integer", "null"] },
+        "pageFaultsPerSec": { "type": ["integer", "null"], "description": "Total page faults per second (soft+hard). Not equivalent to hard faults alone." },
+        "pageReadsPerSec": { "type": ["integer", "null"], "description": "Hard page faults: pages read from disk to resolve page faults." },
+        "pageWritesPerSec": { "type": ["integer", "null"] },
+        "pagesInputPerSec": { "type": ["integer", "null"], "description": "Pages moved from disk to memory (hard fault input)." },
+        "pagesOutputPerSec": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
     },
     "artifacts": {
       "type": "array",

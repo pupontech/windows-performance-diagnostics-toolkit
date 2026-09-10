@@ -274,10 +274,19 @@ jobs:
           $findings = @(Get-Content -LiteralPath (Join-Path $case 'findings.json') -Raw | ConvertFrom-Json)
           $reportHtml = Get-Content -LiteralPath (Join-Path $case 'report.html') -Raw
           if ($reportHtml -notmatch 'Collection Summary') { throw 'report.html is missing the collection summary' }
-          $reportStatesResult = ($reportHtml -match 'Observed Pressure') -or ($reportHtml -match 'Coverage Warnings') -or ($reportHtml -match 'No Sustained Pressure Detected')
-          if (-not $reportStatesResult) { throw 'report.html neither reports findings nor an explicit no-pressure result' }
-          if ($findings.Count -gt 0 -and $reportHtml -notmatch 'Observed Pressure|Coverage Warnings') {
-            throw 'findings.json has entries that report.html does not render'
+          # Every published finding must be reachable in the report. Assert it per
+          # finding (by metric) instead of by section name, so adding a new finding
+          # category cannot silently escape the report - and so a report that
+          # renders new sections is not falsely rejected for lacking the old ones.
+          $missingFindings = @($findings | Where-Object {
+              $metric = [string]$_.metric
+              [string]::IsNullOrWhiteSpace($metric) -or $reportHtml -notmatch [regex]::Escape($metric)
+          })
+          if ($missingFindings.Count -gt 0) {
+            throw "findings.json has entries that report.html does not render: $($missingFindings.metric -join ', ')"
+          }
+          if ($findings.Count -eq 0 -and $reportHtml -notmatch 'No Sustained Pressure Detected') {
+            throw 'report.html reports no findings but does not state the no-pressure result explicitly'
           }
 
           # Verify the intact case.

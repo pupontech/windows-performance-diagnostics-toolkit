@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — next release (1.0.0)
+## 1.0.0 — 2026-09-10
 
 Incident-capture release: every telemetry source now shares one capture window,
 and the report can name what actually consumed the machine.

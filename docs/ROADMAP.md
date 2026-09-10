@@ -27,6 +27,13 @@
 - Automated fixture/behavioral tests including a fixture-driven Collect tail
   that is verified and then refused after report tampering.
 
+**Known limitations (tracked, not user-visible defects):** sustained-window
+selection cites the longest qualifying run and, for two runs of equal length,
+always the earlier one (deterministic, documented, but a later equal run is not
+reported); a transient raw-disk poll failure is recorded in `collectionErrors`
+and in the interval series the next successful poll spans the gap, so a run of
+"N consecutive intervals" can silently bridge a failed poll.
+
 **Not yet owner-verified:** the raw disk counter math, the in-window series and
 the report generation have only been exercised by fixture tests and a hosted
 Windows smoke collection. A run on an owner Windows client is required before

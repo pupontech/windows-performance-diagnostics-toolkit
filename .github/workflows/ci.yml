@@ -268,9 +268,17 @@ jobs:
           $procErrors = @($m.collectionErrors | Where-Object { $_.Stage -eq 'process-snapshot' })
           if ($procErrors.Count -gt 0) { throw "process-snapshot errors present: $($procErrors[0].Message)" }
 
-          # findings.json must be a non-empty JSON array.
+          # findings.json must parse as a JSON array. An idle runner genuinely
+          # breaches no sustained rule, so zero findings is a valid result - but
+          # the report must then say so explicitly instead of staying silent.
           $findings = @(Get-Content -LiteralPath (Join-Path $case 'findings.json') -Raw | ConvertFrom-Json)
-          if ($findings.Count -lt 1) { throw 'findings.json is empty' }
+          $reportHtml = Get-Content -LiteralPath (Join-Path $case 'report.html') -Raw
+          if ($reportHtml -notmatch 'Collection Summary') { throw 'report.html is missing the collection summary' }
+          $reportStatesResult = ($reportHtml -match 'Observed Pressure') -or ($reportHtml -match 'Coverage Warnings') -or ($reportHtml -match 'No Sustained Pressure Detected')
+          if (-not $reportStatesResult) { throw 'report.html neither reports findings nor an explicit no-pressure result' }
+          if ($findings.Count -gt 0 -and $reportHtml -notmatch 'Observed Pressure|Coverage Warnings') {
+            throw 'findings.json has entries that report.html does not render'
+          }
 
           # Verify the intact case.
           $verify = & .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Verify -InputDirectory $case

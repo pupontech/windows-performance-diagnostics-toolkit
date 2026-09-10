@@ -2441,6 +2441,56 @@ $f = @(Evaluate-Findings -Samples $csv -DiskSeries $null -VolumeMetrics $null -M
     assert "volumeMetricsUnavailable" in metrics
 
 
+def test_cpu_interval_stopwatch_spans_the_end_enumeration():
+    """Ordering contract for the interval-CPU measurement (guards audit finding
+    F1). The stopwatch must be stopped only AFTER the end-of-interval process
+    enumeration, with the elapsed value captured in between: stopping it earlier
+    would drop CPU accrued during CSV export / summary polls from the
+    denominator while the numerator delta still included it, inflating every
+    per-process percentage. The live Collect path is Windows-only, so this
+    ordering is asserted on the source rather than executed here; the hosted
+    Windows workload step executes the same code path end to end.
+    """
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+
+    start_idx = source.index("$cpuStopwatch = [System.Diagnostics.Stopwatch]::StartNew()")
+    enumeration_idx = source.index("$processEnds = @(Get-Process")
+    elapsed_idx = source.index("$cpuElapsedSeconds = $cpuStopwatch.Elapsed.TotalSeconds")
+    stop_idx = source.index("$cpuStopwatch.Stop()")
+
+    assert start_idx < enumeration_idx < elapsed_idx < stop_idx
+    # The interval must be measured with the captured value, not read after Stop.
+    assert "ElapsedSeconds $cpuStopwatch.Elapsed.TotalSeconds" not in source
+    assert "ElapsedSeconds $cpuElapsedSeconds" in source
+
+
+def test_html_report_with_no_findings_reports_measured_clear_window():
+    """A collection that measured every source and breached no sustained rule
+    must NOT be reported as 'Insufficient Evidence' - that wording is reserved
+    for missing/unusable data. Zero findings with zero coverage warnings is a
+    positive measurement result and must say so, so an operator can tell
+    'nothing sustained' apart from 'we could not measure'."""
+    script = str(SCRIPT).replace("\\", "/")
+    body = r"""
+$null = . '__SCRIPT__' -Mode Plan -OutputDirectory '/tmp/wpd-clear'
+$manifest = [ordered]@{ toolVersion='0.9.0'; schemaVersion='1.1'; startedAtUtc='2026-09-10T12:00:00Z'; completedAtUtc='2026-09-10T12:00:30Z'; scope=[ordered]@{durationSeconds=30}; artifacts=@() }
+$html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext $null
+[ordered]@{
+    hasCollectionSummary = [bool]($html -match 'Collection Summary')
+    claimsInsufficient   = [bool]($html -match 'Insufficient Evidence')
+    statesNoPressure     = [bool]($html -match 'No Sustained Pressure Detected')
+    retainsCaveat        = [bool]($html -match 'does not prove the system is healthy')
+} | ConvertTo-Json
+"""
+    result = _run_ps(body.replace("__SCRIPT__", script))
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["hasCollectionSummary"] is True
+    assert output["statesNoPressure"] is True
+    assert output["claimsInsufficient"] is False
+    assert output["retainsCaveat"] is True
+
+
 def test_html_report_encodes_artifact_size_bytes():
     """A hostile SizeBytes value from a remote manifest must be HTML-encoded."""
     script = str(SCRIPT).replace("\\", "/")

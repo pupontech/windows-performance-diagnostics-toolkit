@@ -2323,9 +2323,14 @@ function ConvertTo-FindingsHtml {
     }
 
     if ($pressureFindings.Count -eq 0 -and $coverageFindings.Count -eq 0) {
+        # Every source was usable and no sustained rule threshold was breached.
+        # That is a completed measurement with a clear result, not missing
+        # evidence - 'Insufficient Evidence' is reserved for the coverage
+        # section above, so an operator can tell 'nothing sustained' apart from
+        # 'we could not measure this'.
         [void]$sb.AppendLine('<div class="finding info">')
-        [void]$sb.AppendLine('<h3>Insufficient Evidence</h3>')
-        [void]$sb.AppendLine('<p>No pressure findings could be determined from the collected data. This does not mean the system is healthy - it means the available measurements did not trigger any pressure rules. Consider re-running with a longer duration or different WPR profile.</p>')
+        [void]$sb.AppendLine('<h3>No Sustained Pressure Detected</h3>')
+        [void]$sb.AppendLine('<p>The collected window was measured and no pressure rule was breached for a sustained period. This does not prove the system is healthy - a short or intermittent slowdown can fall outside the sampled window. did not trigger any pressure rules. Consider re-running with a longer duration or different WPR profile.</p>')
         [void]$sb.AppendLine('</div>')
     }
 
@@ -2866,7 +2871,10 @@ if ($null -eq $logicalProcessorCount) {
 }
 
 # Monotonic stopwatch brackets the two CPU snapshots so the CPU-delta window
-# matches the elapsed denominator exactly (wall-clock/CIM query time is excluded).
+# matches the elapsed denominator exactly. It is stopped only after the end
+# enumeration (see the process-snapshot stage below): stopping it before that
+# would exclude CPU accrued during CSV export / summary polls from the
+# denominator while the numerator delta still included it.
 $cpuStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $processStartSnapshots = New-ProcessCpuSnapshot -Processes @(Get-Process -ErrorAction SilentlyContinue)
 
@@ -2944,7 +2952,6 @@ for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
     }
 }
 
-$cpuStopwatch.Stop()
 $completedAtSamplingUtc = Get-UtcTimestamp
 
 # Formatted summary counters (manifest convenience only; findings use the series).
@@ -2966,7 +2973,11 @@ catch {
 
 try {
     $processEnds = @(Get-Process -ErrorAction SilentlyContinue)
-    $processes = @(Compare-ProcessCpuSnapshots -StartSnapshots $processStartSnapshots -EndProcesses $processEnds -ElapsedSeconds $cpuStopwatch.Elapsed.TotalSeconds -LogicalProcessors $logicalProcessorCount) |
+    # Capture elapsed and stop here so the numerator (CPU delta between the two
+    # snapshots) and the denominator (this stopwatch) cover the same interval.
+    $cpuElapsedSeconds = $cpuStopwatch.Elapsed.TotalSeconds
+    $cpuStopwatch.Stop()
+    $processes = @(Compare-ProcessCpuSnapshots -StartSnapshots $processStartSnapshots -EndProcesses $processEnds -ElapsedSeconds $cpuElapsedSeconds -LogicalProcessors $logicalProcessorCount) |
         Sort-Object -Property { if ($_.ProcessCpuPercent -ne 'unknown') { [double]$_.ProcessCpuPercent } else { -1 } } -Descending |
         Select-Object -First 20
     Write-JsonFile -InputObject $processes -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'top-processes.json')

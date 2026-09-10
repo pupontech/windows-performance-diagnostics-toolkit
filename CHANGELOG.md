@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.1 — 2026-09-10
 
 - Fixed two unbounded post-sampling stages: DNS resolution now waits on an
   asynchronous resolver for at most two seconds per public name, and the System

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fixed two unbounded post-sampling stages: DNS resolution now waits on an
+  asynchronous resolver for at most two seconds per public name, and the System
+  event reader now starts with newest records and stops at `MaxEventCount`.
+  Both changes preserve a useful partial result instead of extending a short
+  collection by an unpredictable amount.
+
 - `DurationSeconds` now defines a wall-clock budget for baseline sampling. The
   collector schedules samples against a monotonic stopwatch rather than adding
   a one-second sleep after every CIM query, so normal query time no longer

@@ -30,9 +30,8 @@
 **Known limitations (tracked, not user-visible defects):** sustained-window
 selection cites the longest qualifying run and, for two runs of equal length,
 always the earlier one (deterministic, documented, but a later equal run is not
-reported); a transient raw-disk poll failure is recorded in `collectionErrors`
-and in the interval series the next successful poll spans the gap, so a run of
-"N consecutive intervals" can silently bridge a failed poll.
+reported). A raw-disk poll gap resets its baseline, so the following successful
+poll establishes coverage but does not yield a latency/throughput interval.
 
 **Not yet owner-verified:** the raw disk counter math, the in-window series and
 the report generation have only been exercised by fixture tests and a hosted

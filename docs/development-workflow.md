@@ -46,7 +46,8 @@ Every release, without exception:
 
 1. Bump `VERSION` and `$ScriptVersion` in `src/Invoke-WindowsPerformanceDiagnostics.ps1` (semantic versioning).
 2. Add a real `CHANGELOG.md` entry describing the change and the root cause for fixes.
-3. Push to `main` and wait for CI to be green.
+3. Open a pull request and wait for CI to be green on the proposed merge; merge
+   only after those required checks pass.
 4. Tag `v<semver>`; create the GitHub Release with notes **mirrored from CHANGELOG.md** — never a bare tag or one-line note.
 5. Check out the exact `v<semver>` tag and build the zip from that verified clean tree: `bash make-deploy-bundle.sh` (refuses dirty trees and same-version non-tag commits).
 6. Attach the zip **and** the `.sha256` asset; then byte-verify: download the published asset and confirm `sha256sum` matches the local build exactly.
@@ -55,7 +56,7 @@ Every release, without exception:
 
 Per project policy the owner performs live Windows testing themselves (agents
 never set up VMs or run live installs). Track it as a board card per
-`docs/windows-live-test-matrix.md` (WPD-01..11). The release is considered
+`docs/windows-live-test-matrix.md` (WPD-01..WPD-23). The release is considered
 "shipped, pending owner live validation", never "validated on real Windows",
 until the owner records results back on the board.
 

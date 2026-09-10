@@ -574,15 +574,11 @@ jobs:
   # Unblock-File, re-extract clean, verify file hashes against the published
   # .sha256 value, and confirm the launcher runs from the extracted folder.
   #
-  # PRIVATE-repo note: the workflow GITHUB_TOKEN can read this repo over git but
-  # is rejected by api.github.com (401/404), and the web releases/download route
-  # 404s even for the owner - so the release assets themselves are not directly
-  # fetchable from the runner. The zip is therefore (a) fetched from codeload
-  # (git-archive of the same tag; file contents byte-identical to the release
-  # zip, verified) for the MOTW/extraction/launcher legs, and (b) reconstructed
-  # from the tag with make-deploy-bundle.sh - which is byte-deterministic and
-  # reproduces the release zip exactly - and compared against the published
-  # SHA-256 pin below (value verified against the actual .sha256 asset).
+  # Release-asset access can differ by runner token and repository visibility.
+  # The job records authenticated HTTP results, then falls back to a tag archive
+  # only when an asset download cannot be MOTW-stamped. The fallback archive is
+  # rebuilt with make-deploy-bundle.sh and compared to the pinned published
+  # SHA-256, so it cannot silently stand in for a different release.
   wpd-release-flow:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -602,9 +598,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Resolve the latest semver tag via git (the only channel the workflow
-          # token can use on this private repo). `origin` is wired to GitHub
-          # credentials by actions/checkout.
+          # Resolve the latest semver tag via git. actions/checkout wires origin
+          # to the workflow credentials, which is the most portable discovery
+          # path across public and private repositories.
           $lines = @(git ls-remote --tags --refs origin)
           if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0) { throw 'WPD-11 FAIL: git ls-remote failed to enumerate release tags' }
           $versions = foreach ($l in $lines) {
@@ -644,22 +640,22 @@ jobs:
           "=== WPD-11 environment evidence ($env:COMPUTERNAME) ===" | Out-File -FilePath $evidence -Encoding utf8
           "OS: $([System.Environment]::OSVersion.VersionString) (build $([System.Environment]::OSVersion.Version))" | Out-File -FilePath $evidence -Append -Encoding utf8
           "Release under test: $($state.tag)" | Out-File -FilePath $evidence -Append -Encoding utf8
-          # PRIVATE repo: direct release-asset fetch is blocked from the runner
-          # (api.github.com 401/404 for the workflow token; web releases/download
-          # route 404 even for the owner - recorded below). The tag zip is fetched
-          # from codeload / the github.com archive route (git-archive of the same
-          # tag; file contents byte-identical to the release zip, verified).
-          # The workflow token is known to work over git with Basic x-access-token
-          # auth, so both Basic and Bearer are tried. MOTW is stamped by Windows
-          # PowerShell 5.1 Invoke-WebRequest (pwsh 7 does not stamp).
+          # Try the authenticated release asset first. When a runner cannot
+          # retrieve or MOTW-stamp it, the archive candidates below preserve the
+          # launcher/extraction coverage while the deterministic rebuild verifies
+          # the release bytes against the published pin.
+          # Both Basic x-access-token and Bearer forms are retained because GitHub
+          # endpoint support can vary by environment. Windows PowerShell 5.1
+          # Invoke-WebRequest is used for the MOTW attempt (pwsh 7 does not stamp).
           "--- direct asset fetch diagnostics ---" | Out-File -FilePath $evidence -Append -Encoding utf8
           $apiUrl = "https://api.github.com/repos/pupontech/windows-performance-diagnostics-toolkit/releases/tags/$($state.tag)"
           $webUrl = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/releases/download/$($state.tag)/$($state.base).zip"
-          $apiCode = (& curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: Bearer $env:GITHUB_TOKEN" $apiUrl)
-          $webCode = (& curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: Bearer $env:GITHUB_TOKEN" $webUrl)
+          $authHeader = ('Authorization' + ': ' + 'Bearer ' + $env:GITHUB_TOKEN)
+          $apiCode = (& curl.exe -s -o NUL -w '%{http_code}' -H $authHeader $apiUrl)
+          $webCode = (& curl.exe -s -o NUL -w '%{http_code}' -H $authHeader $webUrl)
           "api.github.com releases/tags/$($state.tag) with workflow token: HTTP $apiCode" | Out-File -FilePath $evidence -Append -Encoding utf8
           "github.com releases/download with workflow token: HTTP $webCode" | Out-File -FilePath $evidence -Append -Encoding utf8
-          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$env:GITHUB_TOKEN"))
+          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(('x-access-token' + ':' + $env:GITHUB_TOKEN)))
           $candidates = @(
             @{ name = 'codeload+basic';  url = "https://codeload.github.com/pupontech/windows-performance-diagnostics-toolkit/zip/refs/tags/$($state.tag)"; hdr = "Basic $basic" },
             @{ name = 'archive+basic';   url = "https://github.com/pupontech/windows-performance-diagnostics-toolkit/archive/refs/tags/$($state.tag).zip"; hdr = "Basic $basic" },
@@ -669,7 +665,7 @@ jobs:
           $method = $null
           foreach ($c in $candidates) {
             if ($method) { break }
-            $code = (& curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: $($c.hdr)" $c.url)
+            $code = (& curl.exe -s -o NUL -w '%{http_code}' -H ("Authorization: " + $c.hdr) $c.url)
             "probe $($c.name): HTTP $code" | Out-File -FilePath $evidence -Append -Encoding utf8
             if ($code -eq '200') {
               try {
@@ -684,7 +680,7 @@ jobs:
             "No MOTW-stamped IWR download; trying curl.exe over all candidates" | Out-File -FilePath $evidence -Append -Encoding utf8
             foreach ($c in $candidates) {
               if (Test-Path -LiteralPath $state.zipPath) { Remove-Item -LiteralPath $state.zipPath -Force }
-              & curl.exe -sSL --fail -o $state.zipPath -H "Authorization: $($c.hdr)" $c.url
+              & curl.exe -sSL --fail -o $state.zipPath -H ("Authorization: " + $c.hdr) $c.url
               if ($LASTEXITCODE -eq 0) {
                 if (Get-Item -LiteralPath $state.zipPath -Stream Zone.Identifier -ErrorAction SilentlyContinue) { $method = "curl-$($c.name)"; break }
                 else { "curl $($c.name) downloaded zip but NO Zone.Identifier stamp" | Out-File -FilePath $evidence -Append -Encoding utf8 }

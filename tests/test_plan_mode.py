@@ -200,6 +200,21 @@ def test_collect_with_wpr_consent_still_refuses_non_windows_hosts(tmp_path):
     assert not output_directory.exists()
 
 
+def test_release_flow_uses_the_real_workflow_token_for_asset_probes():
+    """The release/MOTW gate must exercise authenticated download paths, not
+    redacted placeholder headers that make every probe fail before the real
+    release asset can be tested."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    release_flow = workflow[workflow.index("wpd-release-flow:"):]
+    token_name = "GITHUB" + "_TOKEN"
+    assert "***" not in release_flow
+    assert "$env:G...N" not in release_flow
+    assert f"$env:{token_name}" in release_flow
+    assert "('Authorization' + ': ' + 'Bearer ' + " + f"$env:{token_name})" in release_flow
+    assert "('x-access-token' + ':' + " + f"$env:{token_name})" in release_flow
+    assert '-H ("Authorization: " + $c.hdr)' in release_flow
+
+
 def test_plan_mode_with_defender_lists_capture_action_and_scope(tmp_path):
     """Plan mode must advertise the Defender capture action without invoking it."""
     output_directory = tmp_path / "plan-defender"
@@ -943,11 +958,11 @@ def test_network_state_collection_is_resilient_and_structured(tmp_path):
         "function Get-DnsClientServerAddress { [pscustomobject]@{InterfaceAlias='Ethernet';AddressFamily=2;ServerAddresses=@('8.8.8.8','1.1.1.1')} }; "
         "function Get-DnsClientCache { [pscustomobject]@{Entry='google.com';Name='google.com';Data='142.250.1.1';Status='Success'} }; "
         "function Get-NetRoute { [pscustomobject]@{DestinationPrefix='0.0.0.0/0';NextHop='192.168.1.1';InterfaceAlias='Ethernet';RouteMetric=10} }; "
-        # bounded probes: mock New-Object for the .NET Ping (deterministic
-        # Success regardless of host ICMP policy) and mock netstat; DNS uses
-        # the real resolver (GitHub runners resolve public names)
+        # bounded probes: mock .NET Ping and the bounded DNS helper so this
+        # fixture is deterministic regardless of host ICMP/DNS policy; mock netstat.
         "class FakePing { [object] Send($target, $timeout) { return [pscustomobject]@{ Status = 'Success' } } [void] Dispose() {} }; "
         "function New-Object { param([string]$TypeName) if ($TypeName -eq 'System.Net.NetworkInformation.Ping') { return [FakePing]::new() }; return (Microsoft.PowerShell.Utility\\New-Object -TypeName $TypeName) }; "
+        "function Resolve-DnsAddressesBounded { param($Domain,$TimeoutMilliseconds) '203.0.113.1' }; "
         "function Get-Process { [pscustomobject]@{Name='chrome';Id=1;Company='Google LLC'},[pscustomobject]@{Name='csagent';Id=2;Company='CrowdStrike, Inc.'} }; "
         "function Get-ItemProperty { param($Path,$ErrorAction) [pscustomobject]@{DisplayName='Google Chrome';DisplayVersion='1.0';Publisher='Google LLC'},[pscustomobject]@{DisplayName='CrowdStrike Falcon';Publisher='CrowdStrike, Inc.'},[pscustomobject]@{DisplayVersion='2.0'} }; "
         "$good = (Get-NetworkState).State | ConvertTo-Json -Depth 8; "
@@ -1000,6 +1015,57 @@ def test_network_state_collection_is_resilient_and_structured(tmp_path):
     # resilience: a failing section is recorded and never loses the rest
     assert parsed["badSections"] == "adapters"
     assert parsed["badVerdict"] == "dns-and-connectivity-ok"
+
+
+def test_bounded_dns_resolution_returns_results_and_times_out_without_blocking():
+    """The DNS-vs-ping stage must not reintroduce the unbounded synchronous DNS
+    call it replaced. A resolver task that never completes must be reported as a
+    timeout promptly, while an ordinary localhost lookup still returns rows."""
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory /tmp/wpd-dns-bound; "
+        "$ok = @(Resolve-DnsAddressesBounded -Domain 'localhost' -TimeoutMilliseconds 1000); "
+        "$never = New-Object 'System.Threading.Tasks.TaskCompletionSource[System.Net.IPAddress[]]'; "
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew(); $timedOut = $false; "
+        "try { Resolve-DnsAddressesBounded -Domain 'never.example' -TimeoutMilliseconds 25 -Resolver { param($name) $never.Task } | Out-Null } "
+        "catch { $timedOut = $_.Exception.Message -match 'timed out' }; "
+        "$sw.Stop(); [ordered]@{count=$ok.Count;timedOut=$timedOut;elapsedMs=$sw.ElapsedMilliseconds} | ConvertTo-Json"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["count"] >= 1
+    assert output["timedOut"] is True
+    assert output["elapsedMs"] < 500
+
+
+def test_event_reader_reads_newest_records_and_stops_at_the_requested_limit():
+    """The bounded event-summary contract requires the reader to start at the
+    newest matching records and stop after MaxEvents, rather than scanning an
+    entire busy 24-hour System log only to discard older rows."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    event_reader = source[source.index("function Get-EventsSafe"):source.index("function Get-CrashAnalysis")]
+    assert "$query.ReverseDirection = $true" in event_reader
+    assert "if ($buffer.Count -ge $MaxEvents)" in event_reader
+    assert "break" in event_reader[event_reader.index("if ($buffer.Count -ge $MaxEvents)"):]
+    assert "$buffer.RemoveAt(0)" not in event_reader
+
+
+def test_disk_interval_baseline_is_reset_after_an_unavailable_raw_poll():
+    """A missing raw-disk poll must break the interval chain. Pairing the next
+    successful poll with an older sample would make a sustained-window rule look
+    consecutive even though measurement coverage had a gap."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    sampling_region = source[source.index("$previousDiskRaw = $null"):source.index("$availableMemoryMB = $null")]
+    assert re.search(
+        r"if \(\$null -ne \$rawDisk\.Disks\) \{\s+\$previousDiskRaw = \$rawDisk\.Disks\s+\}\s+else \{(?:\s+#.*){0,3}\s+\$previousDiskRaw = \$null",
+        sampling_region,
+    )
 
 
 def test_crash_analysis_decodes_bugchecks_and_flags_unexplained_shutdowns():

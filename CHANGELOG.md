@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased — next release (1.0.0)
+
+Incident-capture release: every telemetry source now shares one capture window,
+and the report can name what actually consumed the machine.
+
+- **Concurrent capture window.** Performance counters, repeated per-process
+  commit samples, kernel pool, pagefile, GPU, disk, UDP endpoints, and the WPR
+  trace start and stop together. Previously the trace started only after
+  counter sampling finished, so an ETL could not explain pressure the counters
+  had already recorded (observed: counters ended 16:35, WPR started 16:37).
+  `diagnostic-manifest.json` records `captureWindow` with the real start/stop of
+  each stage, and a new `evidence-coverage` finding states plainly when a trace
+  does not cover the counters.
+- **Symptom marker (`-MarkerMode`).** An operator presses Enter (or writes the
+  marker file for unattended runs) when the slowdown happens; sampling retains
+  `-MarkerPreSeconds` (60) before and `-MarkerPostSeconds` (30) after the
+  marker. Every series is trimmed to the same window and the manifest reports
+  the retained and dropped sample counts.
+- **Per-process commit attribution.** Working set cannot explain a system commit
+  charge. Each sample now records private bytes (commit charge), working set and
+  private working set, pagefile bytes and peak, virtual bytes, and paged
+  and nonpaged pool per process (`process-memory-samples.csv` plus a
+  `process-memory-top.json` peak/growth summary); the system pagefile size,
+  current usage, peak usage, and location are recorded as well
+  (`pagefile-metrics.json`), with `kernel-pool-samples.json` for the
+  system-wide paged/nonpaged pool series.
+- **GPU attribution.** Per-process GPU engine utilization and dedicated/shared
+  GPU memory, adapter and driver version, plus a TDR/LiveKernelEvent/WHEA and
+  `nvlddmkm` event sweep in `gpu-metrics.json`. Windows exposes no reliable
+  consumer GPU temperature or clock counter set, so those fields record
+  `available: false` with the reason instead of a fabricated value.
+- **UDP diagnostics.** UDP endpoints are enumerated and grouped by owning
+  process, next to the configured dynamic UDP port ranges, and sampled over the
+  capture window (`udp-samples.json`). A TCP-only network view cannot see
+  UDP-port exhaustion.
+- **Incident-correlated events.** Event evidence is pulled from System,
+  Application, WER, LiveKernelReports-adjacent, driver-framework, and PnP logs
+  around the marked window plus `-EventWindowMinutes` (15) of padding, with raw
+  event XML preserved for events Windows cannot render. Events outside the
+  window are labelled `out-of-window` and kept, never silently dropped.
+- **Storage relevance.** Each drive letter is mapped to its backing physical
+  disk and to the pagefile host, so low free space on an unrelated archive or
+  backup volume is not misread as a performance cause.
+- **Bounded, optional WPR.** The trace runs in memory mode — the documented
+  bounded circular buffer — because Microsoft documents `-filemode` as an
+  unbounded file that "can grow in size until it fills the disk" (the reported
+  run produced 1.13 GB plus a symbol directory). The window auto-sizes to
+  outlast the counters (`-WprDurationSeconds 0` = auto), the real duration is
+  recorded, and `-WprMaxFileMB` (512) removes an oversized trace together with
+  the managed-symbol files WPR writes beside it. WPR remains off unless
+  `-CaptureWpr` and `-ConfirmWprCapture` are both supplied.
+- **Fixed: 555 MB `network-state.json`.** Hosts-file entries were serialized as
+  full `MatchInfo` objects, dragging `PSProvider`, reflection metadata,
+  assemblies, and defined types into the JSON. Entries are now flattened to
+  plain strings (a dedicated `ConvertTo-HostsEntryLines` with a regression
+  test), and the proxy settings are materialized as strings as well.
+- **Honest timing in the report.** The report's summary now prints the capture
+  window, requested versus actual baseline seconds, requested versus actual
+  trace seconds, concurrent stages, pagefile allocation, and the volume-to-disk
+  relevance map, instead of a bare "30 seconds".
+- **Schema 1.2.** Adds `captureWindow`, `incident`, `processMemory`, `gpu`,
+  `pageFile`, `kernelPool`, `storageMapping`, `incidentEvents`,
+  `liveKernelReports`, the UDP fields in `network`, and the bounded-WPR fields.
+  Versions 1.0 and 1.1 remain valid.
+
 ## 0.9.1 — 2026-09-10
 
 - Fixed two unbounded post-sampling stages: DNS resolution now waits on an

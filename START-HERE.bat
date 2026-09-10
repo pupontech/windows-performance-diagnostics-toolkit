@@ -32,16 +32,18 @@ echo Choose an operating mode:
 echo.
 echo   1 - Plan preview
 echo   2 - Collect diagnostics (recommended)
-echo   3 - Verify an existing case
-echo   4 - Exit
+echo   3 - Incident capture (performance window + symptom marker)
+echo   4 - Verify an existing case
+echo   5 - Exit
 echo.
-set /p CHOICE="Enter 1-4: "
+set /p CHOICE="Enter 1-5: "
 
 :choice_set
 if "%CHOICE%"=="1" goto :opt_plan
 if "%CHOICE%"=="2" goto :opt_collect
-if "%CHOICE%"=="3" goto :opt_verify
-if "%CHOICE%"=="4" goto :exit_clean
+if "%CHOICE%"=="3" goto :opt_incident
+if "%CHOICE%"=="4" goto :opt_verify
+if "%CHOICE%"=="5" goto :exit_clean
 echo [ERROR] Invalid choice: %CHOICE%
 echo.
 goto :end
@@ -65,6 +67,22 @@ goto :end_no_pause
 
 :collect_ready
 set "EXTRA=-CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
+set "DURATION=30"
+goto :run
+
+:opt_incident
+call :ensure_elevated
+if "%errorlevel%"=="0" goto :incident_ready
+if "%errorlevel%"=="1" goto :end_failed
+goto :end_no_pause
+
+:incident_ready
+echo.
+echo Incident capture runs ONE shared window for counters, process/commit,
+echo GPU, disk, pagefile and the WPR trace. Press Enter when the slowdown
+echo happens: 60 s before the marker and 30 s after it are kept.
+set "EXTRA=-PerformanceMode -MarkerMode -CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
+set "DURATION=120"
 goto :run
 
 :opt_verify
@@ -83,13 +101,14 @@ goto :end_failed
 :run
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 echo.
-echo Collecting: 30-second baseline sampling, then a separate 30-second WPR trace.
+echo Collecting: baseline sampling for %DURATION% seconds, with the WPR trace,
+echo process/commit, GPU, pagefile and UDP capture running in the SAME window.
 echo The console shows baseline progress by sample and percentage.
 echo Allow additional time for event/log collection and final export, hashing, and ZIP packaging.
 echo Output: %OUTDIR%
 echo Run started: %date% %time% - mode Collect >> "%LOG%"
 echo ============================================================ >> "%LOG%"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1' -Mode Collect -ConfirmLocalCollection %EXTRA% -DurationSeconds 30 -OutputDirectory '%OUTDIR%' 2>&1 | Tee-Object -FilePath '%LOG%'"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1' -Mode Collect -ConfirmLocalCollection %EXTRA% -DurationSeconds %DURATION% -OutputDirectory '%OUTDIR%' 2>&1 | Tee-Object -FilePath '%LOG%'"
 echo.
 if errorlevel 1 goto :collection_failed
 if exist "%OUTDIR%\diagnostic-manifest.json" goto :manifest_ok
@@ -107,6 +126,10 @@ echo   - diagnostic-manifest.json     (report + SHA-256 hashes)
 echo   - performance-samples.csv      (CPU/memory/disk samples)
 echo   - top-processes.json           (process snapshot)
 echo   - system-events-last-24-hours.json
+echo   - process-memory-samples.csv (per-process commit charge)
+echo   - gpu-metrics.json           (GPU engines + memory)
+echo   - pagefile-metrics.json      (size/usage/location)
+echo   - incident-events.json       (window-labelled events)
 echo   - wpr-trace.etl                (when WPR is available)
 echo   - minidumps\                   (crash dumps)
 echo   - bootfailure\                 (SRT/boot/CBS logs)

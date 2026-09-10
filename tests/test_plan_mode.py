@@ -121,9 +121,12 @@ def test_collect_progress_uses_a_wall_clock_deadline_and_launchers_explain_extra
     assert "Start-Sleep -Milliseconds $sleepMilliseconds" in source
     sampling_region = source[source.index("$samples = New-Object System.Collections.ArrayList"):source.index("$completedAtSamplingUtc = Get-UtcTimestamp")]
     assert "Start-Sleep -Seconds 1" not in sampling_region
-    assert "30-second baseline sampling" in start_here
-    assert "then a separate 30-second WPR trace" in start_here
+    # the launcher must say the trace runs in the SAME window as the counters
+    # (a "separate 30-second WPR trace" claim was the misleading wording)
+    assert "running in the SAME window" in start_here
+    assert "then a separate 30-second WPR trace" not in start_here
     assert "final export, hashing, and ZIP packaging" in start_here
+    assert "-PerformanceMode -MarkerMode" in start_here
     assert "30-second baseline sampling" in run_diagnostics
 
 
@@ -146,7 +149,12 @@ def test_plan_mode_with_wpr_lists_capture_action_and_scope(tmp_path):
 
     assert "capture-wpr-etl-after-explicit-consent" in manifest["plannedActions"]
     assert manifest["wpr"]["profile"] == "GeneralProfile"
-    assert manifest["wpr"]["durationSeconds"] == 30
+    assert manifest["wpr"]["durationSeconds"] == 60
+    assert manifest["wpr"]["requestedDurationSeconds"] == 0
+    assert manifest["wpr"]["autoSizedDuration"] is True
+    assert manifest["wpr"]["maxFileMB"] == 512
+    assert manifest["wpr"]["loggingMode"] == "memory"
+    assert manifest["wpr"]["concurrentWithSampling"] is True
 
 
 def test_plan_mode_without_wpr_has_no_wpr_section(tmp_path):
@@ -265,7 +273,9 @@ def test_plan_mode_with_defender_lists_capture_action_and_scope(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
 
     assert "capture-defender-performance-etl-after-explicit-consent" in manifest["plannedActions"]
-    assert manifest["defender"]["durationSeconds"] == 30
+    assert manifest["defender"]["durationSeconds"] == 60
+    assert manifest["defender"]["requestedDurationSeconds"] == 0
+    assert manifest["defender"]["autoSizedDuration"] is True
 
 
 def test_plan_mode_without_defender_has_no_defender_section(tmp_path):
@@ -302,7 +312,7 @@ def test_plan_mode_with_wpr_and_defender_lists_both_capture_actions(tmp_path):
     assert "capture-wpr-etl-after-explicit-consent" in manifest["plannedActions"]
     assert "capture-defender-performance-etl-after-explicit-consent" in manifest["plannedActions"]
     assert manifest["wpr"]["profile"] == "GeneralProfile"
-    assert manifest["defender"]["durationSeconds"] == 30
+    assert manifest["defender"]["durationSeconds"] == 60
 
 
 def test_defender_capture_refuses_without_defender_consent(tmp_path):
@@ -681,10 +691,10 @@ def test_remote_collection_source_uses_owned_staging_and_fail_closed_status():
 
 def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
     """Invoke-ConsentedCapture (dot-sourced) must record collectionErrors and
-    return the right status on the readiness-fail path, and must fail SAFE
-    (body never called) when the elevation check cannot run. Add-CollectionError
-    is defined after the plan-mode early exit, so the test stubs it; the real
-    elevation-skip semantics are live-gated by WPD-09 on Windows runners."""
+    return the right status on the readiness-fail path, and must SKIP (never run
+    the capture body) when the console is not elevated. On Linux the elevation
+    probe cannot succeed, which is exactly the non-admin case WPD-09 gates on
+    Windows, so the body must never be invoked."""
     script = str(SCRIPT).replace("\\", "/")
     command = (
         f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
@@ -701,7 +711,10 @@ def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
         "-ElevationMessage 'requires an elevated (Administrator) console; Defender performance capture skipped' -ElevationErrorId 'DefenderElevationRequired' "
         "-ReadyCheck { $true } "
         "-CaptureBody { $script:bodyCalls++; return [ordered]@{ status = 'completed' } }; "
-        "[ordered]@{ s1=$r1.status; s2=$r2.status; errCount=@($script:collectionErrors).Count; bodyCalls=$script:bodyCalls } | ConvertTo-Json -Depth 4"
+        "$elevationProbe = Test-IsElevatedConsole; "
+        "[ordered]@{ s1=$r1.status; s2=$r2.status; errCount=@($script:collectionErrors).Count; bodyCalls=$script:bodyCalls; "
+        "elevationMessages=@($script:collectionErrors | Where-Object { $_.Message -match 'elevated' }).Count; "
+        "elevationProbe=$elevationProbe } | ConvertTo-Json -Depth 4"
     )
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-Command", command],
@@ -714,11 +727,13 @@ def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
     out = json.loads(result.stdout)
     # readiness fail: skip status + error recorded, body never called
     assert out["s1"] == "skipped-wpr-not-found"
-    # ready, but the elevation check cannot run on Linux (WindowsPrincipal is
-    # unsupported -> throws) - the helper must fail SAFE: status failed,
-    # error recorded, capture body never invoked
-    assert out["s2"] == "failed"
+    # ready but not elevated: skip with the elevation reason, body never invoked.
+    # (Test-IsElevatedConsole returns $false rather than throwing where the
+    # Windows principal is unavailable, so the stage skips instead of failing.)
+    assert out["s2"] == "skipped-elevation-required"
+    assert out["elevationProbe"] is False
     assert out["errCount"] == 2
+    assert out["elevationMessages"] == 1
     assert out["bodyCalls"] == 0
 
 
@@ -866,19 +881,40 @@ def test_run_diagnostics_bat_reports_collection_failures():
 
 def test_wpr_capture_completed_requires_zero_stop_exit_code():
     """A non-zero WPR stop result must never be certified as completed, even
-    if a non-empty ETL happened to be left behind."""
+    if a non-empty ETL happened to be left behind, and the trace must run in the
+    same window as the counters (background job, not a sequential tail)."""
     source = (REPO_ROOT / "src" / "Invoke-WindowsPerformanceDiagnostics.ps1").read_text(
         encoding="utf-8-sig"
     )
-    start = source.index("-StageName 'wpr-capture'")
-    end = source.index("if ($CaptureDefender)", start)
+    start = source.index("$wprResult = [ordered]@{")
+    end = source.index("# Marker job cleanup", start)
     wpr_block = source[start:end]
 
-    assert "if ($stopExitCode -eq 0 -and" in wpr_block
-    assert "WprStopFailed" in wpr_block
+    # stop-exit gating preserved from the pre-refactor contract
+    assert "elseif ($wprResult.stopExitCode -ne 0)" in wpr_block
+    assert "status = 'failed'" in wpr_block
+    stop_guard = wpr_block.index("elseif ($wprResult.stopExitCode -ne 0)")
     completed_at = wpr_block.index("status = 'completed'")
-    stop_guard = wpr_block.index("if ($stopExitCode -eq 0 -and")
     assert stop_guard < completed_at
+
+    # concurrency: the trace is launched as a job before sampling and joined after
+    job_start = source.index("Start-WprBoundedCaptureJob")
+    sample_loop = source.index("while (-not $captureComplete)")
+    job_join = source.index("Wait-Job -Job $wprBackgroundJob")
+    assert job_start < sample_loop < job_join
+    # the old sequential start-then-sleep-then-stop path is gone, and the default
+    # status when WPR was not requested is explicit rather than a blank field
+    assert "Start-Sleep -Seconds $DurationSeconds" not in source
+    assert "$wprCaptureStatus = 'not-requested'" in source
+    # memory mode (the documented bounded buffer): the recorded trace is started
+    # with exactly the profile and NOTHING appended. -filemode is documented as
+    # an unbounded on-disk file and -maxduration/-filesize are not documented
+    # wpr.exe switches at all, so no extra argument may ever be appended.
+    wpr_helper = source.split("function Start-WprBoundedCaptureJob")[1].split("function Get-UdpEndpointSample")[0]
+    assert "$startArguments = @('-start', $TraceProfile)" in wpr_helper
+    assert "$startArguments +=" not in wpr_helper
+    assert "maxduration" not in wpr_helper
+    assert "filesize" not in wpr_helper
 
 
 def test_plan_mode_lists_crash_analysis_action(tmp_path):
@@ -1245,9 +1281,20 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
     assert "-Verb RunAs" in text
     # CI must never hang on UAC: guard the elevation attempt
     assert 'if "%CI%"=="true"' in text
-    # Console menu with three operating modes plus Exit
-    for option in ("1 - Plan preview", "2 - Collect diagnostics", "3 - Verify an existing case", "4 - Exit"):
+    # Console menu with the three operating modes, incident capture, and Exit
+    for option in (
+        "1 - Plan preview",
+        "2 - Collect diagnostics",
+        "3 - Incident capture",
+        "4 - Verify an existing case",
+        "5 - Exit",
+    ):
         assert option in text, f"missing menu option {option!r}"
+    # the incident-capture path must reach the same elevatable Collect flow with
+    # its own consent flags and a marker-aware duration
+    assert ":opt_incident" in text
+    assert 'set "DURATION=120"' in text
+    assert "-DurationSeconds %DURATION%" in text
     # Consent flags remain explicit in the single launcher Collect flow
     assert "-Mode Collect" in text
     assert "-ConfirmLocalCollection" in text

@@ -375,6 +375,122 @@ def test_plan_mode_advertises_performance_capture_without_starting_a_trace(tmp_p
     assert not (output_directory / "diagnostic-manifest.json").exists()
 
 
+def test_report_renders_every_finding_category_it_publishes():
+    """findings.json must never contain a category report.html does not render.
+
+    The Windows live gate caught this: new attribution categories were written to
+    findings.json but fell outside the report's two buckets, so they silently
+    disappeared from the report while still being listed as evidence.
+    """
+    body = r"""
+$findings = @(
+    [pscustomobject]@{
+        category = 'cpu-pressure'; sourceArtifact = 'performance-samples.csv'; metric = 'AverageCpuLoadPercent'
+        windowStart = '2026-09-10T16:30:00Z'; windowEnd = '2026-09-10T16:31:00Z'
+        measuredValues = [ordered]@{ peak = 97.5 }
+        ruleCondition = 'cpu sustained'; uncertainty = 'u'; nextSteps = 'n'; suggestedWprProfile = 'GeneralProfile'
+    },
+    [pscustomobject]@{
+        category = 'coverage'; sourceArtifact = 'disk-samples.json'; metric = 'diskLatency'
+        windowStart = $null; windowEnd = $null; measuredValues = [ordered]@{ reason = 'no-io' }
+        ruleCondition = 'insufficient samples'; uncertainty = 'u'; nextSteps = 'n'; suggestedWprProfile = $null
+    },
+    [pscustomobject]@{
+        category = 'evidence-coverage'; sourceArtifact = 'diagnostic-manifest.json'; metric = 'traceWindowOverlap'
+        windowStart = '2026-09-10T16:30:00Z'; windowEnd = '2026-09-10T16:35:00Z'
+        measuredValues = [ordered]@{ status = 'covers-window'; wprActualSeconds = 345.2 }
+        ruleCondition = 'trace covers counters'; uncertainty = 'u'; nextSteps = 'n'; suggestedWprProfile = $null
+    },
+    [pscustomobject]@{
+        category = 'commit-attribution'; sourceArtifact = 'process-memory-samples.csv'; metric = 'PeakPrivateBytes'
+        windowStart = '2026-09-10T16:30:00Z'; windowEnd = '2026-09-10T16:35:00Z'
+        measuredValues = [ordered]@{ peakSystemCommittedBytes = 123456789; topFivePercentOfCommitLimit = 42.5 }
+        ruleCondition = 'per-process attribution'; uncertainty = 'u'; nextSteps = 'n'; suggestedWprProfile = 'GeneralProfile'
+    },
+    [pscustomobject]@{
+        category = 'brand-new-category'; sourceArtifact = 'some-artifact.json'; metric = 'someMetric'
+        windowStart = '2026-09-10T16:30:00Z'; windowEnd = '2026-09-10T16:35:00Z'
+        measuredValues = [ordered]@{ detail = 'must still be rendered' }
+        ruleCondition = 'future category'; uncertainty = 'u'; nextSteps = 'n'; suggestedWprProfile = $null
+    }
+)
+$html = ConvertTo-FindingsHtml -Findings $findings -Manifest $null -SymptomContext $null
+[pscustomobject]@{
+    Length = $html.Length
+    HasPressure = $html.Contains('Observed Pressure')
+    HasCoverageWarnings = $html.Contains('Coverage Warnings')
+    HasEvidenceCoverage = $html.Contains('Evidence Coverage')
+    HasAttribution = $html.Contains('Attribution And Supporting Evidence')
+    CategoryHeadings = @(@('cpu-pressure','evidence-coverage','commit-attribution','brand-new-category') | Where-Object { $html.Contains($_) })
+    Metrics = @(@('AverageCpuLoadPercent','traceWindowOverlap','PeakPrivateBytes','someMetric') | Where-Object { $html.Contains($_) })
+    MeasuredValues = @(@('97.5','covers-window','345.2','42.5','must still be rendered') | Where-Object { $html.Contains($_) })
+    NoFallbackClaim = -not $html.Contains('No Sustained Pressure Detected')
+} | ConvertTo-Json -Depth 6 -Compress
+"""
+    payload = json.loads(
+        run_pwsh(
+            body,
+            ["ConvertTo-FindingsHtml", "ConvertTo-HtmlEncoded", "Get-CaseJsonProperty"] + SUPPORT_FUNCTIONS,
+        )
+    )
+
+    assert payload["HasPressure"] is True
+    assert payload["HasCoverageWarnings"] is True
+    assert payload["HasEvidenceCoverage"] is True
+    assert payload["HasAttribution"] is True
+    # every published finding must be reachable in the report: pressure and
+    # attribution findings are headed by category, coverage/evidence findings by
+    # metric (the existing convention). A brand-new category the report does not
+    # know about must still be rendered rather than dropped.
+    assert payload["CategoryHeadings"] == [
+        "cpu-pressure",
+        "commit-attribution",
+        "brand-new-category",
+    ]
+    assert payload["Metrics"] == [
+        "AverageCpuLoadPercent",
+        "traceWindowOverlap",
+        "PeakPrivateBytes",
+        "someMetric",
+    ]
+    assert payload["MeasuredValues"] == [
+        "97.5",
+        "covers-window",
+        "345.2",
+        "42.5",
+        "must still be rendered",
+    ]
+    # a report WITH pressure findings must not also claim there was none
+    assert payload["NoFallbackClaim"] is True
+
+
+def test_report_still_states_a_result_when_only_attribution_findings_exist():
+    """With no pressure rule breached, the report must still say so explicitly."""
+    body = r"""
+$findings = @(
+    [pscustomobject]@{
+        category = 'commit-attribution'; sourceArtifact = 'process-memory-samples.csv'; metric = 'PeakPrivateBytes'
+        windowStart = '2026-09-10T16:30:00Z'; windowEnd = '2026-09-10T16:35:00Z'
+        measuredValues = [ordered]@{ topFivePercentOfCommitLimit = 12.0 }
+        ruleCondition = 'per-process attribution'; uncertainty = 'u'; nextSteps = 'n'; suggestedWprProfile = $null
+    }
+)
+$html = ConvertTo-FindingsHtml -Findings $findings -Manifest $null -SymptomContext $null
+[pscustomobject]@{
+    StatesNoPressure = $html.Contains('No Sustained Pressure Detected')
+    RendersAttribution = $html.Contains('Attribution And Supporting Evidence')
+} | ConvertTo-Json -Compress
+"""
+    payload = json.loads(
+        run_pwsh(
+            body,
+            ["ConvertTo-FindingsHtml", "ConvertTo-HtmlEncoded", "Get-CaseJsonProperty"] + SUPPORT_FUNCTIONS,
+        )
+    )
+    assert payload["RendersAttribution"] is True
+    assert payload["StatesNoPressure"] is True
+
+
 def test_schema_accepts_an_incident_capture_manifest(tmp_path):
     """A 1.2 manifest carrying the incident-capture blocks must validate, so the
     new evidence surface cannot drift away from the published contract."""

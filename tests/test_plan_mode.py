@@ -691,10 +691,10 @@ def test_remote_collection_source_uses_owned_staging_and_fail_closed_status():
 
 def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
     """Invoke-ConsentedCapture (dot-sourced) must record collectionErrors and
-    return the right status on the readiness-fail path, and must fail SAFE
-    (body never called) when the elevation check cannot run. Add-CollectionError
-    is defined after the plan-mode early exit, so the test stubs it; the real
-    elevation-skip semantics are live-gated by WPD-09 on Windows runners."""
+    return the right status on the readiness-fail path, and must SKIP (never run
+    the capture body) when the console is not elevated. On Linux the elevation
+    probe cannot succeed, which is exactly the non-admin case WPD-09 gates on
+    Windows, so the body must never be invoked."""
     script = str(SCRIPT).replace("\\", "/")
     command = (
         f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
@@ -711,7 +711,10 @@ def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
         "-ElevationMessage 'requires an elevated (Administrator) console; Defender performance capture skipped' -ElevationErrorId 'DefenderElevationRequired' "
         "-ReadyCheck { $true } "
         "-CaptureBody { $script:bodyCalls++; return [ordered]@{ status = 'completed' } }; "
-        "[ordered]@{ s1=$r1.status; s2=$r2.status; errCount=@($script:collectionErrors).Count; bodyCalls=$script:bodyCalls } | ConvertTo-Json -Depth 4"
+        "$elevationProbe = Test-IsElevatedConsole; "
+        "[ordered]@{ s1=$r1.status; s2=$r2.status; errCount=@($script:collectionErrors).Count; bodyCalls=$script:bodyCalls; "
+        "elevationMessages=@($script:collectionErrors | Where-Object { $_.Message -match 'elevated' }).Count; "
+        "elevationProbe=$elevationProbe } | ConvertTo-Json -Depth 4"
     )
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-Command", command],
@@ -724,11 +727,13 @@ def test_invoke_consented_capture_skip_and_elevation_paths(tmp_path):
     out = json.loads(result.stdout)
     # readiness fail: skip status + error recorded, body never called
     assert out["s1"] == "skipped-wpr-not-found"
-    # ready, but the elevation check cannot run on Linux (WindowsPrincipal is
-    # unsupported -> throws) - the helper must fail SAFE: status failed,
-    # error recorded, capture body never invoked
-    assert out["s2"] == "failed"
+    # ready but not elevated: skip with the elevation reason, body never invoked.
+    # (Test-IsElevatedConsole returns $false rather than throwing where the
+    # Windows principal is unavailable, so the stage skips instead of failing.)
+    assert out["s2"] == "skipped-elevation-required"
+    assert out["elevationProbe"] is False
     assert out["errCount"] == 2
+    assert out["elevationMessages"] == 1
     assert out["bodyCalls"] == 0
 
 

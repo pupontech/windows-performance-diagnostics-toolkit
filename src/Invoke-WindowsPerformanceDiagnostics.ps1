@@ -796,6 +796,24 @@ function Add-CasePackageBlock {
     return $CollectionManifest
 }
 
+function Test-IsElevatedConsole {
+    <#
+      True only when the current process is running in an Administrator role.
+      Isolated so both the consent-gated capture helper and the concurrent WPR
+      job path make the SAME decision, and so the non-admin branch stays
+      testable. Returns $false on hosts without a Windows principal (Linux CI).
+    #>
+    param()
+
+    try {
+        $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Invoke-ConsentedCapture {
     <#
       Shared skeleton for the WPR and Defender capture stages: readiness
@@ -852,7 +870,7 @@ function Invoke-ConsentedCapture {
             ))
         }
         else {
-            $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            $isElevated = Test-IsElevatedConsole
             if (-not $isElevated) {
                 Add-CollectionError -Stage $StageName -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
                     [System.Exception]::new($ElevationMessage),
@@ -1232,8 +1250,10 @@ function Start-WprBoundedCaptureJob {
         in size until it fills the disk" and states the default is memory; the
         memory buffer is the documented circular buffer, so the trace cannot
         balloon on disk the way the reported 1.13 GB run did.
-      - Duration is bounded by the caller's window: the trace is stopped as soon
-        as sampling finishes, and the recorded duration is the MEASURED wall
+      - Duration is bounded by the caller's window. The job stops the trace as
+        soon as the caller writes the stop sentinel (the parent does that the
+        moment counter sampling ends), and falls back to its own maximum window
+        if the sentinel never arrives. The recorded duration is the MEASURED wall
         clock, never the requested value.
       - MaxFileMB is an ADVISORY post-capture cap. wpr.exe has no documented
         file-size switch, so the size is enforced after the trace is written: an
@@ -1250,11 +1270,12 @@ function Start-WprBoundedCaptureJob {
         [Parameter(Mandatory = $true)][string]$EtlPath,
         [ValidateRange(5, 600)][int]$DurationSeconds = 60,
         [ValidateRange(0, 4096)][int]$MaxFileMB = 512,
-        [bool]$KeepOversizedTrace = $false
+        [bool]$KeepOversizedTrace = $false,
+        [Parameter(Mandatory = $true)][string]$StopSentinelPath
     )
 
     return Start-Job -ScriptBlock {
-        param($ExePath, $TraceProfile, $OutputPath, $Seconds, $MaxFileMB, $KeepOversized)
+        param($ExePath, $TraceProfile, $OutputPath, $Seconds, $MaxFileMB, $KeepOversized, $StopSentinel)
 
         $result = [ordered]@{
             StartExitCode = $null
@@ -1283,7 +1304,14 @@ function Start-WprBoundedCaptureJob {
         }
 
         if ($result.StartExitCode -eq 0) {
-            Start-Sleep -Seconds $Seconds
+            # Wait for the caller's stop sentinel (sampling finished) or the
+            # maximum window, whichever comes first. A fixed sleep here made the
+            # trace outlive the counters it is supposed to explain.
+            $deadline = (Get-Date).AddSeconds($Seconds)
+            while ((Get-Date) -lt $deadline) {
+                if (Test-Path -LiteralPath $StopSentinel -PathType Leaf) { break }
+                Start-Sleep -Milliseconds 500
+            }
             try {
                 & $ExePath -stop $OutputPath
                 $result.StopExitCode = $LASTEXITCODE
@@ -1345,7 +1373,7 @@ function Start-WprBoundedCaptureJob {
         }
 
         return [pscustomobject]$result
-    } -ArgumentList $WprExePath, $Profile, $EtlPath, $DurationSeconds, $MaxFileMB, $KeepOversizedTrace
+    } -ArgumentList $WprExePath, $Profile, $EtlPath, $DurationSeconds, $MaxFileMB, $KeepOversizedTrace, $StopSentinelPath
 }
 
 function Get-UdpEndpointSample {
@@ -3420,9 +3448,18 @@ function ConvertTo-FindingsHtml {
         }
     }
 
-    # Separate findings by category
+    # Findings are bucketed for the report AND every bucket is rendered. A
+    # category that matches no bucket would silently vanish from report.html
+    # while still sitting in findings.json - the Windows live gate catches that,
+    # and the local suite asserts it directly. Attribution ('commit-*') and any
+    # future category share the supporting-evidence section, so a new category
+    # can never be dropped just because the report does not know it yet.
     $pressureFindings = @($Findings | Where-Object { $_.category -match 'pressure|paging|disk' })
     $coverageFindings = @($Findings | Where-Object { $_.category -eq 'coverage' })
+    $evidenceFindings = @($Findings | Where-Object { $_.category -eq 'evidence-coverage' })
+    $otherFindings = @($Findings | Where-Object {
+            $_.category -notmatch 'pressure|paging|disk|coverage'
+        })
 
     if ($pressureFindings.Count -gt 0) {
         [void]$sb.AppendLine('<h2>Observed Pressure</h2>')
@@ -3438,6 +3475,11 @@ function ConvertTo-FindingsHtml {
                 [void]$sb.AppendLine("<tr><th>Window</th><td>$(ConvertTo-HtmlEncoded $finding.windowStart) to $(ConvertTo-HtmlEncoded $finding.windowEnd)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Rule</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
+            # The measured numbers are the evidence; a finding that names a rule
+            # without the values behind it cannot be checked by the reader.
+            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
             if ($finding.suggestedWprProfile) {
@@ -3465,7 +3507,49 @@ function ConvertTo-FindingsHtml {
         }
     }
 
-    if ($pressureFindings.Count -eq 0 -and $coverageFindings.Count -eq 0) {
+    if ($evidenceFindings.Count -gt 0) {
+        [void]$sb.AppendLine('<h2>Evidence Coverage</h2>')
+        [void]$sb.AppendLine('<p class="no-external">These findings describe how well the captured evidence covers the window it is supposed to explain.</p>')
+        foreach ($finding in $evidenceFindings) {
+            [void]$sb.AppendLine("<div class='finding coverage'>")
+            [void]$sb.AppendLine("<h3>$(ConvertTo-HtmlEncoded $finding.metric)</h3>")
+            [void]$sb.AppendLine('<table>')
+            [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Condition</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
+            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            }
+            [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
+            [void]$sb.AppendLine('</table>')
+            [void]$sb.AppendLine('</div>')
+        }
+    }
+
+    if ($otherFindings.Count -gt 0) {
+        [void]$sb.AppendLine('<h2>Attribution And Supporting Evidence</h2>')
+        [void]$sb.AppendLine('<p class="no-external">Attribution is not proof of causation: it says where a resource went, not why the machine slowed down.</p>')
+        foreach ($finding in $otherFindings) {
+            [void]$sb.AppendLine("<div class='finding pressure'>")
+            [void]$sb.AppendLine("<h3>$(ConvertTo-HtmlEncoded $finding.category)</h3>")
+            [void]$sb.AppendLine('<table>')
+            [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Metric</th><td>$(ConvertTo-HtmlEncoded $finding.metric)</td></tr>")
+            if ($finding.windowStart) {
+                [void]$sb.AppendLine("<tr><th>Window</th><td>$(ConvertTo-HtmlEncoded $finding.windowStart) to $(ConvertTo-HtmlEncoded $finding.windowEnd)</td></tr>")
+            }
+            [void]$sb.AppendLine("<tr><th>Rule</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
+            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            }
+            [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
+            [void]$sb.AppendLine('</table>')
+            [void]$sb.AppendLine('</div>')
+        }
+    }
+
+    if ($pressureFindings.Count -eq 0) {
         # Every source was usable and no sustained rule threshold was breached.
         # That is a completed measurement with a clear result, not missing
         # evidence - 'Insufficient Evidence' is reserved for the coverage
@@ -4083,6 +4167,10 @@ $processStartSnapshots = New-ProcessCpuSnapshot -Processes @(Get-Process -ErrorA
 $wprBackgroundJob = $null
 $wprStartedAtUtc = $null
 $wprEtlPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'wpr-trace.etl'
+# The stop sentinel is the handshake that ends the trace exactly when counter
+# sampling ends. It lives outside the case folder so it can never be mistaken
+# for collected evidence, and it is removed after the job is joined.
+$wprStopSentinelPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "wpd-wpr-stop-$PID.signal"
 $wprCaptureStatus = 'not-requested'
 $wprStartExitCode = $null
 $wprStartError = $null
@@ -4099,6 +4187,13 @@ if ($CaptureWpr) {
         $wprCaptureStatus = 'skipped-wpr-not-found'
         Add-CollectionErrorText -Stage 'wpr-capture' -Message 'wpr.exe not found; WPR capture skipped'
     }
+    elseif (-not (Test-IsElevatedConsole)) {
+        # Same gate as every other consent-gated capture: a non-admin console is
+        # skipped with an explicit reason, never auto-elevated and never left to
+        # fail halfway through starting a trace.
+        $wprCaptureStatus = 'skipped-elevation-required'
+        Add-CollectionErrorText -Stage 'wpr-capture' -Message 'WPR capture requires an elevated (Administrator) console; WPR capture skipped'
+    }
     else {
         # Run the whole bounded trace IN A BACKGROUND JOB so the trace
         # and the counter/process samples occupy the same wall-clock
@@ -4111,7 +4206,8 @@ if ($CaptureWpr) {
             -Profile $WprProfile `
             -EtlPath $wprEtlPath `
             -DurationSeconds $effectiveWprDurationSeconds `
-            -MaxFileMB $WprMaxFileMB
+            -MaxFileMB $WprMaxFileMB `
+            -StopSentinelPath $wprStopSentinelPath
     }
 }
 
@@ -4374,6 +4470,17 @@ $samplingStopwatch.Stop()
 $completedAtSamplingUtc = Get-UtcTimestamp
 $samplingActualSeconds = [Math]::Round((New-TimeSpan -Start ([datetime]$samplerStartUtc) -End ([datetime]$completedAtSamplingUtc)).TotalSeconds, 2)
 
+# Counter sampling is done: end the trace now so the ETL window matches the
+# counter window (the job also self-terminates at its maximum window).
+if ($null -ne $wprBackgroundJob) {
+    try {
+        Set-Content -LiteralPath $wprStopSentinelPath -Value $completedAtSamplingUtc -Encoding Ascii -ErrorAction Stop
+    }
+    catch {
+        Add-CollectionError -Stage 'wpr-stop-signal' -ErrorRecord $_
+    }
+}
+
 # ---- Concurrent WPR trace: stop it and record the REAL duration ---------------
 # The trace ran in parallel with the counters, so its window covers the same
 # interval by construction. Report the measured wall clock, not the request.
@@ -4400,9 +4507,10 @@ $wprResult = [ordered]@{
 
 if ($null -ne $wprBackgroundJob) {
     try {
-        # The job stops the trace itself after its window; allow a little slack
-        # for the stop and the ETL flush, then never leave it running.
-        $jobCompleted = Wait-Job -Job $wprBackgroundJob -Timeout 60
+        # The sentinel is already written (sampling finished), so the job exits
+        # after one poll interval plus the ETL flush. The timeout only has to
+        # cover a hung trace, not the trace window.
+        $jobCompleted = Wait-Job -Job $wprBackgroundJob -Timeout 180
         if ($null -eq $jobCompleted) {
             Stop-Job -Job $wprBackgroundJob -ErrorAction SilentlyContinue
             Add-CollectionErrorText -Stage 'wpr-capture' -Message 'WPR background capture did not finish within its window; job stopped'
@@ -4446,6 +4554,7 @@ if ($null -ne $wprBackgroundJob) {
     }
     finally {
         Remove-Job -Job $wprBackgroundJob -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $wprStopSentinelPath -Force -ErrorAction SilentlyContinue
     }
 
     if ($wprResult.status -eq 'running') {

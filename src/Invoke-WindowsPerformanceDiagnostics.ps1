@@ -2884,7 +2884,12 @@ $volumeMetrics = $null
 $previousDiskRaw = $null
 $diskSourceError = $null
 $consecutiveSampleFailures = 0
-for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
+$sampleIndex = 0
+# DurationSeconds is a wall-clock budget for the baseline sample window.  A
+# slow CIM request can finish just after the deadline, but it cannot add an
+# extra one-second sleep per sample and prolong the whole window.
+$samplingStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+while ($samplingStopwatch.Elapsed.TotalSeconds -lt $DurationSeconds) {
     try {
         $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
         $processors = Get-CimInstance -ClassName Win32_Processor
@@ -2947,8 +2952,17 @@ for ($sampleIndex = 0; $sampleIndex -lt $DurationSeconds; $sampleIndex++) {
         }
     }
 
-    if ($sampleIndex -lt ($DurationSeconds - 1)) {
-        Start-Sleep -Seconds 1
+    $sampleIndex++
+    $elapsedSeconds = $samplingStopwatch.Elapsed.TotalSeconds
+    $percentComplete = [Math]::Min(100, [Math]::Floor(($elapsedSeconds / $DurationSeconds) * 100))
+    Write-Output ([string]::Format('Sampling progress: sample {0}; {1}% of {2}-second baseline', $sampleIndex, $percentComplete, $DurationSeconds))
+
+    # Schedule against the original start time. This avoids drifting by the
+    # collection cost of each sample while keeping a roughly one-second cadence.
+    $nextSampleDueSeconds = [Math]::Min($sampleIndex, $DurationSeconds)
+    $sleepMilliseconds = [Math]::Max(0, [int][Math]::Round(($nextSampleDueSeconds - $samplingStopwatch.Elapsed.TotalSeconds) * 1000))
+    if ($sleepMilliseconds -gt 0) {
+        Start-Sleep -Milliseconds $sleepMilliseconds
     }
 }
 

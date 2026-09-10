@@ -87,6 +87,12 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
 
+`-DurationSeconds 30` is the wall-clock budget for the **baseline sampling**
+window. The console reports each completed sample and the baseline percentage.
+Collection then performs the selected event/network exports, report generation,
+hashing, and optional packaging. A selected WPR or Defender recording is a
+separate 30-second capture, so the full run takes longer than the baseline.
+
 Verify an existing case folder and its optional package without modifying it:
 
 ```powershell

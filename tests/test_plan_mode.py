@@ -107,6 +107,26 @@ def test_collect_mode_refuses_non_windows_hosts_before_any_collection(tmp_path):
     assert not output_directory.exists()
 
 
+def test_collect_progress_uses_a_wall_clock_deadline_and_launchers_explain_extra_stages():
+    """The requested duration is the baseline sampling wall-clock budget, not a
+    count of one-second sleeps after unbounded work. Operators must see live
+    sample/percentage progress and the default launcher must disclose that its
+    WPR trace and final export/package stages take additional time."""
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    start_here = (REPO_ROOT / "START-HERE.bat").read_bytes().decode("ascii")
+    run_diagnostics = (REPO_ROOT / "Run-Diagnostics.bat").read_bytes().decode("ascii")
+
+    assert "$samplingStopwatch = [System.Diagnostics.Stopwatch]::StartNew()" in source
+    assert "Sampling progress: sample {0}; {1}% of {2}-second baseline" in source
+    assert "Start-Sleep -Milliseconds $sleepMilliseconds" in source
+    sampling_region = source[source.index("$samples = New-Object System.Collections.ArrayList"):source.index("$completedAtSamplingUtc = Get-UtcTimestamp")]
+    assert "Start-Sleep -Seconds 1" not in sampling_region
+    assert "30-second baseline sampling" in start_here
+    assert "then a separate 30-second WPR trace" in start_here
+    assert "final export, hashing, and ZIP packaging" in start_here
+    assert "30-second baseline sampling" in run_diagnostics
+
+
 def test_plan_mode_with_wpr_lists_capture_action_and_scope(tmp_path):
     """Plan mode must advertise the WPR capture action without invoking it."""
     output_directory = tmp_path / "plan-wpr"

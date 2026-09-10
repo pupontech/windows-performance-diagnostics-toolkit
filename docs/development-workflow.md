@@ -31,7 +31,7 @@ being exercised on real Windows (GitHub-hosted VMs) first.
 
 | Job | Runner | Verifies |
 |---|---|---|
-| `linux-verify` | ubuntu-latest | pytest suite (plan mode, consent gates, WPR gates, schema, packaging, Verify mode) + pwsh parse gate |
+| `linux-verify` | ubuntu-latest | pytest suite (plan mode, consent gates, WPR gates, schema, packaging, Verify mode, and the incident-capture behavioral tests in `tests/test_incident_capture.py`) + pwsh parse gate |
 | `windows-verify` | windows-2022 **and** windows-2025 | Parse gates under Windows PowerShell 5.1 and pwsh 7; Plan mode; Collect-without-consent refusal; WPR-without-consent refusal; **invalid-`-OutputDirectory` clear error**; **executes the real `Run-Diagnostics.bat` via `cmd`**; executes START-HERE Plan/Collect/Verify modes and asserts `C:\Temp\WPD-Case\diagnostic-manifest.json` |
 | `CodeQL` | ubuntu-latest | Static analysis of Python test/support code and GitHub Actions workflows on every PR and `main` push; scheduled weekly scan. |
 
@@ -63,9 +63,15 @@ Every release, without exception:
 
 Per project policy the owner performs live Windows testing themselves (agents
 never set up VMs or run live installs). Track it as a board card per
-`docs/windows-live-test-matrix.md` (WPD-01..WPD-23). The release is considered
+`docs/windows-live-test-matrix.md` (WPD-01..WPD-31). The release is considered
 "shipped, pending owner live validation", never "validated on real Windows",
 until the owner records results back on the board.
+
+Incident-capture behavior that only real Windows can prove: the WPR trace
+actually covering the counter window (WPD-24), memory-mode bounding and the
+oversized-trace policy (WPD-25), real per-process commit/GPU/UDP values
+(WPD-26..WPD-28), event XML for providers Windows cannot render (WPD-29), and
+the drive-to-disk map (WPD-30). Linux CI proves the helpers and the wiring only.
 
 ## House rules (apply to every file)
 

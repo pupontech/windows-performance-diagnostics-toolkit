@@ -1,12 +1,17 @@
 # Windows Live Test Matrix
 
 This project is verified in hosted CI for PowerShell parsing (5.1 + pwsh),
-fixture/behavioral tests, and a controlled Windows smoke collection. The new
-raw-disk/in-window telemetry and findings/report paths still need an
-**owner-live Windows client run** (WPD-19..WPD-23 below); hosted runners only
-prove the code paths execute, not real device counter values. Run these tests on
-a disposable or approved Windows lab machine before using collection mode on a
-user endpoint.
+fixture/behavioral tests, and a controlled Windows smoke collection. The
+raw-disk/in-window telemetry, findings/report paths, and the incident-capture
+surface still need an **owner-live Windows client run** (WPD-19..WPD-31 below);
+hosted runners only prove the code paths execute, not real device counter values.
+Run these tests on a disposable or approved Windows lab machine before using
+collection mode on a user endpoint.
+
+The incident-capture rows (WPD-24..WPD-31) are the ones that matter most after a
+speed report: they check that the WPR trace actually covers the counter window,
+that the trace is bounded, and that per-process commit, GPU, UDP, and
+drive-to-disk evidence are present rather than merely plausible.
 
 ## Preconditions
 
@@ -42,6 +47,14 @@ user endpoint.
 | WPD-21 | Generate controlled disk I/O (copy a large file) during a 10 s collection, then run an idle 10 s collection | Under load, `disk-samples.json` has paired intervals with non-null read/write latency or throughput for the active disk and a queue reading. When idle/no I/O, latency is `null` with a coverage reason (never `0`), and no disk finding is fabricated from one reading. | `disk-samples.json`, `findings.json` |
 | WPD-22 | Inspect `findings.json` and `report.html` from a collection with a symptom | Findings cite `sourceArtifact`, `metric` and a real `windowStart`/`windowEnd` for sustained rules; report is standalone (no `<script>`, no external URLs), `SizeBytes` is entity-encoded, `report.html` is listed in manifest artifacts but omitted from its own index; insufficient/coverage data is clearly stated. | `findings.json`, `report.html`, manifest |
 | WPD-23 | Run `-Mode Verify` on the intact WPD-20/21 case, then append a byte to `report.html` and re-run | Intact case: exit 0, `status: "verified"`. Tampered report: exit 1, `status: "failed"` with a size/hash mismatch. Restore the report and confirm verification passes again. | JSON verification reports |
+| WPD-24 | Run an incident capture (`-PerformanceMode -MarkerMode -CaptureWpr -ConfirmWprCapture`, `-DurationSeconds 120`) and press Enter in the console about 40 s in | Manifest `captureWindow` shows `wprStartUtc` at or before `startedAtUtc` and `wprStopUtc` at or after `completedAtUtc`; `findings.json` contains an `evidence-coverage` finding with rule `covers-window` (not a missing/partial trace). `incident.windowStartUtc`/`windowEndUtc` are 60 s before and 30 s after the marked time, and `incident.droppedSampleCount` matches the samples outside that window. | `diagnostic-manifest.json` (`captureWindow`, `incident`), `findings.json` |
+| WPD-25 | Inspect the same case's `wpr` block and the case folder size | `wpr.loggingMode` is `memory`, `wpr.actualDurationSeconds` is a measured value close to (not equal to) the requested window, and no multi-GB ETL or `NGenPdb` symbol directory ships when the trace exceeds `-WprMaxFileMB` (`wpr.status` `removed-oversized`, `wpr.traceRemovedOversized` true). | Manifest `wpr` block, case folder listing |
+| WPD-26 | On a machine with the reported 80 GiB commit pressure (or any heavy memory user), run an incident capture and inspect the commit artifacts | `process-memory-samples.csv` has one row per tracked process per sample with non-null `PrivateBytes`/`PageFileBytes`; `process-memory-top.json` names the top consumers with a `PrivateBytesGrowth` value; `pagefile-metrics.json` reports `AllocatedBaseSizeMB`/`CurrentUsageMB`/`PeakUsageMB`/`Name`; `kernel-pool-samples.json` carries a paged/nonpaged series; `findings.json` has a `commit-attribution` finding whose `topFivePercentOfCommitLimit` is computed, not fabricated. | The four artifacts + `findings.json` |
+| WPD-27 | On an NVIDIA machine that has logged TDR/`nvlddmkm` errors, open `gpu-metrics.json` | `adapters` lists the GPU with driver version; `engines` has per-process `UtilizationPercentage` rows while a GPU workload runs; `processMemory` has dedicated/shared usage per process; `gpu.temperature.available`/`clocks.available` are `false` with a reason (Windows exposes no reliable consumer counter set) rather than a fabricated reading. | `gpu-metrics.json`, manifest `gpu` block |
+| WPD-28 | Reproduce UDP-port pressure (or inspect the warning source) and compare `network-state.json` with the live `netstat -ano` output | `network-state.json` is a small file (hundreds of KB at most, not hundreds of MB), `hostsFile.activeEntries` are plain strings, `udpEndpoints`/`udpEndpointCountByProcess` match `netstat -ano`, `dynamicUdpPortRanges` matches `netsh int ipv4 show dynamicport udp`, and `udp-samples.json` shows the per-process endpoint counts over the window. | `network-state.json`, `udp-samples.json`, live `netstat`/`netsh` output |
+| WPD-29 | Run an incident capture on a machine with a recent warning, then inspect `incident-events.json` | Events come from `System`/`Application` plus whichever WER/driver/PnP logs exist, each row carries `RawXml` and an `IncidentWindow` of `in-window` or `out-of-window`; events outside the window are still present (labelled) and the manifest `incidentEvents.inWindowEventCount`/`pulledEventCount` match the rows. Confirm at least one event whose message Windows cannot render still exposes readable `RawXml` EventData. | `incident-events.json`, manifest `incidentEvents`, Event Viewer comparison |
+| WPD-30 | On a machine with a separate archive/backup drive, inspect `storageMapping` and the report's Volumes row | Every drive letter names its backing physical disk; the drive hosting the pagefile is flagged `HostsPageFile` true; the report's Volume Relevance note makes clear that free space on a non-pagefile archive volume is not a performance cause. | Manifest `storageMapping`, `report.html` |
+| WPD-31 | Run `START-HERE.bat` → option 3 from a standard account | The incident-capture text explains the shared window and the Enter-to-mark behavior, a UAC prompt appears only for the collection step, a 120 s window runs with WPR, and the manifest records `performanceMode` in `scope` plus the marker block when Enter was pressed. | Menu screenshot, console output, manifest |
 
 ## Approved collection example
 

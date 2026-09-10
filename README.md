@@ -2,7 +2,7 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.9.1
+**Version:** 1.0.0
 
 **Status:** Slowdown diagnosis toolkit with symptom context, in-window telemetry (PID+StartTime interval CPU percentage, paired raw-disk latency/throughput/queue, memory committed/limit and paging, volume free space), findings engine with sustained-pressure rules and coverage warnings, standalone offline HTML report, and read-only case verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM. The new raw-disk/in-window telemetry and findings/report paths are covered by fixture tests and a hosted Windows smoke run; an **owner-live Windows client run is still required** before any remediation planning (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
@@ -90,8 +90,61 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
 `-DurationSeconds 30` is the wall-clock budget for the **baseline sampling**
 window. The console reports each completed sample and the baseline percentage.
 Collection then performs the selected event/network exports, report generation,
-hashing, and optional packaging. A selected WPR or Defender recording is a
-separate 30-second capture, so the full run takes longer than the baseline.
+hashing, and optional packaging. A selected WPR or Defender recording now runs
+**concurrently with the baseline sampling** under one shared capture window, so
+the trace covers the same minutes the counters cover; the report prints the
+requested and actual duration of each stage instead of a nominal figure.
+
+## Incident capture (`-PerformanceMode`, `-MarkerMode`)
+
+A 30-second baseline is easy to spend on the wrong 30 seconds. The
+performance-capture surface exists so the evidence describes the incident:
+
+```powershell
+powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
+  -Mode Collect `
+  -ConfirmLocalCollection `
+  -PerformanceMode `
+  -MarkerMode `
+  -ConfirmWprCapture -CaptureWpr `
+  -DurationSeconds 120 `
+  -OutputDirectory C:\Temp\WPD-Case-002
+```
+
+- **One capture window.** Performance counters, repeated per-process commit
+  samples, kernel pool, pagefile, GPU, disk, UDP endpoints, and the WPR trace all
+  start and stop together. The manifest records `captureWindow` with the real
+  start/stop of each stage, and `findings.json` gains an evidence-coverage
+  finding that says plainly when a trace does **not** cover the counters
+  (`trace-starts-after-counters`, `partial-overlap`, and so on).
+- **Symptom marker (`-MarkerMode`).** Press Enter when the slowdown happens (or
+  write the marker file for unattended runs). Sampling keeps the
+  `-MarkerPreSeconds` before the marker and `-MarkerPostSeconds` after it (60/30
+  by default), and the manifest reports how many samples were kept and dropped.
+- **Commit attribution.** Working set alone cannot explain a system commit
+  charge. Every sample records per-process private bytes (commit charge),
+  working set and private working set, pagefile bytes and peak, virtual bytes,
+  paged/nonpaged pool, plus the system pagefile size, current and peak usage,
+  and location — written to `process-memory-samples.csv` with a
+  `process-memory-top.json` summary.
+- **GPU attribution.** Per-process engine utilization and dedicated/shared GPU
+  memory, adapter list, driver version, and a TDR/LiveKernelEvent/WHEA/
+  `nvlddmkm` event sweep with raw XML for events Windows cannot render. Windows
+  exposes no reliable *consumer* GPU temperature or clock counter set; rather
+  than invent one, `gpu-metrics.json` records `available: false` with the reason.
+- **UDP diagnostics.** UDP endpoints are counted per owning process, alongside
+  the configured dynamic port ranges, so UDP-port exhaustion is visible in a
+  report that previously only looked at TCP connections.
+- **Storage relevance.** Each drive letter is mapped to its backing physical
+  disk and to the pagefile host, so low free space on an unrelated archive or
+  backup volume is not read as a performance cause.
+- **Bounded WPR.** The trace runs in **memory mode** — the documented bounded
+  circular buffer; Microsoft documents `-filemode` as "an unbounded file, which
+  can grow in size until it fills the disk". The window auto-sizes to outlast the
+  counters, the actual duration is recorded, and `-WprMaxFileMB` (512 by default)
+  removes an oversized trace plus the managed-symbol files WPR writes next to it
+  instead of shipping gigabytes. WPR stays off unless `-CaptureWpr` and
+  `-ConfirmWprCapture` are both supplied.
 
 Verify an existing case folder and its optional package without modifying it:
 

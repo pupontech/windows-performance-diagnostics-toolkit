@@ -3,22 +3,37 @@
   "title": "Windows Performance Diagnostics Toolkit Report",
   "description": "Schema for diagnostic-plan.json (Plan mode) and diagnostic-manifest.json (Collect mode) emitted by the Windows Performance Diagnostics Toolkit.",
   "type": "object",
-  "required": ["schemaVersion", "toolName", "toolVersion", "mode", "safety"],
+  "required": [
+    "schemaVersion",
+    "toolName",
+    "toolVersion",
+    "mode",
+    "safety"
+  ],
   "properties": {
     "schemaVersion": {
       "type": "string",
-      "enum": ["1.0", "1.1"]
+      "enum": [
+        "1.0",
+        "1.1",
+        "1.2"
+      ]
     },
     "toolName": {
       "type": "string",
-      "enum": ["Windows Performance Diagnostics Toolkit"]
+      "enum": [
+        "Windows Performance Diagnostics Toolkit"
+      ]
     },
     "toolVersion": {
       "type": "string"
     },
     "mode": {
       "type": "string",
-      "enum": ["Plan", "Collect"]
+      "enum": [
+        "Plan",
+        "Collect"
+      ]
     },
     "generatedAtUtc": {
       "type": "string",
@@ -62,7 +77,9 @@
         },
         "remoteTransport": {
           "type": "string",
-          "enum": ["winrm"]
+          "enum": [
+            "winrm"
+          ]
         }
       },
       "additionalProperties": false
@@ -78,7 +95,16 @@
       "properties": {
         "profile": {
           "type": "string",
-          "enum": ["GeneralProfile", "CPU", "DiskIO", "FileIO", "Network", "Power", "GPU", "Registry"]
+          "enum": [
+            "GeneralProfile",
+            "CPU",
+            "DiskIO",
+            "FileIO",
+            "Network",
+            "Power",
+            "GPU",
+            "Registry"
+          ]
         },
         "durationSeconds": {
           "type": "integer",
@@ -86,25 +112,121 @@
           "maximum": 300
         },
         "etlFilePath": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "startedAtUtc": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "format": "date-time"
         },
         "completedAtUtc": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "format": "date-time"
         },
         "startExitCode": {
-          "type": ["integer", "null"]
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "stopExitCode": {
-          "type": ["integer", "null"]
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "status": {
           "type": "string",
-          "enum": ["completed", "skipped-wpr-not-found", "skipped-elevation-required", "failed"]
+          "enum": [
+            "completed",
+            "skipped-wpr-not-found",
+            "skipped-elevation-required",
+            "failed",
+            "running",
+            "not-requested",
+            "removed-oversized"
+          ]
+        },
+        "requestedDurationSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 600
+        },
+        "actualDurationSeconds": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "maxFileMB": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "concurrentWithSampling": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "etlBytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "autoSizedDuration": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "loggingMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectiveDurationSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 5,
+          "maximum": 600
+        },
+        "sizeLimitExceeded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "traceRemovedOversized": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "relatedArtifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
         }
       },
       "additionalProperties": false
@@ -113,27 +235,61 @@
       "type": "object",
       "properties": {
         "durationSeconds": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 5,
-          "maximum": 300
+          "maximum": 600
         },
         "etlFilePath": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "startedAtUtc": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "format": "date-time"
         },
         "completedAtUtc": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "format": "date-time"
         },
         "moduleVersion": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "status": {
           "type": "string",
-          "enum": ["completed", "skipped-defender-module-not-found", "skipped-elevation-required", "failed"]
+          "enum": [
+            "completed",
+            "skipped-defender-module-not-found",
+            "skipped-elevation-required",
+            "failed"
+          ]
+        },
+        "requestedDurationSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 600
+        },
+        "autoSizedDuration": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -156,7 +312,11 @@
         },
         "status": {
           "type": "string",
-          "enum": ["completed", "failed", "skipped-no-minidumps"]
+          "enum": [
+            "completed",
+            "failed",
+            "skipped-no-minidumps"
+          ]
         },
         "memoryDump": {
           "type": "object",
@@ -165,10 +325,16 @@
               "type": "boolean"
             },
             "sizeBytes": {
-              "type": ["integer", "null"]
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "lastWriteTimeUtc": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "format": "date-time"
             }
           },
@@ -223,7 +389,10 @@
         },
         "status": {
           "type": "string",
-          "enum": ["completed", "failed"]
+          "enum": [
+            "completed",
+            "failed"
+          ]
         },
         "copiedCount": {
           "type": "integer"
@@ -246,16 +415,25 @@
                 "type": "boolean"
               },
               "sizeBytes": {
-                "type": ["integer", "null"]
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "copied": {
                 "type": "boolean"
               },
               "copiedTo": {
-                "type": ["string", "null"]
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "skippedReason": {
-                "type": ["string", "null"]
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "additionalProperties": false
@@ -282,7 +460,10 @@
         },
         "status": {
           "type": "string",
-          "enum": ["completed", "failed"]
+          "enum": [
+            "completed",
+            "failed"
+          ]
         },
         "zipPath": {
           "type": "string"
@@ -306,18 +487,29 @@
         },
         "transport": {
           "type": "string",
-          "enum": ["winrm"]
+          "enum": [
+            "winrm"
+          ]
         },
         "winrmStatus": {
           "type": "string",
-          "enum": ["ok", "failed-winrm-unavailable"]
+          "enum": [
+            "ok",
+            "failed-winrm-unavailable"
+          ]
         },
         "remoteOutputDirectory": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "status": {
           "type": "string",
-          "enum": ["completed", "failed"]
+          "enum": [
+            "completed",
+            "failed"
+          ]
         },
         "pulledFileCount": {
           "type": "integer"
@@ -354,6 +546,36 @@
         },
         "systemEventLookbackHours": {
           "type": "integer"
+        },
+        "sampleIntervalSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "performanceMode": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "markerMode": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "eventWindowMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxTrackedProcesses": {
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "additionalProperties": true
@@ -366,16 +588,28 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "type": ["boolean", "null"]
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "recordCount": {
-          "type": ["integer", "null"]
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "pulledCount": {
-          "type": ["integer", "null"]
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "skippedUnrenderableCount": {
-          "type": ["integer", "null"]
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -389,14 +623,23 @@
             "type": "object",
             "properties": {
               "TimeCreated": {
-                "type": ["string", "null"],
+                "type": [
+                  "string",
+                  "null"
+                ],
                 "format": "date-time"
               },
               "BugcheckCode": {
-                "type": ["string", "null"]
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "Message": {
-                "type": ["string", "null"]
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "additionalProperties": false
@@ -408,11 +651,17 @@
             "type": "object",
             "properties": {
               "TimeCreated": {
-                "type": ["string", "null"],
+                "type": [
+                  "string",
+                  "null"
+                ],
                 "format": "date-time"
               },
               "Message": {
-                "type": ["string", "null"]
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "additionalProperties": false
@@ -433,7 +682,10 @@
         },
         "status": {
           "type": "string",
-          "enum": ["completed", "failed"]
+          "enum": [
+            "completed",
+            "failed"
+          ]
         },
         "artifact": {
           "type": "string"
@@ -442,10 +694,16 @@
           "type": "object",
           "properties": {
             "rawIpReachable": {
-              "type": ["boolean", "null"]
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "dnsResolutionOk": {
-              "type": ["boolean", "null"]
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "verdict": {
               "type": "string",
@@ -474,6 +732,93 @@
         },
         "sectionErrorCount": {
           "type": "integer"
+        },
+        "udpEndpointCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "dynamicUdpPortRanges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "Family": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "StartPort": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "PortCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "EndPort": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "udpEndpointCountByProcess": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "OwningProcess": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "ProcessName": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "EndpointCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "dynamicUdpPortUsage": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "totalUdpEndpoints": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "endpointsInsideDynamicRange": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -483,12 +828,23 @@
       "description": "Optional user-reported symptom context. Present in both Plan and Collect modes when -SymptomContext is provided. Records the reported symptom separately from the collection window timestamps.",
       "properties": {
         "reported": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "The user-provided symptom description. Absent when only a preset was supplied."
         },
         "preset": {
           "type": "string",
-          "enum": ["baseline", "cpu-heavy", "memory-pressure", "storage-io", "network-io", "boot-slowdown", "application-freeze"],
+          "enum": [
+            "baseline",
+            "cpu-heavy",
+            "memory-pressure",
+            "storage-io",
+            "network-io",
+            "boot-slowdown",
+            "application-freeze"
+          ],
           "description": "Optional collection preset chosen by the user."
         },
         "collectionWindow": {
@@ -514,14 +870,19 @@
           "additionalProperties": false
         }
       },
-      "required": ["collectionWindow"],
+      "required": [
+        "collectionWindow"
+      ],
       "additionalProperties": false
     },
     "collectionErrors": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["Stage", "Message"],
+        "required": [
+          "Stage",
+          "Message"
+        ],
         "properties": {
           "Stage": {
             "type": "string"
@@ -539,18 +900,75 @@
       "items": {
         "type": "object",
         "properties": {
-          "Name": { "type": "string" },
-          "PercentDiskTime": { "type": ["integer", "null"] },
-          "PercentDiskReadTime": { "type": ["integer", "null"] },
-          "PercentDiskWriteTime": { "type": ["integer", "null"] },
-          "DiskReadsPerSec": { "type": ["integer", "null"] },
-          "DiskWritesPerSec": { "type": ["integer", "null"] },
-          "DiskBytesPerSec": { "type": ["integer", "null"] },
-          "DiskReadBytesPerSec": { "type": ["integer", "null"] },
-          "DiskWriteBytesPerSec": { "type": ["integer", "null"] },
-          "CurrentDiskQueueLength": { "type": ["integer", "null"] },
-          "AvgDiskReadQueueLength": { "type": ["number", "null"] },
-          "AvgDiskWriteQueueLength": { "type": ["number", "null"] }
+          "Name": {
+            "type": "string"
+          },
+          "PercentDiskTime": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "PercentDiskReadTime": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "PercentDiskWriteTime": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "DiskReadsPerSec": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "DiskWritesPerSec": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "DiskBytesPerSec": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "DiskReadBytesPerSec": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "DiskWriteBytesPerSec": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "CurrentDiskQueueLength": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "AvgDiskReadQueueLength": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "AvgDiskWriteQueueLength": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
         },
         "additionalProperties": false
       }
@@ -561,12 +979,42 @@
       "items": {
         "type": "object",
         "properties": {
-          "DriveLetter": { "type": ["string", "null"] },
-          "Label": { "type": ["string", "null"] },
-          "FileSystem": { "type": ["string", "null"] },
-          "CapacityBytes": { "type": ["integer", "null"] },
-          "FreeSpaceBytes": { "type": ["integer", "null"] },
-          "PercentFree": { "type": ["number", "null"] }
+          "DriveLetter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "Label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "FileSystem": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "CapacityBytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "FreeSpaceBytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "PercentFree": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
         },
         "additionalProperties": false
       }
@@ -575,14 +1023,57 @@
       "type": "object",
       "description": "Memory committed bytes, commit limit, available bytes, and paging indicators from Win32_PerfFormattedData_PerfOS_Memory. Null when CIM classes are unavailable.",
       "properties": {
-        "committedBytes": { "type": ["integer", "null"] },
-        "commitLimitBytes": { "type": ["integer", "null"] },
-        "availableBytes": { "type": ["integer", "null"] },
-        "pageFaultsPerSec": { "type": ["integer", "null"], "description": "Total page faults per second (soft+hard). Not equivalent to hard faults alone." },
-        "pageReadsPerSec": { "type": ["integer", "null"], "description": "Hard page faults: pages read from disk to resolve page faults." },
-        "pageWritesPerSec": { "type": ["integer", "null"] },
-        "pagesInputPerSec": { "type": ["integer", "null"], "description": "Pages moved from disk to memory (hard fault input)." },
-        "pagesOutputPerSec": { "type": ["integer", "null"] }
+        "committedBytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "commitLimitBytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "availableBytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pageFaultsPerSec": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Total page faults per second (soft+hard). Not equivalent to hard faults alone."
+        },
+        "pageReadsPerSec": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Hard page faults: pages read from disk to resolve page faults."
+        },
+        "pageWritesPerSec": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pagesInputPerSec": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Pages moved from disk to memory (hard fault input)."
+        },
+        "pagesOutputPerSec": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
       },
       "additionalProperties": false
     },
@@ -590,7 +1081,11 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["Name", "SizeBytes", "Sha256"],
+        "required": [
+          "Name",
+          "SizeBytes",
+          "Sha256"
+        ],
         "properties": {
           "Name": {
             "type": "string"
@@ -602,6 +1097,518 @@
           "Sha256": {
             "type": "string",
             "pattern": "^[A-Fa-f0-9]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "performanceMode": {
+      "type": "object",
+      "description": "Plan-mode advertisement of the concurrent incident-capture stages.",
+      "properties": {
+        "concurrentCaptureWindow": {
+          "type": "boolean"
+        },
+        "baselineSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sampleIntervalSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "markerMode": {
+          "type": "boolean"
+        },
+        "markerPreSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "markerPostSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxTrackedProcesses": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "eventWindowMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "captureWindow": {
+      "type": "object",
+      "description": "The single wall-clock window shared by counters, process/commit, GPU, disk, UDP and the WPR trace, with requested-vs-actual durations.",
+      "properties": {
+        "startedAtUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "completedAtUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "requestedBaselineSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "actualBaselineSeconds": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sampleCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "wprStartUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "wprStopUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "wprRequestedSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "wprActualSeconds": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "gpuCollectedAtUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "concurrentStages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "wprEffectiveSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 5,
+          "maximum": 600
+        },
+        "wprAutoSizedDuration": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "incident": {
+      "type": "object",
+      "description": "Incident-marker bookkeeping: when the operator marked the slowdown and how many samples were retained before/after it.",
+      "properties": {
+        "markerMode": {
+          "type": "boolean"
+        },
+        "markerObservedAtUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "markerSource": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windowStartUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "windowEndUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "preSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "postSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "retainedSampleCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "droppedSampleCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "processMemory": {
+      "type": "object",
+      "description": "Per-process commit attribution summary; the full repeated series lives in process-memory-samples.csv.",
+      "properties": {
+        "artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "topArtifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "distinctProcessCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "top": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "gpu": {
+      "type": "object",
+      "description": "GPU attribution summary; per-process engine utilization and dedicated/shared memory live in gpu-metrics.json.",
+      "properties": {
+        "artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "adapterCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "engineSampleCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "processMemorySampleCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "temperature": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "clocks": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "pageFile": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "Pagefile size, current usage, peak usage and location per pagefile (Win32_PageFileUsage; sizes in MiB).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "Name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "DriveLetter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "AllocatedBaseSizeMB": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "CurrentUsageMB": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "PeakUsageMB": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "TempPageFile": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "kernelPool": {
+      "type": "object",
+      "description": "System-wide paged/nonpaged kernel pool summary; the repeated series lives in kernel-pool-samples.json.",
+      "properties": {
+        "artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sampleCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "latestPoolPagedBytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "latestPoolNonpagedBytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "storageMapping": {
+      "type": "object",
+      "description": "Drive letter -> physical disk mapping plus pagefile placement, so low free space on an unrelated archive volume is not misread as a performance cause.",
+      "properties": {
+        "drives": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "incidentEvents": {
+      "type": "object",
+      "description": "Incident-window event correlation: which logs were read, how many events fell inside the window, and that out-of-window events are labelled rather than dropped.",
+      "properties": {
+        "artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windowStartUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "windowEndUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "windowPaddingMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pulledEventCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "inWindowEventCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "logs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "LogName": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "EventCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "SkippedUnrenderableCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "Status": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "liveKernelReports": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "LiveKernelReports on disk (WHEA/TDR residue), read-only metadata.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "Name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "FullPath": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "SizeBytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "LastWriteTimeUtc": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "Directory": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false

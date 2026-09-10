@@ -47,7 +47,39 @@ param(
     [string]$SymptomContext,
 
     [ValidateSet('baseline', 'cpu-heavy', 'memory-pressure', 'storage-io', 'network-io', 'boot-slowdown', 'application-freeze')]
-    [string]$Preset
+    [string]$Preset,
+
+    # ---- Incident capture mode (v1.0) -----------------------------------
+    # Everything below shares ONE capture window: WPR, process/commit samples,
+    # GPU, memory, disk and UDP/endpoint series all start and stop together so
+    # the trace can actually explain the counters.
+    [switch]$PerformanceMode,
+
+    # WPR trace window. 0 = AUTO: sized to cover the whole capture window
+    # (baseline + marker post-window + a margin) so the trace can never end
+    # before the counters it is supposed to explain.
+    [ValidateRange(0, 600)]
+    [int]$WprDurationSeconds = 0,
+
+    [ValidateRange(0, 4096)]
+    [int]$WprMaxFileMB = 512,
+
+    [ValidateRange(1, 30)]
+    [int]$SampleIntervalSeconds = 1,
+
+    [switch]$MarkerMode,
+
+    [ValidateRange(0, 600)]
+    [int]$MarkerPreSeconds = 60,
+
+    [ValidateRange(5, 600)]
+    [int]$MarkerPostSeconds = 30,
+
+    [ValidateRange(0, 120)]
+    [int]$EventWindowMinutes = 15,
+
+    [ValidateRange(1, 500)]
+    [int]$MaxTrackedProcesses = 60
 )
 
 Set-StrictMode -Version Latest
@@ -56,7 +88,7 @@ $ErrorActionPreference = 'Stop'
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
 # keeps the two in sync so drift fails CI.
-$script:ScriptVersion = '0.9.1'
+$script:ScriptVersion = '1.0.0'
 try {
     $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
 }
@@ -69,6 +101,17 @@ catch {
 # recorded as metadata only and never copied.
 $script:MaxMinidumpTotalBytes = 512MB
 $script:MaxBootFailureLogBytes = 100MB
+
+# Effective WPR trace window. An explicit -WprDurationSeconds is honoured
+# verbatim; 0 (the default) auto-sizes the trace to outlast the counter window
+# (baseline + the marker post-window + a margin) so the ETL can never end before
+# the counters it is supposed to explain. Computed here because Plan mode
+# advertises it too.
+$markerExtraSeconds = if ($MarkerMode) { $MarkerPostSeconds } else { 0 }
+$effectiveWprDurationSeconds = $WprDurationSeconds
+if ($effectiveWprDurationSeconds -le 0) {
+    $effectiveWprDurationSeconds = [Math]::Min(600, [Math]::Max(60, ($DurationSeconds + $markerExtraSeconds + 15)))
+}
 
 # Collection-error accumulator and its helpers are defined before any mode
 # dispatch so the shared Collect-tail function (Write-CollectionOutputs) can be
@@ -920,6 +963,581 @@ function Get-EventsSafe {
     }
 }
 
+function ConvertTo-HostsEntryLines {
+    <#
+      Flattens hosts-file content into plain, non-empty, non-comment STRINGS.
+
+      Root cause this exists for: the previous implementation piped Select-String
+      output straight into the network state, so every "entry" was a MatchInfo
+      object whose PSObject graph drags in PSProvider, reflection metadata,
+      assemblies and defined types. Network-state.json serialized to 555 MB as a
+      result. A hosts file has a handful of lines, so the report should be a
+      handful of bytes.
+
+      Accepts file lines OR MatchInfo-like objects (anything with .Line) so a
+      future refactor cannot silently reintroduce provider objects.
+    #>
+    param([AllowNull()][object[]]$Lines)
+
+    $entries = @()
+    foreach ($line in @($Lines)) {
+        if ($null -eq $line) { continue }
+        $text = $null
+        if ($line -is [string]) {
+            $text = $line
+        }
+        else {
+            $text = Get-SafeObjectProperty -InputObject $line -Name 'Line'
+            if ($null -eq $text) { $text = [string]$line }
+        }
+        $trimmed = ([string]$text).Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        $entries += [string]$trimmed
+    }
+    return , @($entries)
+}
+
+function Get-EventsWithRawXml {
+    <#
+      Reads a log via the low-level .NET reader and returns each record with its
+      raw event XML. Windows cannot render the message when a provider's
+      message-resource DLL is missing or mismatched - the XML survives, so a
+      technician can still read the EventData (the nvlddmkm / TDR / LiveKernel
+      fault path hits this constantly). Record-by-record keeps one bad provider
+      from wiping the query, exactly like Get-EventsSafe.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$LogName,
+        [Parameter(Mandatory = $true)][datetime]$StartTime,
+        [int]$MaxEvents = 200,
+        [int]$MaxXmlChars = 8000
+    )
+
+    $isoTime = $StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+    $xpath = "*[System[TimeCreated[@SystemTime>='$isoTime']]]"
+    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($LogName, [System.Diagnostics.Eventing.Reader.PathType]::LogName, $xpath)
+    $query.ReverseDirection = $true
+    $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
+    $buffer = New-Object System.Collections.ArrayList
+    $skipped = 0
+    try {
+        $rec = $reader.ReadEvent()
+        while ($null -ne $rec) {
+            try {
+                $msg = $null
+                try {
+                    $msg = $rec.FormatDescription()
+                }
+                catch {
+                    $msg = "[message text unavailable: $($_.Exception.Message)]"
+                    $skipped++
+                }
+                $level = $null
+                try {
+                    $level = $rec.LevelDisplayName
+                }
+                catch {
+                    $level = "Level$($rec.Level)"
+                }
+                $rawXml = $null
+                try {
+                    $rawXml = $rec.ToXml()
+                }
+                catch {
+                    $rawXml = $null
+                }
+                if ($null -ne $rawXml -and $rawXml.Length -gt $MaxXmlChars) {
+                    $rawXml = $rawXml.Substring(0, $MaxXmlChars) + '<!-- truncated -->'
+                }
+                [void]$buffer.Add([pscustomobject]@{
+                    TimeCreated = $rec.TimeCreated
+                    LevelDisplayName = $level
+                    Id = $rec.Id
+                    ProviderName = $rec.ProviderName
+                    LogName = [string]$LogName
+                    Message = $msg
+                    RawXml = $rawXml
+                })
+                if ($buffer.Count -ge $MaxEvents) {
+                    break
+                }
+            }
+            finally {
+                $rec.Dispose()
+            }
+            $rec = $reader.ReadEvent()
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+    return [pscustomobject]@{
+        Events = @($buffer)
+        SkippedMessageCount = $skipped
+    }
+}
+
+function Add-IncidentWindowLabels {
+    <#
+      Pure labelling step: every event keeps its row and gains an
+      IncidentWindow field of 'in-window' or 'out-of-window' (or $null when the
+      window is unusable). Out-of-window events are labelled, never dropped, so
+      the report can distinguish "happened during the incident" from "background
+      noise that also exists on this machine".
+    #>
+    param(
+        [AllowNull()][object[]]$Events,
+        [AllowNull()][object]$WindowStart,
+        [AllowNull()][object]$WindowEnd,
+        [int]$WindowMinutes = 15
+    )
+
+    $rows = @()
+    foreach ($event in @($Events)) {
+        if ($null -eq $event) { continue }
+        $rows += [pscustomobject]@{
+            TimeCreated = Get-SafeObjectProperty -InputObject $event -Name 'TimeCreated'
+            IncidentWindow = Test-IncidentWindowMembership `
+                -EventTime (Get-SafeObjectProperty -InputObject $event -Name 'TimeCreated') `
+                -WindowStart $WindowStart `
+                -WindowEnd $WindowEnd `
+                -WindowMinutes $WindowMinutes
+            LevelDisplayName = Get-SafeObjectProperty -InputObject $event -Name 'LevelDisplayName'
+            Id = Get-SafeObjectProperty -InputObject $event -Name 'Id'
+            ProviderName = Get-SafeObjectProperty -InputObject $event -Name 'ProviderName'
+            LogName = Get-SafeObjectProperty -InputObject $event -Name 'LogName'
+            Message = Get-SafeObjectProperty -InputObject $event -Name 'Message'
+            RawXml = Get-SafeObjectProperty -InputObject $event -Name 'RawXml'
+        }
+    }
+    return $rows
+}
+
+function Get-StorageTopology {
+    <#
+      Maps each drive letter to the physical disk that backs it, plus the
+      partition/offset. Low free space on a drive that does not back the working
+      set, the pagefile, or the application cache is irrelevant to a
+      performance complaint; without this map the report cannot say which
+      volumes actually matter. Uses Win32_LogicalDiskToPartition +
+      Win32_DiskDriveToDiskPartition (documented association classes).
+    #>
+    param()
+
+    $driveToDisk = [ordered]@{}
+    try {
+        $partitionToDisk = @{}
+        foreach ($mapping in @(Get-CimInstance -ClassName 'Win32_DiskDriveToDiskPartition' -ErrorAction Stop)) {
+            $disk = $mapping.Antecedent
+            $partition = $mapping.Dependent
+            if ($null -eq $disk -or $null -eq $partition) { continue }
+            $partitionToDisk[[string]$partition.DeviceID] = [string]$disk.DeviceID
+        }
+
+        $diskDetails = @{}
+        foreach ($disk in @(Get-CimInstance -ClassName 'Win32_DiskDrive' -ErrorAction Stop)) {
+            $diskDetails[[string]$disk.DeviceID] = [pscustomobject]@{
+                Model = [string]$disk.Model
+                SerialNumber = [string]$disk.SerialNumber
+                MediaType = [string]$disk.MediaType
+                SizeBytes = Get-SafeObjectProperty -InputObject $disk -Name 'Size'
+            }
+        }
+
+        foreach ($mapping in @(Get-CimInstance -ClassName 'Win32_LogicalDiskToPartition' -ErrorAction Stop)) {
+            $partition = $mapping.Antecedent
+            $logicalDisk = $mapping.Dependent
+            if ($null -eq $partition -or $null -eq $logicalDisk) { continue }
+            $partitionId = [string]$partition.DeviceID
+            $deviceId = [string]$logicalDisk.DeviceID
+            $diskId = $null
+            if ($partitionToDisk.ContainsKey($partitionId)) { $diskId = $partitionToDisk[$partitionId] }
+            $diskInfo = $null
+            if ($null -ne $diskId -and $diskDetails.ContainsKey($diskId)) { $diskInfo = $diskDetails[$diskId] }
+            $driveToDisk[$deviceId] = [pscustomobject]@{
+                DriveLetter = $deviceId
+                PartitionDeviceId = $partitionId
+                DiskDeviceId = $diskId
+                DiskModel = if ($null -ne $diskInfo) { $diskInfo.Model } else { $null }
+                DiskSerialNumber = if ($null -ne $diskInfo) { $diskInfo.SerialNumber } else { $null }
+                DiskMediaType = if ($null -ne $diskInfo) { $diskInfo.MediaType } else { $null }
+                DiskSizeBytes = if ($null -ne $diskInfo) { $diskInfo.SizeBytes } else { $null }
+            }
+        }
+    }
+    catch {
+        Add-CollectionErrorText -Stage 'storage-topology' -Message "Storage topology mapping unavailable: $($_.Exception.Message)"
+    }
+    return $driveToDisk
+}
+
+function Get-VolumeStorageMapping {
+    <#
+      Joins per-volume free space (Get-VolumeMetrics output) with the drive
+      letter -> physical disk map and the pagefile placement, so a report can
+      say "C: is on the NVMe, D: (archive) is on the SATA drive and is NOT the
+      pagefile host". Pure join over supplied data.
+    #>
+    param(
+        [AllowNull()][object[]]$VolumeMetrics,
+        [AllowNull()][object]$DriveToDiskMap,
+        [AllowNull()][object[]]$PageFileMetrics
+    )
+
+    $pageFileDrives = @()
+    foreach ($pageFile in @($PageFileMetrics)) {
+        $driveLetter = Get-SafeObjectProperty -InputObject $pageFile -Name 'DriveLetter'
+        if (-not [string]::IsNullOrWhiteSpace([string]$driveLetter)) { $pageFileDrives += ([string]$driveLetter).ToUpperInvariant() }
+    }
+
+    $rows = @()
+    foreach ($volume in @($VolumeMetrics)) {
+        if ($null -eq $volume) { continue }
+        $driveLetter = [string](Get-SafeObjectProperty -InputObject $volume -Name 'DriveLetter')
+        $diskInfo = $null
+        if ($null -ne $DriveToDiskMap) {
+            if ($DriveToDiskMap -is [System.Collections.IDictionary]) {
+                if ($DriveToDiskMap.Contains($driveLetter)) { $diskInfo = $DriveToDiskMap[$driveLetter] }
+            }
+            else {
+                $property = $DriveToDiskMap.PSObject.Properties[$driveLetter]
+                if ($null -ne $property) { $diskInfo = $property.Value }
+            }
+        }
+        $rows += [pscustomobject]@{
+            DriveLetter = $driveLetter
+            Label = Get-SafeObjectProperty -InputObject $volume -Name 'Label'
+            FileSystem = Get-SafeObjectProperty -InputObject $volume -Name 'FileSystem'
+            CapacityBytes = Get-SafeObjectProperty -InputObject $volume -Name 'CapacityBytes'
+            FreeSpaceBytes = Get-SafeObjectProperty -InputObject $volume -Name 'FreeSpaceBytes'
+            PercentFree = Get-SafeObjectProperty -InputObject $volume -Name 'PercentFree'
+            PhysicalDiskModel = if ($null -ne $diskInfo) { Get-SafeObjectProperty -InputObject $diskInfo -Name 'DiskModel' } else { $null }
+            PhysicalDiskDeviceId = if ($null -ne $diskInfo) { Get-SafeObjectProperty -InputObject $diskInfo -Name 'DiskDeviceId' } else { $null }
+            HostsPageFile = ($pageFileDrives -contains $driveLetter.ToUpperInvariant())
+        }
+    }
+    return $rows
+}
+
+function Start-WprBoundedCaptureJob {
+    <#
+      Runs one COMPLETE bounded WPR trace as a background job: start, wait out
+      the window while the parent keeps sampling counters, then stop and report.
+
+      Bounding, using ONLY documented wpr.exe behavior
+      (https://learn.microsoft.com/windows-hardware/test/wpt/wpr-command-line-options):
+      - MEMORY mode is used deliberately (no -filemode). Microsoft documents
+        -filemode as "the data is recorded to an unbounded file, which can grow
+        in size until it fills the disk" and states the default is memory; the
+        memory buffer is the documented circular buffer, so the trace cannot
+        balloon on disk the way the reported 1.13 GB run did.
+      - Duration is bounded by the caller's window: the trace is stopped as soon
+        as sampling finishes, and the recorded duration is the MEASURED wall
+        clock, never the requested value.
+      - MaxFileMB is an ADVISORY post-capture cap. wpr.exe has no documented
+        file-size switch, so the size is enforced after the trace is written: an
+        oversized ETL (and the managed-symbol files WPR writes next to it) is
+        removed and reported, instead of shipping gigabytes in the case folder.
+
+      Returns a live job object whose result carries
+      { StartExitCode, StopExitCode, StartedAtUtc, CompletedAtUtc, ElapsedSeconds,
+        EtlPath, EtlBytes, SizeLimitExceeded, TraceRemoved, RelatedArtifacts, Error }.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$WprExePath,
+        [Parameter(Mandatory = $true)][string]$Profile,
+        [Parameter(Mandatory = $true)][string]$EtlPath,
+        [ValidateRange(5, 600)][int]$DurationSeconds = 60,
+        [ValidateRange(0, 4096)][int]$MaxFileMB = 512,
+        [bool]$KeepOversizedTrace = $false
+    )
+
+    return Start-Job -ScriptBlock {
+        param($ExePath, $TraceProfile, $OutputPath, $Seconds, $MaxFileMB, $KeepOversized)
+
+        $result = [ordered]@{
+            StartExitCode = $null
+            StopExitCode = $null
+            StartedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            CompletedAtUtc = $null
+            ElapsedSeconds = $null
+            EtlPath = $OutputPath
+            EtlBytes = $null
+            SizeLimitExceeded = $false
+            TraceRemoved = $false
+            RelatedArtifacts = @()
+            Error = $null
+        }
+
+        $startArguments = @('-start', $TraceProfile)
+        try {
+            & $ExePath @startArguments
+            $result.StartExitCode = $LASTEXITCODE
+        }
+        catch {
+            $result.StartExitCode = -1
+            $result.Error = $_.Exception.Message
+            $result.CompletedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            return [pscustomobject]$result
+        }
+
+        if ($result.StartExitCode -eq 0) {
+            Start-Sleep -Seconds $Seconds
+            try {
+                & $ExePath -stop $OutputPath
+                $result.StopExitCode = $LASTEXITCODE
+            }
+            catch {
+                $result.StopExitCode = -1
+                $result.Error = $_.Exception.Message
+            }
+        }
+
+        $result.CompletedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        try {
+            $result.ElapsedSeconds = [Math]::Round(
+                (New-TimeSpan -Start ([datetime]$result.StartedAtUtc) -End ([datetime]$result.CompletedAtUtc)).TotalSeconds, 2)
+        }
+        catch {
+            $result.ElapsedSeconds = $null
+        }
+
+        if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+            $etlItem = Get-Item -LiteralPath $OutputPath
+            $result.EtlBytes = $etlItem.Length
+
+            # WPR writes managed-symbol artifacts alongside the trace; collect
+            # them so the case folder does not silently carry a second payload.
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($OutputPath)
+            $siblings = @()
+            try {
+                $siblings = @(Get-ChildItem -LiteralPath $etlItem.DirectoryName -Force -ErrorAction Stop |
+                    Where-Object {
+                        $_.FullName -ne $etlItem.FullName -and
+                        $_.Name -like ($baseName + '*')
+                    })
+            }
+            catch {
+                $siblings = @()
+            }
+            foreach ($sibling in $siblings) {
+                $siblingBytes = $null
+                if (-not $sibling.PSIsContainer) { $siblingBytes = $sibling.Length }
+                $result.RelatedArtifacts += [pscustomobject]@{
+                    Name = $sibling.Name
+                    FullPath = $sibling.FullName
+                    IsDirectory = [bool]$sibling.PSIsContainer
+                    SizeBytes = $siblingBytes
+                }
+            }
+
+            if ($MaxFileMB -gt 0 -and ([int64]$etlItem.Length -gt ([int64]$MaxFileMB * 1MB))) {
+                $result.SizeLimitExceeded = $true
+                if (-not $KeepOversized) {
+                    Remove-Item -LiteralPath $etlItem.FullName -Force -ErrorAction SilentlyContinue
+                    foreach ($sibling in $siblings) {
+                        Remove-Item -LiteralPath $sibling.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    $result.TraceRemoved = -not (Test-Path -LiteralPath $OutputPath -PathType Leaf)
+                }
+            }
+        }
+
+        return [pscustomobject]$result
+    } -ArgumentList $WprExePath, $Profile, $EtlPath, $DurationSeconds, $MaxFileMB, $KeepOversizedTrace
+}
+
+function Get-UdpEndpointSample {
+    <#
+      One UDP endpoint census: total endpoints, endpoints grouped by owning
+      PID/process, and how many fall inside the configured dynamic range.
+      UDP exhaustion is invisible to a TCP-only view, and endpoint counts that
+      grow across samples identify the process that is leaking them.
+
+      -NetstatOutput lets a test feed synthetic `netstat -ano` text instead of
+      running netstat, so the grouping math is verifiable off-Windows.
+    #>
+    param(
+        [AllowNull()][string[]]$NetstatOutput
+    )
+
+    if ($null -ne $NetstatOutput) {
+        $netstatLines = @($NetstatOutput)
+    }
+    else {
+        $netstatLines = @(& netstat -ano)
+    }
+
+    $endpoints = @(
+        $netstatLines | Where-Object { $_ -match '^\s*UDP' } | ForEach-Object {
+            $parts = @(($_ -split '\s+') | Where-Object { $_ })
+            if ($parts.Count -ge 4) {
+                $localEndpoint = $parts[1]
+                $owningProcess = $parts[3]
+                $processName = $null
+                try {
+                    $processName = (Get-Process -Id ([int]$owningProcess) -ErrorAction Stop).ProcessName
+                }
+                catch {
+                    $processName = $null
+                }
+                [pscustomobject]@{
+                    LocalAddress = ($localEndpoint -split ':')[0]
+                    LocalPort = [int](($localEndpoint -split ':')[-1])
+                    OwningProcess = [int]$owningProcess
+                    ProcessName = $processName
+                }
+            }
+        }
+    )
+    if ($endpoints.Count -eq 0) { return $null }
+
+    $byProcess = @(
+        $endpoints | Group-Object -Property OwningProcess | ForEach-Object {
+            [pscustomobject]@{
+                OwningProcess = [int]$_.Name
+                ProcessName = @($_.Group | Select-Object -First 1)[0].ProcessName
+                EndpointCount = $_.Count
+            }
+        } | Sort-Object -Property EndpointCount -Descending
+    )
+
+    return [pscustomobject]@{
+        TimestampUtc = Get-UtcTimestamp
+        TotalUdpEndpoints = $endpoints.Count
+        EndpointsByProcess = @($byProcess)
+    }
+}
+
+function Select-MarkerRetainedSeries {
+    <#
+      Pure retention rule for marker mode. Without a marker the whole baseline
+      series is returned (unchanged behavior). With a marker the retained series
+      is MarkerPreSeconds of samples before the marker plus every sample up to
+      MarkerPostSeconds after it; the caller reports what was dropped so the
+      retention is explicit rather than silent.
+    #>
+    param(
+        [AllowNull()][object[]]$Samples,
+        [AllowNull()][object]$MarkerTimeUtc,
+        [ValidateRange(0, 600)][int]$MarkerPreSeconds = 60,
+        [ValidateRange(5, 600)][int]$MarkerPostSeconds = 30
+    )
+
+    $all = @($Samples | Where-Object { $null -ne $_ })
+    if ($null -eq $MarkerTimeUtc) {
+        return [pscustomobject]@{
+            Series = $all
+            IncidentWindowStartUtc = $null
+            IncidentWindowEndUtc = $null
+            RetainedSampleCount = $all.Count
+            DroppedSampleCount = 0
+            MarkerApplied = $false
+        }
+    }
+
+    $markerUtc = $null
+    try { $markerUtc = ([datetime]$MarkerTimeUtc).ToUniversalTime() } catch { $markerUtc = $null }
+    if ($null -eq $markerUtc) {
+        return [pscustomobject]@{
+            Series = $all
+            IncidentWindowStartUtc = $null
+            IncidentWindowEndUtc = $null
+            RetainedSampleCount = $all.Count
+            DroppedSampleCount = 0
+            MarkerApplied = $false
+        }
+    }
+
+    $windowStart = $markerUtc.AddSeconds(-1 * $MarkerPreSeconds)
+    $windowEnd = $markerUtc.AddSeconds($MarkerPostSeconds)
+    $retained = @()
+    foreach ($sample in $all) {
+        $stamp = Get-SafeObjectProperty -InputObject $sample -Name 'TimestampUtc'
+        if ($null -eq $stamp) { continue }
+        $sampleUtc = $null
+        try { $sampleUtc = ([datetime]$stamp).ToUniversalTime() } catch { $sampleUtc = $null }
+        if ($null -eq $sampleUtc) { continue }
+        if ($sampleUtc -ge $windowStart -and $sampleUtc -le $windowEnd) {
+            $retained += $sample
+        }
+    }
+
+    return [pscustomobject]@{
+        Series = $retained
+        IncidentWindowStartUtc = $windowStart
+        IncidentWindowEndUtc = $windowEnd
+        RetainedSampleCount = $retained.Count
+        DroppedSampleCount = ($all.Count - $retained.Count)
+        MarkerApplied = $true
+    }
+}
+
+function Test-CaptureWindowCoverage {
+    <#
+      Pure check that the WPR trace actually covers the counter-sampling window.
+      A trace that starts after the counters stopped cannot explain the pressure
+      they recorded - that was a real defect, so the report must be able to say
+      so instead of implying the ETL covers the incident.
+      Returns { Covers, Status, Detail } where Status is one of
+      'covers-window', 'trace-starts-after-counters', 'trace-ends-before-counters',
+      'partial-overlap', 'no-trace', 'no-window'.
+    #>
+    param(
+        [AllowNull()][object]$CaptureWindow,
+        [AllowNull()][object]$WprStartUtc,
+        [AllowNull()][object]$WprStopUtc
+    )
+
+    $samplingStart = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'startedAtUtc'
+    $samplingEnd = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'completedAtUtc'
+
+    if ($null -eq $samplingStart -or $null -eq $samplingEnd) {
+        return [pscustomobject]@{ Covers = $false; Status = 'no-window'; Detail = 'Counter window start/end unavailable; overlap cannot be established.' }
+    }
+    if ($null -eq $WprStartUtc -or $null -eq $WprStopUtc) {
+        return [pscustomobject]@{ Covers = $false; Status = 'no-trace'; Detail = 'No WPR trace was recorded for this collection.' }
+    }
+
+    try {
+        $sStart = ([datetime]$samplingStart).ToUniversalTime()
+        $sEnd = ([datetime]$samplingEnd).ToUniversalTime()
+        $tStart = ([datetime]$WprStartUtc).ToUniversalTime()
+        $tStop = ([datetime]$WprStopUtc).ToUniversalTime()
+    }
+    catch {
+        return [pscustomobject]@{ Covers = $false; Status = 'no-window'; Detail = 'Window timestamps could not be parsed.' }
+    }
+
+    if ($tStart -ge $sEnd) {
+        return [pscustomobject]@{
+            Covers = $false
+            Status = 'trace-starts-after-counters'
+            Detail = "The trace started at $($tStart.ToString('o')), after the counters stopped at $($sEnd.ToString('o')); the trace cannot explain the sampled pressure."
+        }
+    }
+    if ($tStop -le $sStart) {
+        return [pscustomobject]@{
+            Covers = $false
+            Status = 'trace-ends-before-counters'
+            Detail = "The trace ended at $($tStop.ToString('o')), before the counters started at $($sStart.ToString('o')); the trace cannot explain the sampled pressure."
+        }
+    }
+    if ($tStart -gt $sStart -or $tStop -lt $sEnd) {
+        return [pscustomobject]@{
+            Covers = $false
+            Status = 'partial-overlap'
+            Detail = "The trace window $($tStart.ToString('o'))..$($tStop.ToString('o')) only partially overlaps the counter window $($sStart.ToString('o'))..$($sEnd.ToString('o'))."
+        }
+    }
+    return [pscustomobject]@{
+        Covers = $true
+        Status = 'covers-window'
+        Detail = "The trace window $($tStart.ToString('o'))..$($tStop.ToString('o')) fully covers the counter window $($sStart.ToString('o'))..$($sEnd.ToString('o'))."
+    }
+}
+
 function Get-CrashAnalysis {
     <#
       Decodes BSOD/bugcheck evidence and flags unexplained abrupt shutdowns:
@@ -1227,10 +1845,11 @@ function Get-NetworkState {
         $hostsPath = Join-Path -Path $env:SystemRoot -ChildPath 'System32\drivers\etc\hosts'
         $activeEntries = @()
         if (Test-Path -LiteralPath $hostsPath) {
-            $activeEntries = @(
-                Get-Content -LiteralPath $hostsPath |
-                    Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }
-            )
+            # Materialize plain strings BEFORE serialization. Select-String /
+            # Where-Object emit MatchInfo objects whose PSObject graph pulls in
+            # PSProvider, reflection metadata, assemblies and defined types; a
+            # single hosts file then serializes into hundreds of megabytes.
+            $activeEntries = ConvertTo-HostsEntryLines -Lines @(Get-Content -LiteralPath $hostsPath)
         }
         $state['hostsFile'] = [ordered]@{
             path = $hostsPath
@@ -1244,11 +1863,24 @@ function Get-NetworkState {
 
     try {
         $winhttpProxy = ((netsh winhttp show proxy) -join "`n")
-        $ieProxy = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue |
-            Select-Object ProxyEnable, ProxyServer, AutoConfigURL
+        # Cast to a plain string array: a registry read returns provider-backed
+        # objects that drag the whole PSObject graph into the JSON.
+        $ieProxyValues = @()
+        $ieProxy = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+        if ($null -ne $ieProxy) {
+            foreach ($proxyName in @('ProxyEnable', 'ProxyServer', 'AutoConfigURL')) {
+                $proxyValue = Get-PropertyValue -InputObject $ieProxy -Name $proxyName
+                if ($null -ne $proxyValue) {
+                    $ieProxyValues += [pscustomobject]@{
+                        Name = $proxyName
+                        Value = [string]$proxyValue
+                    }
+                }
+            }
+        }
         $state['proxySettings'] = [ordered]@{
             winhttpProxy = $winhttpProxy
-            internetSettings = @($ieProxy)
+            internetSettings = @($ieProxyValues)
         }
     }
     catch {
@@ -1259,6 +1891,8 @@ function Get-NetworkState {
         # netstat -ano instead of Get-NetTCPConnection: the cmdlet enumerates
         # per-connection owning processes and can take minutes for a restricted
         # token (batch-logon standard user); netstat is native and instant.
+        # UDP has no State column, so it is parsed separately - UDP endpoint
+        # exhaustion is a real fault mode that a TCP-only view cannot see.
         $tcpConnections = @(
             (& netstat -ano) | Where-Object { $_ -match '^\s*TCP' } | ForEach-Object {
                 $parts = @(($_ -split '\s+') | Where-Object { $_ })
@@ -1275,9 +1909,85 @@ function Get-NetworkState {
             } | Where-Object { $_.State -in @('ESTABLISHED', 'LISTENING') } | Sort-Object LocalPort
         )
         $state['tcpConnections'] = $tcpConnections
+
+        $udpEndpoints = @(
+            (& netstat -ano) | Where-Object { $_ -match '^\s*UDP' } | ForEach-Object {
+                $parts = @(($_ -split '\s+') | Where-Object { $_ })
+                if ($parts.Count -ge 4) {
+                    $localEndpoint = $parts[1]
+                    $owningProcess = $parts[3]
+                    $processName = $null
+                    try {
+                        $processName = (Get-Process -Id ([int]$owningProcess) -ErrorAction Stop).ProcessName
+                    }
+                    catch {
+                        $processName = $null
+                    }
+                    [pscustomobject]@{
+                        LocalAddress = ($localEndpoint -split ':')[0]
+                        LocalPort = [int](($localEndpoint -split ':')[-1])
+                        OwningProcess = [int]$owningProcess
+                        ProcessName = $processName
+                    }
+                }
+            }
+        )
+        $state['udpEndpoints'] = $udpEndpoints
+        $state['udpEndpointCountByProcess'] = @(
+            $udpEndpoints | Group-Object -Property OwningProcess | ForEach-Object {
+                [pscustomobject]@{
+                    OwningProcess = [int]$_.Name
+                    ProcessName = @($_.Group | Select-Object -First 1)[0].ProcessName
+                    EndpointCount = $_.Count
+                }
+            } | Sort-Object -Property EndpointCount -Descending
+        )
     }
     catch {
         $errors += [pscustomobject]@{ Section = 'tcp-connections'; Message = $_.Exception.Message }
+    }
+
+    try {
+        # The configured dynamic (ephemeral) port ranges bound how many UDP
+        # endpoints can exist at once - the denominator for an exhaustion call.
+        $dynamicUdpRanges = @()
+        foreach ($family in @('ipv4', 'ipv6')) {
+            try {
+                $rangeOutput = ((& netsh int $family show dynamicport udp) -join ' ')
+                $startMatch = [regex]::Match($rangeOutput, 'start port\s*:\s*(\d+)', 'IgnoreCase')
+                $numberMatch = [regex]::Match($rangeOutput, 'number of ports\s*:\s*(\d+)', 'IgnoreCase')
+                if ($startMatch.Success -and $numberMatch.Success) {
+                    $rangeStart = [int]$startMatch.Groups[1].Value
+                    $rangeCount = [int]$numberMatch.Groups[1].Value
+                    $dynamicUdpRanges += [pscustomobject]@{
+                        Family = $family
+                        StartPort = $rangeStart
+                        PortCount = $rangeCount
+                        EndPort = $rangeStart + $rangeCount - 1
+                    }
+                }
+            }
+            catch {
+                $errors += [pscustomobject]@{ Section = "dynamic-udp-range-$family"; Message = $_.Exception.Message }
+            }
+        }
+        $state['dynamicUdpPortRanges'] = @($dynamicUdpRanges)
+        $inRangeCount = 0
+        foreach ($endpoint in $udpEndpoints) {
+            foreach ($range in $dynamicUdpRanges) {
+                if ($endpoint.LocalPort -ge $range.StartPort -and $endpoint.LocalPort -le $range.EndPort) {
+                    $inRangeCount++
+                    break
+                }
+            }
+        }
+        $state['dynamicUdpPortUsage'] = [ordered]@{
+            totalUdpEndpoints = $udpEndpoints.Count
+            endpointsInsideDynamicRange = $inRangeCount
+        }
+    }
+    catch {
+        $errors += [pscustomobject]@{ Section = 'dynamic-udp-range'; Message = $_.Exception.Message }
     }
 
     try {
@@ -1355,6 +2065,245 @@ function Get-SafeObjectProperty {
     }
     catch { }
     return $null
+}
+
+function Get-PerProcessMemorySample {
+    <#
+      Repeated per-process commit attribution from
+      Win32_PerfFormattedData_PerfProc_Process. Working-set alone cannot answer
+      "what consumed the commit charge": PrivateBytes is the process commit
+      charge, PageFileBytes is its pagefile-backed share, and WorkingSetPrivate
+      separates private resident memory from shared pages. _Total is excluded
+      (it double-counts the per-process rows). Returns a flat PSCustomObject
+      list, never provider-backed objects, so JSON serialization stays small.
+    #>
+    param(
+        [ValidateRange(1, 2000)][int]$MaxProcesses = 60
+    )
+
+    $counters = @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfProc_Process' -ErrorAction Stop |
+        Where-Object { $_.Name -ne '_Total' })
+    if ($counters.Count -eq 0) { return @() }
+
+    return @($counters | ForEach-Object {
+        [pscustomobject]@{
+            Name = [string]$_.Name
+            Id = [int]$_.IDProcess
+            PrivateBytes = [int64]$_.PrivateBytes
+            WorkingSet = [int64]$_.WorkingSet
+            WorkingSetPrivate = [int64]$_.WorkingSetPrivate
+            PageFileBytes = [int64]$_.PageFileBytes
+            PageFileBytesPeak = [int64]$_.PageFileBytesPeak
+            VirtualBytes = [int64]$_.VirtualBytes
+            PoolPagedBytes = [int64]$_.PoolPagedBytes
+            PoolNonpagedBytes = [int64]$_.PoolNonpagedBytes
+            HandleCount = [int]$_.HandleCount
+            ThreadCount = [int]$_.ThreadCount
+        }
+    } | Sort-Object -Property PrivateBytes -Descending | Select-Object -First $MaxProcesses)
+}
+
+function Get-KernelPoolMetrics {
+    <#
+      System-wide paged/nonpaged kernel pool from
+      Win32_PerfFormattedData_PerfOS_Memory. Pool growth is a classic cause of
+      unexplained commit/nonpaged charge that per-process views miss.
+    #>
+    param()
+
+    try {
+        $memory = Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_Memory' -ErrorAction Stop
+        return [pscustomobject]@{
+            poolPagedBytes = Get-SafeObjectProperty -InputObject $memory -Name 'PoolPagedBytes'
+            poolNonpagedBytes = Get-SafeObjectProperty -InputObject $memory -Name 'PoolNonpagedBytes'
+            poolPagedResidentBytes = Get-SafeObjectProperty -InputObject $memory -Name 'PoolPagedResidentBytes'
+            systemCacheResidentBytes = Get-SafeObjectProperty -InputObject $memory -Name 'SystemCacheResidentBytes'
+            cacheBytes = Get-SafeObjectProperty -InputObject $memory -Name 'CacheBytes'
+        }
+    }
+    catch {
+        Add-CollectionErrorText -Stage 'kernel-pool' -Message "Win32_PerfFormattedData_PerfOS_Memory pool counters unavailable: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-PageFileMetrics {
+    <#
+      Pagefile size, current usage, peak usage and location from
+      Win32_PageFileUsage (AllocatedBaseSize/CurrentUsage/PeakUsage are MiB,
+      Name is the pagefile path). TempPageFile marks a system-managed temporary
+      pagefile. Returns null when the class is unavailable.
+    #>
+    param()
+
+    try {
+        $pageFiles = @(Get-CimInstance -ClassName 'Win32_PageFileUsage' -ErrorAction Stop)
+        if ($pageFiles.Count -eq 0) { return $null }
+        return @($pageFiles | ForEach-Object {
+            [pscustomobject]@{
+                Name = [string]$_.Name
+                DriveLetter = if ($_.Name -match '^([A-Za-z]):') { $matches[1].ToUpperInvariant() + ':' } else { $null }
+                AllocatedBaseSizeMB = Get-SafeObjectProperty -InputObject $_ -Name 'AllocatedBaseSize'
+                CurrentUsageMB = Get-SafeObjectProperty -InputObject $_ -Name 'CurrentUsage'
+                PeakUsageMB = Get-SafeObjectProperty -InputObject $_ -Name 'PeakUsage'
+                TempPageFile = Get-SafeObjectProperty -InputObject $_ -Name 'TempPageFile'
+            }
+        })
+    }
+    catch {
+        Add-CollectionErrorText -Stage 'pagefile-metrics' -Message "Win32_PageFileUsage unavailable: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function ConvertFrom-GpuCounterPath {
+    <#
+      Pure parser for a PDH instance path such as
+      "\\<machine>\GPU Engine(pid_1234_luid_0x00000000_0x0000ABCD_phys_0_eng_1_engtype_3D)\Utilization Percentage"
+      or the already-split instance name "pid_1234_..._engtype_3D".
+      Returns the PID, engine type and LUID, or $null when the instance is not a
+      per-process GPU instance. Kept separate from the collection so it is
+      testable without a GPU.
+    #>
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $instance = $Path
+    if ($Path -match '\(([^()]*)\)') { $instance = $matches[1] }
+
+    $pidMatch = [regex]::Match($instance, 'pid_(\d+)', 'IgnoreCase')
+    if (-not $pidMatch.Success) { return $null }
+
+    $engineMatch = [regex]::Match($instance, 'engtype_([A-Za-z0-9_]+)', 'IgnoreCase')
+    $luidMatch = [regex]::Match($instance, 'luid_(0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)', 'IgnoreCase')
+
+    return [pscustomobject]@{
+        ProcessId = [int]$pidMatch.Groups[1].Value
+        EngineType = if ($engineMatch.Success) { $engineMatch.Groups[1].Value } else { $null }
+        Luid = if ($luidMatch.Success) { $luidMatch.Groups[1].Value } else { $null }
+        InstanceName = $instance
+    }
+}
+
+function Get-GpuMetrics {
+    <#
+      GPU attribution from the Windows GPU performance-counter sets:
+      GPU Engine (*)\Utilization Percentage (per process+engine) and
+      GPU Process Memory (*)\Dedicated Usage / Shared Usage / Total Committed.
+      GPU description, driver version, adapter RAM and video-processor driver
+      come from Win32_VideoController. Temperature and clocks are NOT available
+      from these counter sets on most systems, so they are reported as
+      unavailable rather than guessed. Returns a flat PSCustomObject block or
+      $null when the GPU counters are absent (integrated/headless hosts).
+    #>
+    param()
+
+    $block = [ordered]@{
+        collectedAtUtc = Get-UtcTimestamp
+        adapters = @()
+        engines = @()
+        processMemory = @()
+        temperature = [ordered]@{ available = $false; reason = 'no-windows-gpu-temperature-counter-set' }
+        clocks = [ordered]@{ available = $false; reason = 'no-windows-gpu-clock-counter-set' }
+    }
+
+    try {
+        $controllers = @(Get-CimInstance -ClassName 'Win32_VideoController' -ErrorAction Stop)
+        $block.adapters = @($controllers | ForEach-Object {
+            [pscustomobject]@{
+                Name = [string](Get-SafeObjectProperty -InputObject $_ -Name 'Name')
+                DriverVersion = [string](Get-SafeObjectProperty -InputObject $_ -Name 'DriverVersion')
+                DriverDate = [string](Get-SafeObjectProperty -InputObject $_ -Name 'DriverDate')
+                AdapterRAMBytes = Get-SafeObjectProperty -InputObject $_ -Name 'AdapterRAM'
+                VideoProcessor = [string](Get-SafeObjectProperty -InputObject $_ -Name 'VideoProcessor')
+                Status = [string](Get-SafeObjectProperty -InputObject $_ -Name 'Status')
+                PNPDeviceID = [string](Get-SafeObjectProperty -InputObject $_ -Name 'PNPDeviceID')
+            }
+        })
+    }
+    catch {
+        Add-CollectionErrorText -Stage 'gpu-adapter-info' -Message "Win32_VideoController unavailable: $($_.Exception.Message)"
+    }
+
+    $counterAvailable = $false
+    try {
+        $engineCounters = Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop
+        $counterAvailable = $true
+        $engineRows = @()
+        foreach ($sample in @($engineCounters.CounterSamples)) {
+            $parsed = ConvertFrom-GpuCounterPath -Path $sample.InstanceName
+            if ($null -eq $parsed) { continue }
+            $value = $null
+            try { $value = [double]$sample.CookedValue } catch { $value = $null }
+            $engineRows += [pscustomobject]@{
+                ProcessId = $parsed.ProcessId
+                EngineType = $parsed.EngineType
+                Luid = $parsed.Luid
+                UtilizationPercent = $value
+            }
+        }
+        $block.engines = @($engineRows | Sort-Object -Property UtilizationPercent -Descending | Select-Object -First 200)
+    }
+    catch {
+        $block.engines = @()
+        Add-CollectionErrorText -Stage 'gpu-engine-counters' -Message "GPU Engine counters unavailable: $($_.Exception.Message)"
+    }
+
+    try {
+        $memoryCounters = Get-Counter -Counter '\GPU Process Memory(*)\Dedicated Usage' -ErrorAction Stop
+        $counterAvailable = $true
+        $memoryRows = @()
+        foreach ($sample in @($memoryCounters.CounterSamples)) {
+            $parsed = ConvertFrom-GpuCounterPath -Path $sample.InstanceName
+            if ($null -eq $parsed) { continue }
+            $dedicated = $null
+            try { $dedicated = [int64]$sample.CookedValue } catch { $dedicated = $null }
+            $memoryRows += [pscustomobject]@{
+                ProcessId = $parsed.ProcessId
+                Luid = $parsed.Luid
+                DedicatedUsageBytes = $dedicated
+            }
+        }
+        $block.processMemory = @($memoryRows | Sort-Object -Property DedicatedUsageBytes -Descending | Select-Object -First 200)
+    }
+    catch {
+        $block.processMemory = @()
+        Add-CollectionErrorText -Stage 'gpu-process-memory-counters' -Message "GPU Process Memory counters unavailable: $($_.Exception.Message)"
+    }
+
+    if (-not $counterAvailable -and $block.adapters.Count -eq 0) {
+        return $null
+    }
+    return $block
+}
+
+function Test-IncidentWindowMembership {
+    <#
+      Pure classifier for an event timestamp against the incident window.
+      Returns 'in-window' when the event falls inside the marked incident
+      window padded by the configured minutes, 'out-of-window' otherwise, and
+      $null when the window or timestamp is unusable. Never silently drops an
+      out-of-window event: the caller labels and retains it.
+    #>
+    param(
+        [AllowNull()][object]$EventTime,
+        [AllowNull()][object]$WindowStart,
+        [AllowNull()][object]$WindowEnd,
+        [int]$WindowMinutes = 15
+    )
+
+    if ($null -eq $EventTime -or $null -eq $WindowStart -or $null -eq $WindowEnd) { return $null }
+    try {
+        $eventUtc = ([datetime]$EventTime).ToUniversalTime()
+        $startUtc = ([datetime]$WindowStart).ToUniversalTime().AddMinutes(-1 * $WindowMinutes)
+        $endUtc = ([datetime]$WindowEnd).ToUniversalTime().AddMinutes($WindowMinutes)
+    }
+    catch {
+        return $null
+    }
+    if ($eventUtc -ge $startUtc -and $eventUtc -le $endUtc) { return 'in-window' }
+    return 'out-of-window'
 }
 
 function Get-ProcessSnapshotKey {
@@ -1969,13 +2918,109 @@ function Evaluate-Findings {
         [string]$WindowStart,
 
         [AllowNull()]
-        [string]$WindowEnd
+        [string]$WindowEnd,
+
+        [AllowNull()]
+        [object]$CaptureWindow,
+
+        [AllowNull()]
+        [object]$ProcessMemoryTop,
+
+        [AllowNull()]
+        [object]$MemoryMetricsRaw
     )
 
     $findings = @()
     $sustainedThreshold = 5
     $sampleList = @($Samples)
     $cpuValidCount = Get-FiniteNumericCount -Samples $sampleList -ValueProperty 'AverageCpuLoadPercent'
+
+    # ---- Evidence coverage: does the trace cover the counters? ----------------
+    # Without this check the report can imply an ETL explains pressure it never
+    # observed (the defect this release fixes).
+    if ($null -ne $CaptureWindow) {
+        $wprStart = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'wprStartUtc'
+        $wprStop = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'wprStopUtc'
+        $coverage = Test-CaptureWindowCoverage -CaptureWindow $CaptureWindow -WprStartUtc $wprStart -WprStopUtc $wprStop
+        if ($coverage.Status -eq 'covers-window') {
+            $findings += [pscustomobject]@{
+                category = 'evidence-coverage'
+                sourceArtifact = 'diagnostic-manifest.json'
+                metric = 'captureWindow'
+                windowStart = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'startedAtUtc'
+                windowEnd = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'completedAtUtc'
+                measuredValues = [ordered]@{
+                    requestedBaselineSeconds = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'requestedBaselineSeconds'
+                    actualBaselineSeconds = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'actualBaselineSeconds'
+                    wprRequestedSeconds = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'wprRequestedSeconds'
+                    wprActualSeconds = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'wprActualSeconds'
+                }
+                ruleCondition = 'The WPR trace window fully covers the counter sampling window'
+                uncertainty = 'Overlap is a timing guarantee only; it does not prove the trace recorded every event the counters summarize'
+                nextSteps = 'Open wpr-trace.etl in WPA and align it to the cited counter window'
+                suggestedWprProfile = $null
+            }
+        }
+        elseif ($coverage.Status -ne 'no-trace') {
+            $findings += [pscustomobject]@{
+                category = 'coverage'
+                sourceArtifact = 'diagnostic-manifest.json'
+                metric = 'traceWindowOverlap'
+                windowStart = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'startedAtUtc'
+                windowEnd = Get-CaseJsonProperty -InputObject $CaptureWindow -Name 'completedAtUtc'
+                measuredValues = [ordered]@{
+                    status = $coverage.Status
+                    detail = $coverage.Detail
+                    wprStartUtc = $wprStart
+                    wprStopUtc = $wprStop
+                }
+                ruleCondition = 'The WPR trace window does not fully cover the counter sampling window'
+                uncertainty = 'The trace cannot explain pressure recorded outside its own window'
+                nextSteps = 'Re-run with -PerformanceMode so the trace and counters share one capture window'
+                suggestedWprProfile = $null
+            }
+        }
+    }
+
+    # ---- Commit attribution: which process holds the commit charge -----------
+    if ($null -ne $ProcessMemoryTop) {
+        $topProcesses = @($ProcessMemoryTop | Where-Object { $null -ne (Get-SafeObjectProperty -InputObject $_ -Name 'PeakPrivateBytes') } |
+            Sort-Object -Property PeakPrivateBytes -Descending | Select-Object -First 5)
+        if ($topProcesses.Count -gt 0) {
+            $commitLimit = if ($null -ne $MemoryMetricsRaw) { Get-SafeObjectProperty -InputObject $MemoryMetricsRaw -Name 'commitLimitBytes' } else { $null }
+            $peakSampleCommit = $null
+            foreach ($commitSample in $sampleList) {
+                $value = Get-SafeObjectProperty -InputObject $commitSample -Name 'CommittedBytes'
+                if ($null -ne $value -and ($null -eq $peakSampleCommit -or [int64]$value -gt [int64]$peakSampleCommit)) {
+                    $peakSampleCommit = [int64]$value
+                }
+            }
+            $topSum = ($topProcesses | Measure-Object -Property PeakPrivateBytes -Sum).Sum
+            $attributedPercent = $null
+            if ($null -ne $commitLimit -and [int64]$commitLimit -gt 0 -and $null -ne $topSum) {
+                $attributedPercent = [Math]::Round((([double]$topSum / [double]$commitLimit) * 100), 2)
+            }
+            $first = $topProcesses[0]
+            $findings += [pscustomobject]@{
+                category = 'commit-attribution'
+                sourceArtifact = 'process-memory-samples.csv'
+                metric = 'PeakPrivateBytes'
+                windowStart = $WindowStart
+                windowEnd = $WindowEnd
+                measuredValues = [ordered]@{
+                    peakSystemCommittedBytes = $peakSampleCommit
+                    commitLimitBytes = $commitLimit
+                    topProcesses = @($topProcesses)
+                    topFivePeakPrivateBytesSum = $topSum
+                    topFivePercentOfCommitLimit = $attributedPercent
+                }
+                ruleCondition = 'Per-process private bytes (commit charge) attributed across the sampled window'
+                uncertainty = 'PrivateBytes is the process commit charge; shared pages and kernel pool are attributed separately and a process may legitimately reserve more than it uses'
+                nextSteps = "Start with $($first.Name): compare its PrivateBytes trend against the commit curve, then check the kernel-pool and pagefile findings for charge that is not per-process"
+                suggestedWprProfile = 'GeneralProfile'
+            }
+        }
+    }
 
     # ---- CPU: sustained >= 80% anywhere in the series ----
     $cpuWindow = Get-SustainedWindow -Samples $sampleList -ValueProperty 'AverageCpuLoadPercent' -Threshold 80 -MinimumConsecutive $sustainedThreshold -Comparator 'ge'
@@ -2295,6 +3340,71 @@ function ConvertTo-FindingsHtml {
                 [void]$sb.AppendLine("<tr><th>Duration</th><td>$(ConvertTo-HtmlEncoded $durationValue) seconds</td></tr>")
             }
         }
+        # Capture-window honesty: what was requested vs what actually elapsed,
+        # for the counters AND the trace. A report that says "30 seconds" while
+        # the run took four minutes is misleading.
+        $captureWindowValue = Get-CaseJsonProperty -InputObject $Manifest -Name 'captureWindow'
+        if ($null -ne $captureWindowValue) {
+            $actualBaseline = Get-CaseJsonProperty -InputObject $captureWindowValue -Name 'actualBaselineSeconds'
+            $requestedBaseline = Get-CaseJsonProperty -InputObject $captureWindowValue -Name 'requestedBaselineSeconds'
+            $wprRequested = Get-CaseJsonProperty -InputObject $captureWindowValue -Name 'wprRequestedSeconds'
+            $wprActual = Get-CaseJsonProperty -InputObject $captureWindowValue -Name 'wprActualSeconds'
+            $windowStart = Get-CaseJsonProperty -InputObject $captureWindowValue -Name 'startedAtUtc'
+            $windowEnd = Get-CaseJsonProperty -InputObject $captureWindowValue -Name 'completedAtUtc'
+            [void]$sb.AppendLine("<tr><th>Capture Window</th><td>$(ConvertTo-HtmlEncoded $windowStart) to $(ConvertTo-HtmlEncoded $windowEnd)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Baseline Sampling</th><td>$(ConvertTo-HtmlEncoded $requestedBaseline) s requested; $(ConvertTo-HtmlEncoded $actualBaseline) s actual</td></tr>")
+            if ($null -ne $wprRequested -or $null -ne $wprActual) {
+                [void]$sb.AppendLine("<tr><th>WPR Trace</th><td>$(ConvertTo-HtmlEncoded $wprRequested) s requested; $(ConvertTo-HtmlEncoded $wprActual) s actual (concurrent with sampling)</td></tr>")
+            }
+            $concurrentStages = Get-CaseJsonProperty -InputObject $captureWindowValue -Name 'concurrentStages'
+            if ($null -ne $concurrentStages) {
+                $stageText = if ($concurrentStages -is [array]) { $concurrentStages -join ', ' } else { [string]$concurrentStages }
+                [void]$sb.AppendLine("<tr><th>Concurrent Stages</th><td>$(ConvertTo-HtmlEncoded $stageText)</td></tr>")
+            }
+        }
+        $incidentValue = Get-CaseJsonProperty -InputObject $Manifest -Name 'incident'
+        if ($null -ne $incidentValue) {
+            $markerObserved = Get-CaseJsonProperty -InputObject $incidentValue -Name 'markerObservedAtUtc'
+            if ($null -ne $markerObserved) {
+                $markerSourceText = Get-CaseJsonProperty -InputObject $incidentValue -Name 'markerSource'
+                $preSeconds = Get-CaseJsonProperty -InputObject $incidentValue -Name 'preSeconds'
+                $postSeconds = Get-CaseJsonProperty -InputObject $incidentValue -Name 'postSeconds'
+                $keptCount = Get-CaseJsonProperty -InputObject $incidentValue -Name 'retainedSampleCount'
+                $droppedCount = Get-CaseJsonProperty -InputObject $incidentValue -Name 'droppedSampleCount'
+                [void]$sb.AppendLine("<tr><th>Incident Marker</th><td>$(ConvertTo-HtmlEncoded $markerObserved) (source: $(ConvertTo-HtmlEncoded $markerSourceText))</td></tr>")
+                [void]$sb.AppendLine("<tr><th>Retention</th><td>$(ConvertTo-HtmlEncoded $preSeconds) s before / $(ConvertTo-HtmlEncoded $postSeconds) s after; $(ConvertTo-HtmlEncoded $keptCount) samples kept, $(ConvertTo-HtmlEncoded $droppedCount) dropped</td></tr>")
+            }
+        }
+        $pageFileValue = Get-CaseJsonProperty -InputObject $Manifest -Name 'pageFile'
+        if ($null -ne $pageFileValue -and @($pageFileValue).Count -gt 0) {
+            foreach ($pageFile in @($pageFileValue)) {
+                $pageFileName = Get-CaseJsonProperty -InputObject $pageFile -Name 'Name'
+                $allocated = Get-CaseJsonProperty -InputObject $pageFile -Name 'AllocatedBaseSizeMB'
+                $current = Get-CaseJsonProperty -InputObject $pageFile -Name 'CurrentUsageMB'
+                $peak = Get-CaseJsonProperty -InputObject $pageFile -Name 'PeakUsageMB'
+                [void]$sb.AppendLine("<tr><th>Pagefile</th><td>$(ConvertTo-HtmlEncoded $pageFileName): $(ConvertTo-HtmlEncoded $allocated) MiB allocated, $(ConvertTo-HtmlEncoded $current) MiB current, $(ConvertTo-HtmlEncoded $peak) MiB peak</td></tr>")
+            }
+        }
+        $storageMappingValue = Get-CaseJsonProperty -InputObject $Manifest -Name 'storageMapping'
+        if ($null -ne $storageMappingValue) {
+            $driveRows = @(Get-CaseJsonProperty -InputObject $storageMappingValue -Name 'drives')
+            if ($driveRows.Count -gt 0) {
+                $parts = @()
+                foreach ($drive in $driveRows) {
+                    $letter = Get-CaseJsonProperty -InputObject $drive -Name 'DriveLetter'
+                    $model = Get-CaseJsonProperty -InputObject $drive -Name 'PhysicalDiskModel'
+                    $percentFree = Get-CaseJsonProperty -InputObject $drive -Name 'PercentFree'
+                    $hostsPageFile = Get-CaseJsonProperty -InputObject $drive -Name 'HostsPageFile'
+                    $pageFileLabel = if ($hostsPageFile -eq $true) { 'pagefile host' } else { 'no pagefile' }
+                    $parts += ("{0} on {1} ({2}% free, {3})" -f $letter, $model, $percentFree, $pageFileLabel)
+                }
+                [void]$sb.AppendLine("<tr><th>Volumes</th><td>$(ConvertTo-HtmlEncoded ($parts -join '; '))</td></tr>")
+            }
+            $storageNote = Get-CaseJsonProperty -InputObject $storageMappingValue -Name 'note'
+            if ($null -ne $storageNote) {
+                [void]$sb.AppendLine("<tr><th>Volume Relevance</th><td>$(ConvertTo-HtmlEncoded $storageNote)</td></tr>")
+            }
+        }
         [void]$sb.AppendLine('</table>')
     }
 
@@ -2419,7 +3529,11 @@ function Write-CollectionOutputs {
 
         [AllowNull()][object]$MemoryMetrics,
 
-        [AllowNull()][string]$SymptomContext
+        [AllowNull()][string]$SymptomContext,
+
+        [AllowNull()][object]$CaptureWindow,
+
+        [AllowNull()][object]$ProcessMemoryTop
     )
 
     $windowStart = Get-CaseJsonProperty -InputObject $CollectionManifest -Name 'startedAtUtc'
@@ -2452,7 +3566,7 @@ function Write-CollectionOutputs {
 
     $findingsList = @()
     try {
-        $findingsList = @(Evaluate-Findings -Samples $Samples -DiskSeries $DiskSeries -VolumeMetrics $VolumeMetrics -MemoryMetrics $MemoryMetrics -WindowStart $windowStart -WindowEnd $windowEnd)
+        $findingsList = @(Evaluate-Findings -Samples $Samples -DiskSeries $DiskSeries -VolumeMetrics $VolumeMetrics -MemoryMetrics $MemoryMetrics -WindowStart $windowStart -WindowEnd $windowEnd -CaptureWindow $CaptureWindow -ProcessMemoryTop $ProcessMemoryTop -MemoryMetricsRaw $MemoryMetrics)
         Write-JsonFile -InputObject $findingsList -Path (Join-Path -Path $OutputDirectory -ChildPath 'findings.json')
         if (-not $CollectedArtifacts.Contains('findings.json')) { [void]$CollectedArtifacts.Add('findings.json') }
     }
@@ -2527,18 +3641,51 @@ $planManifest = [ordered]@{
     }
 }
 
+if ($PerformanceMode) {
+    $planManifest.plannedActions += 'collect-incident-performance-capture-after-explicit-consent'
+    $planManifest.performanceMode = [ordered]@{
+        concurrentCaptureWindow = $true
+        baselineSeconds = $DurationSeconds
+        sampleIntervalSeconds = $SampleIntervalSeconds
+        markerMode = [bool]$MarkerMode
+        markerPreSeconds = $MarkerPreSeconds
+        markerPostSeconds = $MarkerPostSeconds
+        maxTrackedProcesses = $MaxTrackedProcesses
+        eventWindowMinutes = $EventWindowMinutes
+        stages = @(
+            'performance-counters',
+            'process-commit-attribution',
+            'kernel-pool',
+            'pagefile-metrics',
+            'gpu-metrics',
+            'udp-endpoints',
+            'storage-topology',
+            'incident-events',
+            'wpr-trace'
+        )
+        note = 'All stages share one wall-clock capture window so the trace covers the counters.'
+    }
+}
+
 if ($CaptureWpr) {
     $planManifest.plannedActions += 'capture-wpr-etl-after-explicit-consent'
     $planManifest.wpr = [ordered]@{
         profile = $WprProfile
-        durationSeconds = $DurationSeconds
+        durationSeconds = $effectiveWprDurationSeconds
+        requestedDurationSeconds = $WprDurationSeconds
+        autoSizedDuration = ($WprDurationSeconds -le 0)
+        maxFileMB = $WprMaxFileMB
+        loggingMode = 'memory'
+        concurrentWithSampling = $true
     }
 }
 
 if ($CaptureDefender) {
     $planManifest.plannedActions += 'capture-defender-performance-etl-after-explicit-consent'
     $planManifest.defender = [ordered]@{
-        durationSeconds = $DurationSeconds
+        durationSeconds = $effectiveWprDurationSeconds
+        requestedDurationSeconds = $WprDurationSeconds
+        autoSizedDuration = ($WprDurationSeconds -le 0)
     }
 }
 
@@ -2736,6 +3883,23 @@ if ($RemoteComputer) {
             $remoteParams.CollectBootFailureLogs = $true
             $remoteParams.ConfirmBootFailureLogCollection = $true
         }
+        # The incident-capture surface travels with a remote collection, or the
+        # remote manifest would advertise a window the remote run never used.
+        if ($PerformanceMode) {
+            $remoteParams.PerformanceMode = $true
+            $remoteParams.SampleIntervalSeconds = $SampleIntervalSeconds
+            $remoteParams.EventWindowMinutes = $EventWindowMinutes
+            $remoteParams.MaxTrackedProcesses = $MaxTrackedProcesses
+        }
+        if ($MarkerMode) {
+            $remoteParams.MarkerMode = $true
+            $remoteParams.MarkerPreSeconds = $MarkerPreSeconds
+            $remoteParams.MarkerPostSeconds = $MarkerPostSeconds
+        }
+        if ($CaptureWpr) {
+            $remoteParams.WprDurationSeconds = $WprDurationSeconds
+            $remoteParams.WprMaxFileMB = $WprMaxFileMB
+        }
 
         Invoke-Command -Session $session -ScriptBlock {
             param($scriptPath, $invokeParams)
@@ -2911,18 +4075,91 @@ if ($null -eq $logicalProcessorCount) {
 $cpuStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $processStartSnapshots = New-ProcessCpuSnapshot -Processes @(Get-Process -ErrorAction SilentlyContinue)
 
+# ---- Incident capture window -------------------------------------------------
+# WPR, the perf counters, the process/commit series, GPU, pagefile/pool and the
+# UDP series all share ONE wall-clock window. Previously the trace started after
+# the counter sampling finished, so the ETL could not explain pressure the
+# counters recorded; the capture is now concurrent by construction.
+$wprBackgroundJob = $null
+$wprStartedAtUtc = $null
+$wprEtlPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'wpr-trace.etl'
+$wprCaptureStatus = 'not-requested'
+$wprStartExitCode = $null
+$wprStartError = $null
+
+# Effective trace window: an explicit -WprDurationSeconds is honoured verbatim,
+# otherwise the trace is sized to outlast the counters (baseline + the marker
+# post-window) so the ETL always covers what the counters recorded. The value is
+# computed once, next to the parameter validation, so Plan mode advertises the
+# same number Collect mode uses.
+
+if ($CaptureWpr) {
+    $wprExe = Join-Path $env:SystemRoot 'System32\wpr.exe'
+    if (-not (Test-Path -LiteralPath $wprExe)) {
+        $wprCaptureStatus = 'skipped-wpr-not-found'
+        Add-CollectionErrorText -Stage 'wpr-capture' -Message 'wpr.exe not found; WPR capture skipped'
+    }
+    else {
+        # Run the whole bounded trace IN A BACKGROUND JOB so the trace
+        # and the counter/process samples occupy the same wall-clock
+        # window. Previously WPR started only after sampling finished,
+        # which made the ETL useless for explaining the counters.
+        $wprStartedAtUtc = Get-UtcTimestamp
+        $wprCaptureStatus = 'running'
+        $wprBackgroundJob = Start-WprBoundedCaptureJob `
+            -WprExePath $wprExe `
+            -Profile $WprProfile `
+            -EtlPath $wprEtlPath `
+            -DurationSeconds $effectiveWprDurationSeconds `
+            -MaxFileMB $WprMaxFileMB
+    }
+}
+
+# Marker channel: -MarkerMode watches for the operator pressing Enter (or
+# writing the marker file) so a short slowdown can be captured deliberately
+# instead of hoping a fixed interval lands on it.
+$markerFilePath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'incident-marker.txt'
+$markerTimeUtc = $null
+$markerSource = $null
+$markerJob = $null
+if ($MarkerMode) {
+    # A paste/console read cannot be trusted in non-interactive hosts, so the
+    # job writes a plain file the sampler polls. The file is also the documented
+    # automation path (`Set-Content incident-marker.txt`).
+    $markerJob = Start-Job -ScriptBlock {
+        param($Path)
+        try {
+            [void](Read-Host 'Press Enter (or type MARK) when the slowdown happens')
+            $stamp = (Get-Date).ToUniversalTime().ToString('o')
+            Set-Content -LiteralPath $Path -Value $stamp -Encoding Ascii -ErrorAction Stop
+            return [pscustomobject]@{ MarkerFile = $Path; WrittenAtUtc = $stamp }
+        }
+        catch {
+            return [pscustomobject]@{ MarkerFile = $Path; Error = $_.Exception.Message }
+        }
+    } -ArgumentList $markerFilePath
+}
+
 $samples = New-Object System.Collections.ArrayList
 $diskSeries = New-Object System.Collections.ArrayList
+$processMemorySeries = New-Object System.Collections.ArrayList
+$kernelPoolSeries = New-Object System.Collections.ArrayList
+$udpSeries = New-Object System.Collections.ArrayList
 $volumeMetrics = $null
+$pageFileMetrics = $null
+$storageTopology = $null
+$gpuMetrics = $null
 $previousDiskRaw = $null
 $diskSourceError = $null
 $consecutiveSampleFailures = 0
 $sampleIndex = 0
-# DurationSeconds is a wall-clock budget for the baseline sample window.  A
-# slow CIM request can finish just after the deadline, but it cannot add an
-# extra one-second sleep per sample and prolong the whole window.
+$samplerStartUtc = Get-UtcTimestamp
 $samplingStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-while ($samplingStopwatch.Elapsed.TotalSeconds -lt $DurationSeconds) {
+$captureComplete = $false
+
+# Sampling stops at the configured baseline duration, or MarkerPostSeconds after
+# the operator marks the slowdown (whichever comes first once a marker exists).
+while (-not $captureComplete) {
     try {
         $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
         $processors = Get-CimInstance -ClassName Win32_Processor
@@ -2936,9 +4173,84 @@ while ($samplingStopwatch.Elapsed.TotalSeconds -lt $DurationSeconds) {
 
         $memMetrics = Get-MemoryMetrics
 
+        # ---- Per-process commit attribution (every sample) ----------------
+        # Working set cannot explain a system commit charge: PrivateBytes and
+        # PageFileBytes attribute the commitment to the process that caused it.
+        $processRows = @()
+        try {
+            $processRows = @(Get-PerProcessMemorySample -MaxProcesses $MaxTrackedProcesses)
+            foreach ($row in $processRows) {
+                [void]$processMemorySeries.Add([pscustomobject]@{
+                    TimestampUtc = $sampleTimestamp
+                    Name = $row.Name
+                    Id = $row.Id
+                    PrivateBytes = $row.PrivateBytes
+                    WorkingSet = $row.WorkingSet
+                    WorkingSetPrivate = $row.WorkingSetPrivate
+                    PageFileBytes = $row.PageFileBytes
+                    PageFileBytesPeak = $row.PageFileBytesPeak
+                    VirtualBytes = $row.VirtualBytes
+                    PoolPagedBytes = $row.PoolPagedBytes
+                    PoolNonpagedBytes = $row.PoolNonpagedBytes
+                })
+            }
+        }
+        catch {
+            Add-CollectionError -Stage 'process-memory-sample' -ErrorRecord $_
+        }
+
+        # ---- Kernel pool (every sample) -----------------------------------
+        try {
+            $poolSample = Get-KernelPoolMetrics
+            if ($null -ne $poolSample) {
+                [void]$kernelPoolSeries.Add([pscustomobject]@{
+                    TimestampUtc = $sampleTimestamp
+                    PoolPagedBytes = $poolSample.poolPagedBytes
+                    PoolNonpagedBytes = $poolSample.poolNonpagedBytes
+                    PoolPagedResidentBytes = $poolSample.poolPagedResidentBytes
+                    SystemCacheResidentBytes = $poolSample.systemCacheResidentBytes
+                    CacheBytes = $poolSample.cacheBytes
+                })
+            }
+        }
+        catch {
+            Add-CollectionError -Stage 'kernel-pool-sample' -ErrorRecord $_
+        }
+
+        # ---- Pagefile (first sample; size/peak are not per-second series) ---
+        if ($null -eq $pageFileMetrics) {
+            $pageFileMetrics = Get-PageFileMetrics
+        }
+
+        # ---- UDP endpoint series (per-PID growth over time) ---------------
+        if ($PerformanceMode) {
+            try {
+                $udpSample = Get-UdpEndpointSample
+                if ($null -ne $udpSample) {
+                    [void]$udpSeries.Add($udpSample)
+                }
+            }
+            catch {
+                Add-CollectionError -Stage 'udp-endpoint-sample' -ErrorRecord $_
+            }
+        }
+
         # Per-volume free space captured inside the sample window (first sample).
         if ($null -eq $volumeMetrics) {
             $volumeMetrics = Get-VolumeMetrics
+        }
+        if ($null -eq $storageTopology) {
+            $storageTopology = Get-StorageTopology
+        }
+        # GPU snapshot inside the SAME window as the counters (the counter walk
+        # costs a second or two, so it is taken once, on the first sample).
+        if ($null -eq $gpuMetrics) {
+            try {
+                $gpuMetrics = Get-GpuMetrics
+            }
+            catch {
+                Add-CollectionError -Stage 'gpu-metrics' -ErrorRecord $_
+            }
         }
 
         # Raw disk counters sampled inside the window; derived metrics need a
@@ -2969,6 +4281,19 @@ while ($samplingStopwatch.Elapsed.TotalSeconds -lt $DurationSeconds) {
             $totalLogicalDiskFreeGB = [Math]::Round(([double]$freeSpaceMeasure.Sum / 1GB), 2)
         }
 
+        $topPrivateBytes = $null
+        $topPrivateProcess = $null
+        $topPageFileBytes = $null
+        $topPageFileProcess = $null
+        if ($processRows.Count -gt 0) {
+            $topPrivate = @($processRows | Sort-Object -Property PrivateBytes -Descending | Select-Object -First 1)[0]
+            $topPrivateBytes = $topPrivate.PrivateBytes
+            $topPrivateProcess = $topPrivate.Name
+            $topPageFile = @($processRows | Sort-Object -Property PageFileBytes -Descending | Select-Object -First 1)[0]
+            $topPageFileBytes = $topPageFile.PageFileBytes
+            $topPageFileProcess = $topPageFile.Name
+        }
+
         [void]$samples.Add([pscustomobject]@{
             TimestampUtc = $sampleTimestamp
             AverageCpuLoadPercent = $averageCpuLoad
@@ -2981,6 +4306,11 @@ while ($samplingStopwatch.Elapsed.TotalSeconds -lt $DurationSeconds) {
             PageReadsPerSec = if ($memMetrics) { $memMetrics.pageReadsPerSec } else { $null }
             PagesInputPerSec = if ($memMetrics) { $memMetrics.pagesInputPerSec } else { $null }
             PagesOutputPerSec = if ($memMetrics) { $memMetrics.pagesOutputPerSec } else { $null }
+            TopPrivateBytesProcessName = $topPrivateProcess
+            TopPrivateBytes = $topPrivateBytes
+            TopPageFileBytesProcessName = $topPageFileProcess
+            TopPageFileBytes = $topPageFileBytes
+            SumPrivateBytes = if ($processRows.Count -gt 0) { ($processRows | Measure-Object -Property PrivateBytes -Sum).Sum } else { $null }
         })
         $consecutiveSampleFailures = 0
     }
@@ -2994,19 +4324,188 @@ while ($samplingStopwatch.Elapsed.TotalSeconds -lt $DurationSeconds) {
 
     $sampleIndex++
     $elapsedSeconds = $samplingStopwatch.Elapsed.TotalSeconds
-    $percentComplete = [Math]::Min(100, [Math]::Floor(($elapsedSeconds / $DurationSeconds) * 100))
-    Write-Output ([string]::Format('Sampling progress: sample {0}; {1}% of {2}-second baseline', $sampleIndex, $percentComplete, $DurationSeconds))
 
-    # Schedule against the original start time. This avoids drifting by the
-    # collection cost of each sample while keeping a roughly one-second cadence.
-    $nextSampleDueSeconds = [Math]::Min($sampleIndex, $DurationSeconds)
-    $sleepMilliseconds = [Math]::Max(0, [int][Math]::Round(($nextSampleDueSeconds - $samplingStopwatch.Elapsed.TotalSeconds) * 1000))
-    if ($sleepMilliseconds -gt 0) {
-        Start-Sleep -Milliseconds $sleepMilliseconds
+    # Marker detection: an operator Enter (job-written file) or a direct file
+    # write both count. The post-window starts at the FIRST observed marker.
+    if ($MarkerMode -and $null -eq $markerTimeUtc) {
+        try {
+            if (Test-Path -LiteralPath $markerFilePath -PathType Leaf) {
+                $markerRaw = (Get-Content -LiteralPath $markerFilePath -ErrorAction Stop | Select-Object -First 1)
+                $parsedMarker = $null
+                try { $parsedMarker = ([datetime]$markerRaw).ToUniversalTime() } catch { $parsedMarker = $null }
+                if ($null -eq $parsedMarker) { $parsedMarker = (Get-Date).ToUniversalTime() }
+                $markerTimeUtc = $parsedMarker
+                $markerSource = 'file-or-enter'
+                Write-Output ("Incident marker recorded at {0}; sampling for {1} more seconds." -f $markerTimeUtc.ToString('o'), $MarkerPostSeconds)
+            }
+        }
+        catch {
+            Add-CollectionError -Stage 'incident-marker-read' -ErrorRecord $_
+        }
+    }
+
+    if ($null -ne $markerTimeUtc) {
+        $postMarkerSeconds = ((Get-Date).ToUniversalTime() - $markerTimeUtc).TotalSeconds
+        if ($postMarkerSeconds -ge $MarkerPostSeconds) {
+            $captureComplete = $true
+        }
+    }
+    elseif ($elapsedSeconds -ge $DurationSeconds) {
+        $captureComplete = $true
+    }
+
+    $percentComplete = [Math]::Min(100, [Math]::Floor(($elapsedSeconds / $DurationSeconds) * 100))
+    $progressSuffix = ''
+    if ($null -ne $markerTimeUtc) { $progressSuffix = '; incident marked' }
+    Write-Output ([string]::Format('Sampling progress: sample {0}; {1}% of {2}-second baseline{3}', $sampleIndex, $percentComplete, $DurationSeconds, $progressSuffix))
+
+    if (-not $captureComplete) {
+        # Schedule against the original start time. This avoids drifting by the
+        # collection cost of each sample while keeping a steady cadence.
+        $nextSampleDueSeconds = $sampleIndex * $SampleIntervalSeconds
+        $sleepMilliseconds = [Math]::Max(0, [int][Math]::Round(($nextSampleDueSeconds - $samplingStopwatch.Elapsed.TotalSeconds) * 1000))
+        if ($sleepMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds $sleepMilliseconds
+        }
     }
 }
 
+$samplingStopwatch.Stop()
 $completedAtSamplingUtc = Get-UtcTimestamp
+$samplingActualSeconds = [Math]::Round((New-TimeSpan -Start ([datetime]$samplerStartUtc) -End ([datetime]$completedAtSamplingUtc)).TotalSeconds, 2)
+
+# ---- Concurrent WPR trace: stop it and record the REAL duration ---------------
+# The trace ran in parallel with the counters, so its window covers the same
+# interval by construction. Report the measured wall clock, not the request.
+$wprResult = [ordered]@{
+    status = $wprCaptureStatus
+    etlFilePath = $null
+    startedAtUtc = $wprStartedAtUtc
+    completedAtUtc = $null
+    startExitCode = $null
+    stopExitCode = $null
+    moduleVersion = $null
+    requestedDurationSeconds = $WprDurationSeconds
+    effectiveDurationSeconds = $effectiveWprDurationSeconds
+    autoSizedDuration = ($WprDurationSeconds -le 0)
+    actualDurationSeconds = $null
+    etlBytes = $null
+    maxFileMB = $WprMaxFileMB
+    sizeLimitExceeded = $false
+    traceRemovedOversized = $false
+    relatedArtifacts = @()
+    loggingMode = 'memory'
+    concurrentWithSampling = $true
+}
+
+if ($null -ne $wprBackgroundJob) {
+    try {
+        # The job stops the trace itself after its window; allow a little slack
+        # for the stop and the ETL flush, then never leave it running.
+        $jobCompleted = Wait-Job -Job $wprBackgroundJob -Timeout 60
+        if ($null -eq $jobCompleted) {
+            Stop-Job -Job $wprBackgroundJob -ErrorAction SilentlyContinue
+            Add-CollectionErrorText -Stage 'wpr-capture' -Message 'WPR background capture did not finish within its window; job stopped'
+        }
+        $jobOutput = @(Receive-Job -Job $wprBackgroundJob -ErrorAction SilentlyContinue)
+        $jobRecord = $jobOutput | Where-Object { $_ -is [psobject] -and $null -ne $_.PSObject.Properties['StartExitCode'] } | Select-Object -Last 1
+        if ($null -ne $jobRecord) {
+            $wprResult.startExitCode = $jobRecord.StartExitCode
+            $wprResult.stopExitCode = $jobRecord.StopExitCode
+            $wprResult.completedAtUtc = $jobRecord.CompletedAtUtc
+            $wprResult.etlBytes = $jobRecord.EtlBytes
+            $wprResult.sizeLimitExceeded = [bool]$jobRecord.SizeLimitExceeded
+            $wprResult.traceRemovedOversized = [bool]$jobRecord.TraceRemoved
+            $wprResult.relatedArtifacts = @($jobRecord.RelatedArtifacts)
+            if ($null -ne $jobRecord.Error) {
+                Add-CollectionErrorText -Stage 'wpr-capture' -Message ([string]$jobRecord.Error)
+            }
+            if ($null -ne $jobRecord.StartedAtUtc -and $null -ne $jobRecord.CompletedAtUtc) {
+                try {
+                    $wprResult.actualDurationSeconds = [Math]::Round(
+                        (New-TimeSpan -Start ([datetime]$jobRecord.StartedAtUtc) -End ([datetime]$jobRecord.CompletedAtUtc)).TotalSeconds, 2)
+                }
+                catch {
+                    $wprResult.actualDurationSeconds = $null
+                }
+            }
+            if ($wprResult.sizeLimitExceeded) {
+                $etlMiB = [Math]::Round(([double]$wprResult.etlBytes / 1MB), 1)
+                if ($wprResult.traceRemovedOversized) {
+                    Add-CollectionErrorText -Stage 'wpr-capture' -Message "WPR trace was $etlMiB MiB, over the $WprMaxFileMB MiB cap; the oversized trace and its symbol artifacts were removed. Raise -WprMaxFileMB to keep it."
+                }
+                else {
+                    Add-CollectionErrorText -Stage 'wpr-capture' -Message "WPR trace was $etlMiB MiB, over the $WprMaxFileMB MiB cap, and was kept because the oversized-trace policy was disabled."
+                }
+            }
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
+        $wprResult.status = 'failed'
+    }
+    finally {
+        Remove-Job -Job $wprBackgroundJob -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($wprResult.status -eq 'running') {
+        if ($wprResult.startExitCode -ne 0) {
+            $wprResult.status = 'failed'
+            Add-CollectionErrorText -Stage 'wpr-capture' -Message "wpr.exe -start $WprProfile failed with exit code $($wprResult.startExitCode); WPR capture failed"
+        }
+        elseif ($wprResult.stopExitCode -ne 0) {
+            $wprResult.status = 'failed'
+            Add-CollectionErrorText -Stage 'wpr-capture' -Message "wpr.exe -stop reported exit code $($wprResult.stopExitCode); WPR capture failed"
+        }
+        elseif ($wprResult.traceRemovedOversized) {
+            $wprResult.status = 'removed-oversized'
+        }
+        elseif (Test-Path -LiteralPath $wprEtlPath -PathType Leaf) {
+            $wprResult.status = 'completed'
+            $wprResult.etlFilePath = $wprEtlPath
+            [void]$collectedArtifacts.Add('wpr-trace.etl')
+        }
+        else {
+            $wprResult.status = 'failed'
+            Add-CollectionErrorText -Stage 'wpr-capture' -Message 'wpr.exe -stop succeeded but no wpr-trace.etl was produced'
+        }
+    }
+}
+
+# Marker job cleanup (its result is only used to explain how the marker arrived).
+if ($null -ne $markerJob) {
+    try {
+        [void](Wait-Job -Job $markerJob -Timeout 5)
+        [void](Receive-Job -Job $markerJob -ErrorAction SilentlyContinue)
+    }
+    catch {
+        Add-CollectionError -Stage 'incident-marker-job' -ErrorRecord $_
+    }
+    finally {
+        Remove-Job -Job $markerJob -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---- Incident window retention ------------------------------------------------
+# With a marker, keep MarkerPreSeconds before it plus MarkerPostSeconds after;
+# without one, keep the whole baseline series (existing behavior).
+$markerRetention = Select-MarkerRetainedSeries `
+    -Samples @($samples) `
+    -MarkerTimeUtc $markerTimeUtc `
+    -MarkerPreSeconds $MarkerPreSeconds `
+    -MarkerPostSeconds $MarkerPostSeconds
+$samples = @($markerRetention.Series)
+$incidentWindowStartUtc = $markerRetention.IncidentWindowStartUtc
+$incidentWindowEndUtc = $markerRetention.IncidentWindowEndUtc
+
+# Every series describes the SAME window as the retained samples, so the CSV/JSON
+# artifacts cannot disagree about which minutes of the run they cover.
+if ($markerRetention.MarkerApplied) {
+    $diskSeries = @((Select-MarkerRetainedSeries -Samples @($diskSeries) -MarkerTimeUtc $markerTimeUtc -MarkerPreSeconds $MarkerPreSeconds -MarkerPostSeconds $MarkerPostSeconds).Series)
+    $processMemorySeries = @((Select-MarkerRetainedSeries -Samples @($processMemorySeries) -MarkerTimeUtc $markerTimeUtc -MarkerPreSeconds $MarkerPreSeconds -MarkerPostSeconds $MarkerPostSeconds).Series)
+    $kernelPoolSeries = @((Select-MarkerRetainedSeries -Samples @($kernelPoolSeries) -MarkerTimeUtc $markerTimeUtc -MarkerPreSeconds $MarkerPreSeconds -MarkerPostSeconds $MarkerPostSeconds).Series)
+    $udpSeries = @((Select-MarkerRetainedSeries -Samples @($udpSeries) -MarkerTimeUtc $markerTimeUtc -MarkerPreSeconds $MarkerPreSeconds -MarkerPostSeconds $MarkerPostSeconds).Series)
+}
 
 # Formatted summary counters (manifest convenience only; findings use the series).
 $diskMetrics = Get-DiskMetrics
@@ -3020,6 +4519,88 @@ try {
 }
 catch {
     Add-CollectionError -Stage 'performance-export' -ErrorRecord $_
+}
+
+# Repeated per-process commit/per-pagefile series - the answer to "what consumed
+# the commit charge", as CSV (one row per process per sample) plus a top-consumer
+# summary the report can cite.
+try {
+    $processMemorySeries | Export-Csv -LiteralPath (Join-Path -Path $resolvedOutputDirectory -ChildPath 'process-memory-samples.csv') -NoTypeInformation -Encoding UTF8
+    [void]$collectedArtifacts.Add('process-memory-samples.csv')
+}
+catch {
+    Add-CollectionError -Stage 'process-memory-export' -ErrorRecord $_
+}
+
+$processMemoryTop = @()
+try {
+    if ($processMemorySeries.Count -gt 0) {
+        $processMemoryTop = @(
+            $processMemorySeries | Group-Object -Property Name | ForEach-Object {
+                $rows = @($_.Group)
+                $peakPrivate = ($rows | Measure-Object -Property PrivateBytes -Maximum).Maximum
+                $lastRow = $rows | Sort-Object -Property TimestampUtc | Select-Object -Last 1
+                $firstRow = $rows | Sort-Object -Property TimestampUtc | Select-Object -First 1
+                $growth = $null
+                if ($null -ne $firstRow -and $null -ne $lastRow -and $null -ne $firstRow.PrivateBytes -and $null -ne $lastRow.PrivateBytes) {
+                    $growth = [int64]$lastRow.PrivateBytes - [int64]$firstRow.PrivateBytes
+                }
+                [pscustomobject]@{
+                    Name = $_.Name
+                    PeakPrivateBytes = $peakPrivate
+                    PeakWorkingSetBytes = ($rows | Measure-Object -Property WorkingSet -Maximum).Maximum
+                    PeakPageFileBytes = ($rows | Measure-Object -Property PageFileBytes -Maximum).Maximum
+                    PeakPoolPagedBytes = ($rows | Measure-Object -Property PoolPagedBytes -Maximum).Maximum
+                    PeakPoolNonpagedBytes = ($rows | Measure-Object -Property PoolNonpagedBytes -Maximum).Maximum
+                    PrivateBytesGrowth = $growth
+                    SampleCount = $rows.Count
+                }
+            } | Sort-Object -Property PeakPrivateBytes -Descending | Select-Object -First 25
+        )
+    }
+    Write-JsonFile -InputObject $processMemoryTop -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'process-memory-top.json')
+    [void]$collectedArtifacts.Add('process-memory-top.json')
+}
+catch {
+    Add-CollectionError -Stage 'process-memory-top-export' -ErrorRecord $_
+}
+
+try {
+    Write-JsonFile -InputObject @($kernelPoolSeries) -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'kernel-pool-samples.json')
+    [void]$collectedArtifacts.Add('kernel-pool-samples.json')
+}
+catch {
+    Add-CollectionError -Stage 'kernel-pool-export' -ErrorRecord $_
+}
+
+if ($PerformanceMode) {
+    try {
+        Write-JsonFile -InputObject @($udpSeries) -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'udp-samples.json')
+        [void]$collectedArtifacts.Add('udp-samples.json')
+    }
+    catch {
+        Add-CollectionError -Stage 'udp-samples-export' -ErrorRecord $_
+    }
+}
+
+if ($null -ne $gpuMetrics) {
+    try {
+        Write-JsonFile -InputObject $gpuMetrics -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'gpu-metrics.json')
+        [void]$collectedArtifacts.Add('gpu-metrics.json')
+    }
+    catch {
+        Add-CollectionError -Stage 'gpu-metrics-export' -ErrorRecord $_
+    }
+}
+
+if ($null -ne $pageFileMetrics) {
+    try {
+        Write-JsonFile -InputObject @($pageFileMetrics) -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'pagefile-metrics.json')
+        [void]$collectedArtifacts.Add('pagefile-metrics.json')
+    }
+    catch {
+        Add-CollectionError -Stage 'pagefile-export' -ErrorRecord $_
+    }
 }
 
 # disk-samples.json / volume-metrics.json are written and registered by the
@@ -3074,6 +4655,98 @@ try {
 }
 catch {
     Add-CollectionError -Stage 'system-event-summary' -ErrorRecord $_
+}
+
+# ---- Incident-correlated event evidence ---------------------------------------
+# The latest-200-System-log view cannot answer "what happened when it froze", so
+# the incident window (marked time +/- EventWindowMinutes, or the collection
+# window when unmarked) drives a multi-log query that keeps raw XML. Events
+# outside the window are labelled, not discarded - the report can then separate
+# "happened during the incident" from background noise.
+$incidentEvents = @()
+$incidentEventSummary = @()
+$correlationWindowStart = if ($null -ne $incidentWindowStartUtc) { $incidentWindowStartUtc } else { $samplerStartUtc }
+$correlationWindowEnd = if ($null -ne $incidentWindowEndUtc) { $incidentWindowEndUtc } else { $completedAtSamplingUtc }
+try {
+    $paddedStart = ([datetime]$correlationWindowStart).AddMinutes(-1 * $EventWindowMinutes)
+    $paddedEnd = ([datetime]$correlationWindowEnd).AddMinutes($EventWindowMinutes)
+    $logNames = @('System', 'Application')
+    # These logs are optional/permission-limited; skip silently when absent.
+    foreach ($optionalLog in @(
+            'Microsoft-Windows-WER/Operational',
+            'Microsoft-Windows-Kernel-LiveDump/Operational',
+            'Microsoft-Windows-DriverFrameworks-UserMode/Operational',
+            'Microsoft-Windows-Kernel-PnP/Configuration')) {
+        try {
+            $null = Get-WinEvent -ListLog $optionalLog -ErrorAction Stop
+            $logNames += $optionalLog
+        }
+        catch {
+            # log not present on this SKU - not an error
+        }
+    }
+
+    foreach ($logName in $logNames) {
+        try {
+            $perLog = Get-EventsWithRawXml -LogName $logName -StartTime $paddedStart -MaxEvents $MaxEventCount -MaxXmlChars 8000
+            foreach ($row in @($perLog.Events)) {
+                $incidentEvents += $row
+            }
+            $incidentEventSummary += [pscustomobject]@{
+                LogName = $logName
+                EventCount = @($perLog.Events).Count
+                SkippedUnrenderableCount = $perLog.SkippedMessageCount
+                Status = 'completed'
+            }
+        }
+        catch {
+            Add-CollectionErrorText -Stage "incident-events-$logName" -Message $_.Exception.Message
+            $incidentEventSummary += [pscustomobject]@{
+                LogName = $logName
+                EventCount = 0
+                SkippedUnrenderableCount = $null
+                Status = 'failed'
+            }
+        }
+    }
+
+    $labelledEvents = @(Add-IncidentWindowLabels `
+        -Events $incidentEvents `
+        -WindowStart $correlationWindowStart `
+        -WindowEnd $correlationWindowEnd `
+        -WindowMinutes $EventWindowMinutes)
+    $inWindowEvents = @($labelledEvents | Where-Object { $_.IncidentWindow -eq 'in-window' })
+
+    Write-JsonFile -InputObject $labelledEvents -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'incident-events.json')
+    [void]$collectedArtifacts.Add('incident-events.json')
+}
+catch {
+    Add-CollectionError -Stage 'incident-events' -ErrorRecord $_
+}
+
+# LiveKernelReports (WHEA/TDR residue) is file-system evidence, not an event log.
+$liveKernelReports = @()
+try {
+    $liveKernelDir = Join-Path $env:SystemRoot 'LiveKernelReports'
+    if (Test-Path -LiteralPath $liveKernelDir) {
+        $liveKernelReports = @(
+            Get-ChildItem -LiteralPath $liveKernelDir -Recurse -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 50 | ForEach-Object {
+                    [pscustomobject]@{
+                        Name = $_.Name
+                        FullPath = $_.FullName
+                        SizeBytes = $_.Length
+                        LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString('o')
+                        Directory = $_.DirectoryName
+                    }
+                }
+        )
+    }
+    Write-JsonFile -InputObject $liveKernelReports -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'livekernelreports.json')
+    [void]$collectedArtifacts.Add('livekernelreports.json')
+}
+catch {
+    Add-CollectionError -Stage 'livekernelreports' -ErrorRecord $_
 }
 
 $crashAnalysis = [ordered]@{
@@ -3224,90 +4897,6 @@ if ($CollectBootFailureLogs) {
     }
 }
 
-if ($CaptureWpr) {
-    $wprResult = Invoke-ConsentedCapture `
-        -StageName 'wpr-capture' `
-        -SkipStatusNotReady 'skipped-wpr-not-found' `
-        -NotReadyMessage 'wpr.exe not found; WPR capture skipped' `
-        -NotReadyErrorId 'WprNotFound' `
-        -ElevationMessage 'requires an elevated (Administrator) console; WPR capture skipped' `
-        -ElevationErrorId 'WprElevationRequired' `
-        -ReadyCheck { Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\wpr.exe') } `
-        -CaptureBody {
-            $wprExe = Join-Path $env:SystemRoot 'System32\wpr.exe'
-            $startedAtUtc = Get-UtcTimestamp
-            $etlPath = Join-Path $resolvedOutputDirectory 'wpr-trace.etl'
-            $startExitCode = $null
-            $stopExitCode = $null
-            $startFailed = $false
-            try {
-                & $wprExe -start $WprProfile -filemode
-                $startExitCode = $LASTEXITCODE
-                if ($startExitCode -ne 0) {
-                    $startFailed = $true
-                }
-            }
-            catch {
-                Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
-                $startFailed = $true
-            }
-
-            if ($startFailed) {
-                Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                    [System.Exception]::new("wpr.exe -start $WprProfile failed with exit code $startExitCode; WPR capture skipped (an already-running trace is left untouched)"),
-                    'WprStartFailed',
-                    [System.Management.Automation.ErrorCategory]::InvalidOperation,
-                    $null
-                ))
-                return [ordered]@{ status = 'failed'; startedAtUtc = $startedAtUtc; startExitCode = $startExitCode }
-            }
-
-            Start-Sleep -Seconds $DurationSeconds
-            try {
-                & $wprExe -stop $etlPath
-                $stopExitCode = $LASTEXITCODE
-                $completedAtUtc = Get-UtcTimestamp
-                $etlExists = Test-Path -LiteralPath $etlPath -PathType Leaf
-                $etlBytes = 0
-                if ($etlExists) {
-                    $etlBytes = (Get-Item -LiteralPath $etlPath).Length
-                }
-                if ($stopExitCode -eq 0 -and $etlExists -and $etlBytes -gt 0) {
-                    [void]$collectedArtifacts.Add('wpr-trace.etl')
-                    return [ordered]@{
-                        status = 'completed'
-                        etlFilePath = $etlPath
-                        startedAtUtc = $startedAtUtc
-                        completedAtUtc = $completedAtUtc
-                        startExitCode = $startExitCode
-                        stopExitCode = $stopExitCode
-                    }
-                }
-                else {
-                    if ($stopExitCode -ne 0) {
-                        $wprStopErrorId = 'WprStopFailed'
-                        $wprStopMessage = "wpr.exe -stop reported exit code $stopExitCode; WPR capture failed (etlExists=$etlExists, etlBytes=$etlBytes)"
-                    }
-                    else {
-                        $wprStopErrorId = 'WprEtlMissing'
-                        $wprStopMessage = "wpr.exe -stop succeeded but no non-empty wpr-trace.etl was produced (etlExists=$etlExists, etlBytes=$etlBytes)"
-                    }
-                    Add-CollectionError -Stage 'wpr-capture' -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
-                        [System.Exception]::new($wprStopMessage),
-                        $wprStopErrorId,
-                        [System.Management.Automation.ErrorCategory]::InvalidData,
-                        $null
-                    ))
-                    return [ordered]@{ status = 'failed'; startedAtUtc = $startedAtUtc; completedAtUtc = $completedAtUtc; startExitCode = $startExitCode; stopExitCode = $stopExitCode }
-                }
-            }
-            catch {
-                Add-CollectionError -Stage 'wpr-capture' -ErrorRecord $_
-                return [ordered]@{ status = 'failed'; startedAtUtc = $startedAtUtc; startExitCode = $startExitCode }
-            }
-        }
-}
-
 if ($CaptureDefender) {
     $defenderResult = Invoke-ConsentedCapture `
         -StageName 'defender-capture' `
@@ -3340,8 +4929,25 @@ if ($CaptureDefender) {
 }
 
 $completedAtUtc = Get-UtcTimestamp
+
+# Volume -> physical disk -> pagefile relevance map (pure join over already
+# collected data, so it can never fail on a live provider).
+$volumeStorageMapping = @()
+try {
+    $volumeStorageMapping = @(Get-VolumeStorageMapping -VolumeMetrics @($volumeMetrics) -DriveToDiskMap $storageTopology -PageFileMetrics @($pageFileMetrics))
+}
+catch {
+    Add-CollectionError -Stage 'storage-mapping' -ErrorRecord $_
+}
+# Schema 1.2 adds the incident-capture surface (concurrent window, marker,
+# process commit attribution, GPU, pagefile/pool, UDP, correlated events).
+# Older 1.0/1.1 manifests stay valid - this only widens the contract.
+$manifestSchemaVersion = '1.0'
+if ($SymptomContext -or $Preset) { $manifestSchemaVersion = '1.1' }
+if ($PerformanceMode -or $MarkerMode) { $manifestSchemaVersion = '1.2' }
+
 $collectionManifest = [ordered]@{
-    schemaVersion = if ($SymptomContext) { '1.1' } else { '1.0' }
+    schemaVersion = $manifestSchemaVersion
     toolName = 'Windows Performance Diagnostics Toolkit'
     toolVersion = $ScriptVersion
     mode = 'Collect'
@@ -3352,9 +4958,67 @@ $collectionManifest = [ordered]@{
         durationSeconds = $DurationSeconds
         maxSystemEvents = $MaxEventCount
         systemEventLookbackHours = 24
+        sampleIntervalSeconds = $SampleIntervalSeconds
+        performanceMode = [bool]$PerformanceMode
+        markerMode = [bool]$MarkerMode
+        eventWindowMinutes = $EventWindowMinutes
+        maxTrackedProcesses = $MaxTrackedProcesses
+    }
+    captureWindow = [ordered]@{
+        startedAtUtc = $samplerStartUtc
+        completedAtUtc = $completedAtSamplingUtc
+        requestedBaselineSeconds = $DurationSeconds
+        actualBaselineSeconds = $samplingActualSeconds
+        sampleCount = @($samples).Count
+        # The evidence for "the trace covers the counters": both stages report
+        # their own real start/stop inside this one window.
+        wprStartUtc = $wprStartedAtUtc
+        wprStopUtc = $wprResult.completedAtUtc
+        wprRequestedSeconds = $WprDurationSeconds
+        wprEffectiveSeconds = $effectiveWprDurationSeconds
+        wprAutoSizedDuration = ($WprDurationSeconds -le 0)
+        wprActualSeconds = $wprResult.actualDurationSeconds
+        gpuCollectedAtUtc = if ($null -ne $gpuMetrics) { $gpuMetrics.collectedAtUtc } else { $null }
+        concurrentStages = @('performance-counters', 'process-commit', 'kernel-pool', 'disk', 'gpu', 'udp', 'wpr')
+    }
+    incident = [ordered]@{
+        markerMode = [bool]$MarkerMode
+        markerObservedAtUtc = $markerTimeUtc
+        markerSource = $markerSource
+        windowStartUtc = $incidentWindowStartUtc
+        windowEndUtc = $incidentWindowEndUtc
+        preSeconds = $MarkerPreSeconds
+        postSeconds = $MarkerPostSeconds
+        retainedSampleCount = @($samples).Count
+        droppedSampleCount = if ($null -ne $markerRetention) { $markerRetention.DroppedSampleCount } else { 0 }
     }
     safety = $planManifest.safety
     system = $systemSummary
+    processMemory = [ordered]@{
+        artifact = 'process-memory-samples.csv'
+        topArtifact = 'process-memory-top.json'
+        distinctProcessCount = @($processMemoryTop).Count
+        top = @($processMemoryTop | Select-Object -First 10)
+    }
+    gpu = [ordered]@{
+        artifact = 'gpu-metrics.json'
+        adapterCount = if ($null -ne $gpuMetrics) { @($gpuMetrics.adapters).Count } else { 0 }
+        engineSampleCount = if ($null -ne $gpuMetrics) { @($gpuMetrics.engines).Count } else { 0 }
+        processMemorySampleCount = if ($null -ne $gpuMetrics) { @($gpuMetrics.processMemory).Count } else { 0 }
+        temperature = if ($null -ne $gpuMetrics) { $gpuMetrics.temperature } else { [ordered]@{ available = $false } }
+        clocks = if ($null -ne $gpuMetrics) { $gpuMetrics.clocks } else { [ordered]@{ available = $false } }
+    }
+    pageFile = @($pageFileMetrics)
+    kernelPool = [ordered]@{
+        artifact = 'kernel-pool-samples.json'
+        sampleCount = @($kernelPoolSeries).Count
+        latestPoolPagedBytes = if (@($kernelPoolSeries).Count -gt 0) { @($kernelPoolSeries)[-1].PoolPagedBytes } else { $null }
+        latestPoolNonpagedBytes = if (@($kernelPoolSeries).Count -gt 0) { @($kernelPoolSeries)[-1].PoolNonpagedBytes } else { $null }
+    }
+    storageMapping = [ordered]@{
+        drives = @($volumeStorageMapping)
+        note = 'Drive letters are mapped to their backing physical disk and to the pagefile host so low free space on an unrelated archive or backup volume is not read as a performance cause.'
+    }
     systemEventLog = [ordered]@{
         enabled = $null
         recordCount = $null
@@ -3375,7 +5039,24 @@ $collectionManifest = [ordered]@{
             installedSoftwareMatches = 0
         }
         sectionErrorCount = $networkSectionErrorCount
+        # UDP visibility: a TCP-only network view cannot see UDP-port
+        # exhaustion, which was the actual warning on the reported machine.
+        udpEndpointCount = if ($null -ne $networkState -and $null -ne $networkState.PSObject.Properties['udpEndpoints']) { @($networkState.udpEndpoints).Count } else { $null }
+        udpEndpointCountByProcess = if ($null -ne $networkState -and $null -ne $networkState.PSObject.Properties['udpEndpointCountByProcess']) { @($networkState.udpEndpointCountByProcess) } else { @() }
+        dynamicUdpPortRanges = if ($null -ne $networkState -and $null -ne $networkState.PSObject.Properties['dynamicUdpPortRanges']) { @($networkState.dynamicUdpPortRanges) } else { @() }
+        dynamicUdpPortUsage = if ($null -ne $networkState -and $null -ne $networkState.PSObject.Properties['dynamicUdpPortUsage']) { $networkState.dynamicUdpPortUsage } else { $null }
     }
+    incidentEvents = [ordered]@{
+        artifact = 'incident-events.json'
+        windowStartUtc = $correlationWindowStart
+        windowEndUtc = $correlationWindowEnd
+        windowPaddingMinutes = $EventWindowMinutes
+        pulledEventCount = @($incidentEvents).Count
+        inWindowEventCount = if ($null -ne $inWindowEvents) { @($inWindowEvents).Count } else { 0 }
+        logs = @($incidentEventSummary)
+        note = 'Events outside the incident window are retained and labelled out-of-window; they are not evidence of the incident.'
+    }
+    liveKernelReports = @($liveKernelReports)
     collectionErrors = $collectionErrors
     artifacts = @()
 }
@@ -3405,6 +5086,9 @@ if ($networkState) {
             installedSoftwareMatches = if ($null -ne $securitySoftwareState) { @($securitySoftwareState['installedSoftwareMatches']).Count } else { 0 }
         }
         sectionErrorCount = $networkSectionErrorCount
+        udpEndpointCount = if ($networkState.Contains('udpEndpoints')) { @($networkState['udpEndpoints']).Count } else { $null }
+        dynamicUdpPortRanges = if ($networkState.Contains('dynamicUdpPortRanges')) { @($networkState['dynamicUdpPortRanges']) } else { @() }
+        udpEndpointCountByProcess = if ($networkState.Contains('udpEndpointCountByProcess')) { @($networkState['udpEndpointCountByProcess']) } else { @() }
     }
 }
 
@@ -3412,12 +5096,58 @@ if ($CaptureWpr) {
     $collectionManifest.wpr = [ordered]@{
         profile = $WprProfile
         durationSeconds = $DurationSeconds
+        requestedDurationSeconds = $WprDurationSeconds
+        actualDurationSeconds = $wprResult.actualDurationSeconds
+        maxFileMB = $WprMaxFileMB
+        concurrentWithSampling = $true
         etlFilePath = $wprResult.etlFilePath
+        etlBytes = $wprResult.etlBytes
         startedAtUtc = $wprResult.startedAtUtc
         completedAtUtc = $wprResult.completedAtUtc
         startExitCode = $wprResult.startExitCode
         stopExitCode = $wprResult.stopExitCode
         status = $wprResult.status
+    }
+}
+
+if ($null -ne $gpuMetrics) {
+    $collectionManifest.gpu = [ordered]@{
+        artifact = 'gpu-metrics.json'
+        adapterCount = @($gpuMetrics.adapters).Count
+        engineSampleCount = @($gpuMetrics.engines).Count
+        processMemorySampleCount = @($gpuMetrics.processMemory).Count
+        temperature = $gpuMetrics.temperature
+        clocks = $gpuMetrics.clocks
+    }
+}
+
+if ($null -ne $pageFileMetrics) {
+    $collectionManifest.pageFile = @($pageFileMetrics)
+}
+
+if ($kernelPoolSeries.Count -gt 0) {
+    $lastPool = $kernelPoolSeries[$kernelPoolSeries.Count - 1]
+    $collectionManifest.kernelPool = [ordered]@{
+        artifact = 'kernel-pool-samples.json'
+        sampleCount = $kernelPoolSeries.Count
+        latestPoolPagedBytes = $lastPool.PoolPagedBytes
+        latestPoolNonpagedBytes = $lastPool.PoolNonpagedBytes
+    }
+}
+
+if ($null -ne $storageTopology) {
+    $collectionManifest.storageMapping = [ordered]@{
+        drives = @(Get-VolumeStorageMapping -VolumeMetrics $volumeMetrics -DriveToDiskMap $storageTopology -PageFileMetrics $pageFileMetrics)
+        note = 'HostsPageFile identifies the volume backing the pagefile; free space on other volumes does not bound paging performance.'
+    }
+}
+
+if ($processMemoryTop.Count -gt 0) {
+    $collectionManifest.processMemory = [ordered]@{
+        artifact = 'process-memory-samples.csv'
+        topArtifact = 'process-memory-top.json'
+        distinctProcessCount = @($processMemorySeries | Group-Object -Property Name).Count
+        top = @($processMemoryTop | Select-Object -First 5)
     }
 }
 
@@ -3500,7 +5230,9 @@ $collectionManifest = Write-CollectionOutputs `
     -DiskSeries @($diskSeries) `
     -VolumeMetrics $volumeMetrics `
     -MemoryMetrics $finalMemMetrics `
-    -SymptomContext $SymptomContext
+    -SymptomContext $SymptomContext `
+    -CaptureWindow $collectionManifest.captureWindow `
+    -ProcessMemoryTop @($processMemoryTop)
 
 $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"

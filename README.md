@@ -2,7 +2,7 @@
 
 > A safety-first, documentation-led foundation for diagnosing Windows slowness and stability issues.
 
-**Version:** 0.9.0
+**Version:** 0.9.1
 
 **Status:** Slowdown diagnosis toolkit with symptom context, in-window telemetry (PID+StartTime interval CPU percentage, paired raw-disk latency/throughput/queue, memory committed/limit and paging, volume free space), findings engine with sustained-pressure rules and coverage warnings, standalone offline HTML report, and read-only case verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM. The new raw-disk/in-window telemetry and findings/report paths are covered by fixture tests and a hosted Windows smoke run; an **owner-live Windows client run is still required** before any remediation planning (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 

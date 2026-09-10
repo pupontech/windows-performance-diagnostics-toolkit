@@ -593,8 +593,8 @@ jobs:
       WPD11_WORK: C:\WPD11
       # Published SHA-256 of the release zip for WPD11_PIN_TAG (verified against
       # the .sha256 release asset). Bump both together on the next release.
-      WPD11_PIN_TAG: v0.8.2
-      WPD11_PIN_SHA256: 0aa81c628227ffc94605b9130af4d2cabaf2f6cc27e7396dbac4b1e2de683c92
+      WPD11_PIN_TAG: v0.9.0
+      WPD11_PIN_SHA256: dcb67cda6f0f4d52b56b1ebe99f3ceaab6ba8dcee6ac3b330969de07d56fd394
     steps:
       - uses: actions/checkout@v4
 

@@ -853,7 +853,8 @@ function Get-EventsSafe {
       specified resource type cannot be found in the image file" and the ENTIRE
       query comes back empty - discarding thousands of good records along with
       the one bad one. Record-by-record lets us skip just the bad one.
-      Returns the NEWEST up to MaxEvents records (sliding buffer).
+      Returns the newest up to MaxEvents records and stops reading once that
+      bound is reached.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -868,6 +869,9 @@ function Get-EventsSafe {
     $isoTime = $StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
     $xpath = "*[System[TimeCreated[@SystemTime>='$isoTime']]]"
     $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($LogName, [System.Diagnostics.Eventing.Reader.PathType]::LogName, $xpath)
+    # Read newest first. This makes MaxEvents a real I/O bound instead of a
+    # sliding buffer over every matching record in a busy 24-hour log.
+    $query.ReverseDirection = $true
     $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
     $buffer = New-Object System.Collections.ArrayList
     $skipped = 0
@@ -897,8 +901,8 @@ function Get-EventsSafe {
                     ProviderName = $rec.ProviderName
                     Message = $msg
                 })
-                if ($buffer.Count -gt $MaxEvents) {
-                    $buffer.RemoveAt(0)
+                if ($buffer.Count -ge $MaxEvents) {
+                    break
                 }
             }
             finally {
@@ -1031,6 +1035,36 @@ function Get-PropertyValue {
     return $null
 }
 
+function Resolve-DnsAddressesBounded {
+    <#
+      Resolves one name through the asynchronous .NET resolver with a hard
+      caller-side timeout. GetHostAddresses() is synchronous and can block for
+      minutes when DNS is silently dropped; do not use it in Collect mode.
+      A timed-out resolver task is deliberately not awaited further: it may
+      finish later, but it cannot hold up the diagnostic pipeline.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Domain,
+        [ValidateRange(1, 30000)][int]$TimeoutMilliseconds = 2000,
+        [AllowNull()][scriptblock]$Resolver
+    )
+
+    if ($null -eq $Resolver) {
+        $Resolver = {
+            param($Name)
+            [System.Net.Dns]::GetHostAddressesAsync($Name)
+        }
+    }
+    $task = & $Resolver $Domain
+    if ($null -eq $task) {
+        throw "DNS resolution did not return a task for '$Domain'."
+    }
+    if (-not $task.Wait($TimeoutMilliseconds)) {
+        throw "DNS resolution timed out after $TimeoutMilliseconds ms for '$Domain'."
+    }
+    return @($task.Result | ForEach-Object { $_.IPAddressToString })
+}
+
 function Get-NetworkState {
     <#
       Read-only network-state snapshot (pattern adopted from the field-tested
@@ -1113,8 +1147,8 @@ function Get-NetworkState {
     # DNS-vs-ping split test: reach a public IP by raw address (link/routing
     # without DNS) and resolve public names (DNS). The combination tells the
     # technician whether the outage is in connectivity or in name resolution.
-    # Probes are hard-timeout bounded (.NET Ping 2s; GetHostAddresses resolver
-    # timeout) - Test-Connection/Resolve-DnsName can block for minutes when
+    # Probes are hard-timeout bounded (.NET Ping 2s; asynchronous DNS resolver
+    # waited for no more than 2s) - Test-Connection/Resolve-DnsName can block for minutes when
     # ICMP/DNS is silently dropped (observed in batch-logon standard-user
     # sessions on CI runners).
     $pingTargets = @('8.8.8.8', '1.1.1.1')
@@ -1147,8 +1181,7 @@ function Get-NetworkState {
     foreach ($domain in $dnsTargets) {
         try {
             $resolvedIps = @(
-                [System.Net.Dns]::GetHostAddresses($domain) |
-                    ForEach-Object { $_.IPAddressToString }
+                Resolve-DnsAddressesBounded -Domain $domain -TimeoutMilliseconds 2000
             )
             $dnsResults += [pscustomobject]@{
                 Domain = $domain
@@ -2917,7 +2950,14 @@ while ($samplingStopwatch.Elapsed.TotalSeconds -lt $DurationSeconds) {
                 [void]$diskSeries.Add($deltaRow)
             }
         }
-        if ($null -ne $rawDisk.Disks) { $previousDiskRaw = $rawDisk.Disks }
+        if ($null -ne $rawDisk.Disks) {
+            $previousDiskRaw = $rawDisk.Disks
+        }
+        else {
+            # A missing raw poll is a coverage gap, not a longer interval. The
+            # next usable poll establishes a new baseline and cannot bridge it.
+            $previousDiskRaw = $null
+        }
 
         $availableMemoryMB = $null
         if ($null -ne $operatingSystem.FreePhysicalMemory) {

@@ -33,9 +33,16 @@ being exercised on real Windows (GitHub-hosted VMs) first.
 |---|---|---|
 | `linux-verify` | ubuntu-latest | pytest suite (plan mode, consent gates, WPR gates, schema, packaging, Verify mode) + pwsh parse gate |
 | `windows-verify` | windows-2022 **and** windows-2025 | Parse gates under Windows PowerShell 5.1 and pwsh 7; Plan mode; Collect-without-consent refusal; WPR-without-consent refusal; **invalid-`-OutputDirectory` clear error**; **executes the real `Run-Diagnostics.bat` via `cmd`**; executes START-HERE Plan/Collect/Verify modes and asserts `C:\Temp\WPD-Case\diagnostic-manifest.json` |
+| `CodeQL` | ubuntu-latest | Static analysis of Python test/support code and GitHub Actions workflows on every PR and `main` push; scheduled weekly scan. |
 
-A change is not releasable until both jobs are green on both Windows OS
-versions. This is what catches the class of bug that Linux-only checks miss
+`main` is protected: pull requests, up-to-date passing CI, resolved review
+threads, no force pushes, and no branch deletion are required. The required
+checks include both CodeQL language legs plus every collection/release gate.
+Dependabot updates GitHub Actions weekly; Dependabot alerts/updates, secret
+scanning, and secret-scanning push protection are enabled for the repository.
+
+A change is not releasable until all required CI checks are green on both Windows
+OS versions. This is what catches the class of bug that Linux-only checks miss
 (for example v0.2.1: a trailing backslash before a closing quote in a
 `powershell.exe -File` argument becomes a literal quote character, which threw
 `GetFullPath ... Illegal characters in path.` on real Windows).
@@ -63,7 +70,9 @@ until the owner records results back on the board.
 ## House rules (apply to every file)
 
 - PowerShell 5.1 compatible (no `??`, no ternary, no `::new()` where it breaks 5.1, no pipeline-chain assignment).
-- Pure ASCII, no BOM — verify with a Python byte scan.
+- Runtime and automation files (`.ps1`, `.bat`, `.sh`, `.json`, `.yml`) are
+  pure ASCII and BOM-free; documentation and test descriptions may use UTF-8
+  typography but must remain BOM-free. Verify with a Python byte scan.
 - Never invent CLI flags: only documented switches for Microsoft tools.
 - `.bat` launchers: CRLF line endings, no `\"` before a closing quote, explicit consent flags, CI-safe pause (`if not "%CI%"=="true" pause`).
 - Windows-only code paths get Linux-verifiable tests where possible; everything else is documented for the owner's live matrix.

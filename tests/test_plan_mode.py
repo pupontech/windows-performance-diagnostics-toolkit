@@ -215,6 +215,38 @@ def test_release_flow_uses_the_real_workflow_token_for_asset_probes():
     assert '-H ("Authorization: " + $c.hdr)' in release_flow
 
 
+def test_project_security_automation_covers_action_updates_and_code_scanning():
+    """Project hardening is a shipped contract: Dependabot must watch workflow
+    actions, and CodeQL must analyze both Python and GitHub Actions on PRs and
+    the default branch."""
+    dependabot = (REPO_ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+    codeql = (REPO_ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
+
+    assert "package-ecosystem: github-actions" in dependabot
+    assert "interval: weekly" in dependabot
+    assert "pull_request:" in codeql
+    assert "push:" in codeql
+    assert "security-events: write" in codeql
+    assert "language: [actions, python]" in codeql
+    assert "github/codeql-action/init@v3" in codeql
+    assert "github/codeql-action/analyze@v3" in codeql
+
+
+def test_runtime_and_automation_files_follow_the_encoding_rule():
+    """Machine-parsed runtime and automation files remain portable ASCII without
+    a UTF-8 BOM; human-facing documentation is intentionally allowed UTF-8."""
+    suffixes = {".ps1", ".bat", ".sh", ".json", ".yml", ".yaml"}
+    ignored_parts = {".git", ".venv", "dist", "__pycache__"}
+    for path in REPO_ROOT.rglob("*"):
+        if not path.is_file() or ignored_parts.intersection(path.parts):
+            continue
+        if path.suffix.lower() not in suffixes:
+            continue
+        data = path.read_bytes()
+        assert not data.startswith(b"\xef\xbb\xbf"), f"BOM: {path.relative_to(REPO_ROOT)}"
+        assert all(byte < 128 for byte in data), f"non-ASCII: {path.relative_to(REPO_ROOT)}"
+
+
 def test_plan_mode_with_defender_lists_capture_action_and_scope(tmp_path):
     """Plan mode must advertise the Defender capture action without invoking it."""
     output_directory = tmp_path / "plan-defender"

@@ -433,42 +433,6 @@ public static class WpdFileIdentityNative
         SafeFileHandle fileHandle,
         out BY_HANDLE_FILE_INFORMATION information);
 
-    public static FileStream OpenReadNoFollowSingleLink(string path)
-    {
-        const uint GENERIC_READ = 0x80000000;
-        const uint FILE_SHARE_READ = 0x00000001;
-        const uint FILE_SHARE_WRITE = 0x00000002;
-        const uint FILE_SHARE_DELETE = 0x00000004;
-        const uint OPEN_EXISTING = 3;
-        const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
-        SafeFileHandle handle = CreateFile(
-            path,
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            IntPtr.Zero,
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT,
-            IntPtr.Zero);
-        if (handle.IsInvalid) {
-            handle.Dispose();
-            throw new Win32Exception(Marshal.GetLastWin32Error());
-        }
-        try {
-            BY_HANDLE_FILE_INFORMATION information;
-            if (!GetFileInformationByHandle(handle, out information)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-            }
-            if (information.NumberOfLinks != 1) {
-                throw new IOException("File has multiple filesystem links.");
-            }
-            return new FileStream(handle, FileAccess.Read, 65536, false);
-        }
-        catch {
-            handle.Dispose();
-            throw;
-        }
-    }
-
     public static long GetLinkCount(string path)
     {
         const uint FILE_READ_ATTRIBUTES = 0x00000080;
@@ -604,7 +568,7 @@ function Copy-CaseFileBounded {
         if ($copyOnWindows) {
             $sourceLinkCount = Get-CaseFileLinkCount -Path $sourceFull
             if ($sourceLinkCount -ne 1) { throw "Source file identity is unsafe: $sourceFull" }
-            $sourceStream = [WpdFileIdentityNative]::OpenReadNoFollowSingleLink($sourceFull)
+            $sourceStream = [System.IO.File]::OpenRead($sourceFull)
         }
         else {
             $sourceStream = [System.IO.File]::OpenRead($sourceFull)
@@ -1136,7 +1100,7 @@ function New-CasePackage {
             try {
                 $copyOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
                 if ($copyOnWindows) {
-                    $inputStream = [WpdFileIdentityNative]::OpenReadNoFollowSingleLink($validatedEntry.SourcePath)
+                    $inputStream = [System.IO.File]::OpenRead($validatedEntry.SourcePath)
                 }
                 else {
                     $inputStream = [System.IO.File]::OpenRead($validatedEntry.SourcePath)
@@ -2231,7 +2195,7 @@ function Get-ServicingLogAnalysis {
             try {
                 $boundedStream = [System.IO.MemoryStream]::new()
                 if ($runningOnWindows) {
-                    $inputStream = [WpdFileIdentityNative]::OpenReadNoFollowSingleLink($fullPath)
+                    $inputStream = [System.IO.File]::OpenRead($fullPath)
                 }
                 else {
                     $inputStream = [System.IO.File]::OpenRead($fullPath)

@@ -78,11 +78,12 @@ jobs:
           }
 
       - name: Run crash and servicing helper tests (Windows PowerShell 5.1)
+        timeout-minutes: 10
         shell: powershell
         run: |
-          python -m pip install --disable-pip-version-check pytest jsonschema
+          python -m pip install --disable-pip-version-check pytest jsonschema pytest-timeout
           $env:WPD_POWERSHELL_EXE = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-          python -m pytest tests/test_crash_servicing_findings.py -q
+          python -m pytest tests/test_crash_servicing_findings.py -q --timeout=180 --timeout-method=thread
 
       - name: Run Plan mode
         shell: pwsh

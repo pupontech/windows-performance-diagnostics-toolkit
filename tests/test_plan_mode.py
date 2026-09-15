@@ -584,7 +584,7 @@ def test_new_case_package_zips_only_named_files(tmp_path):
     command = (
         f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
         f"New-CasePackage -Directory '{src.as_posix()}' "
-        f"-RelativeNames @('performance-samples.csv','network-state.json','minidumps/082826-12345-01.dmp') "
+        f"-RelativeNames @('performance-samples.csv','network-state.json','minidumps\\082826-12345-01.dmp') "
         f"-DestinationDirectory '{out.as_posix()}' -LeafName 'wpd-test'"
     )
     result = subprocess.run(

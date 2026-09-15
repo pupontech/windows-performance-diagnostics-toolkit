@@ -1056,7 +1056,7 @@ function New-CasePackage {
         if ([string]::IsNullOrWhiteSpace($relativeText) -or [System.IO.Path]::IsPathRooted($relativeText) -or $relativeText -match '(^|[\\/])\.\.?([\\/]|$)') {
             throw "Case package entry is not a safe relative path: $relativeText"
         }
-        $relativeForPath = $relativeText.Replace('\\', [string][System.IO.Path]::DirectorySeparatorChar).Replace('/', [string][System.IO.Path]::DirectorySeparatorChar)
+        $relativeForPath = $relativeText.Replace('\', [string][System.IO.Path]::DirectorySeparatorChar).Replace('/', [string][System.IO.Path]::DirectorySeparatorChar)
         $sourceFile = [System.IO.Path]::GetFullPath((Join-Path -Path $directoryFull -ChildPath $relativeForPath))
         if (-not $sourceFile.StartsWith($directoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Case package entry escapes its source directory: $relativeText"
@@ -1072,7 +1072,7 @@ function New-CasePackage {
             throw "Case package source has unsafe file identity: $relativeText"
         }
         $validatedEntries += [pscustomobject]@{
-            RelativeName = $relativeText.Replace('\\', '/')
+            RelativeName = $relativeText.Replace('\', '/')
             SourcePath = $sourceFile
             Length = $sourceInfo.Length
         }

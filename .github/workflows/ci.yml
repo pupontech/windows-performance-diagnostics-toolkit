@@ -12,8 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pytest
-        run: python3 -m pip install pytest
+      - name: Install pytest and jsonschema
+        run: python3 -m pip install pytest jsonschema
 
       - name: Run pytest
         run: |
@@ -76,6 +76,13 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.ToString() }
             exit 1
           }
+
+      - name: Run crash and servicing helper tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          python -m pip install --disable-pip-version-check pytest jsonschema
+          $env:WPD_POWERSHELL_EXE = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+          python -m pytest tests/test_crash_servicing_findings.py -q
 
       - name: Run Plan mode
         shell: pwsh
@@ -196,6 +203,18 @@ jobs:
           }
           if ($m.bootFailureLogs.enabled -ne $true -or $m.bootFailureLogs.status -notin @("completed","failed")) {
             Write-Error "Unexpected bootFailureLogs block: $($m.bootFailureLogs | ConvertTo-Json -Compress)"
+            exit 1
+          }
+          if ($null -eq $m.servicingAnalysis -or $m.servicingAnalysis.status -notin @("completed","partial","failed")) {
+            Write-Error "Unexpected servicingAnalysis block: $($m.servicingAnalysis | ConvertTo-Json -Compress)"
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath "C:\Temp\WPD-Case\servicing-log-analysis.json")) {
+            Write-Error "servicing-log-analysis.json missing"
+            exit 1
+          }
+          if (@($m.artifacts | Where-Object { $_.Name -eq "servicing-log-analysis.json" }).Count -ne 1) {
+            Write-Error "servicing-log-analysis.json not listed in manifest hashes"
             exit 1
           }
           if ($m.package.enabled -ne $true -or $m.package.status -notin @("completed","failed")) {

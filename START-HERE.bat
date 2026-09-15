@@ -133,6 +133,7 @@ echo   - incident-events.json       (window-labelled events)
 echo   - wpr-trace.etl                (when WPR is available)
 echo   - minidumps\                   (crash dumps)
 echo   - bootfailure\                 (SRT/boot/CBS logs)
+echo   - servicing-log-analysis.json (CBS/DISM/setup signatures)
 echo   - WPD-Case-^<time^>.zip          (case package, next to the output folder)
 echo Full log: %LOG%
 echo.

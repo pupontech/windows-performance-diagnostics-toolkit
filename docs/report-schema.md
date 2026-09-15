@@ -16,6 +16,8 @@ document defines the contract for those JSON files and their companion artifacts
 | `performance-samples.csv` | Time-series samples of CPU load, available memory, free disk space, and memory committed/limit/paging indicators collected once per second inside the sample window. |
 | `top-processes.json` | Snapshot of the top 20 processes sorted by interval CPU percentage, including PID, cumulative CPU seconds, memory, and handle count. |
 | `system-events-last-24-hours.json` | System event log entries from the preceding 24 hours (up to MaxEventCount). |
+| `livekernelreports.json` | Bounded metadata for the newest LiveKernelReports files; raw dump contents are not copied by this artifact. |
+| `servicing-log-analysis.json` | Bounded aggregate signatures, counts and line ranges from copied CBS, DISM, setup and boot logs; raw lines remain in `bootfailure\`. |
 | `network-state.json` | Read-only network-state snapshot: IP configuration, adapter status, DNS servers/cache, routes, ARP table, a DNS-vs-ping split test, hosts-file entries, proxy settings, active TCP connections, and a security/VPN/filtering software inventory. |
 | `disk-samples.json` | Per-interval, per-disk derived metrics from paired raw `Win32_PerfRawData_PerfDisk_PhysicalDisk` snapshots: read/write latency, throughput and instantaneous queue depth, with coverage reasons for unavailable counters. |
 | `volume-metrics.json` | Per-volume capacity/free space with null guards (missing free space is `null`, never `0`). |
@@ -35,7 +37,9 @@ The `schemaVersion` field is independent of the `toolVersion` field.
   of schema changes.
 
 Current schema version: `1.1` when symptom context or a preset is present
-(`symptom` block), otherwise `1.0`. Both are valid.
+(`symptom` block), otherwise `1.0`; incident-capture manifests use `1.2`.
+The crash/servicing follow-up adds optional fields to the `1.2` contract, so no
+incompatible schema bump is required. All prior versions remain valid.
 
 When a new schema version is introduced, both versions remain valid during a
 transition window. Consumers should accept any `schemaVersion` present in the
@@ -231,8 +235,10 @@ The manifest file is never self-referenced. This allows consumers to verify
 integrity of all collected files by recomputing hashes and comparing against the
 manifest.
 
-`findings.json`, `report.html`, `disk-samples.json` and `volume-metrics.json` are
-written and registered **before** the final manifest artifact index is computed,
+The following artifacts are written and registered **before** the final manifest
+artifact index is computed: `findings.json`, `report.html`, `disk-samples.json`,
+`volume-metrics.json` and, when boot-failure collection is requested,
+`servicing-log-analysis.json`.
 so they are hashed, included in the case ZIP and covered by Verify and remote
 pull. `report.html` is generated before its own hash exists, so its artifact
 index intentionally omits itself (a file cannot contain its own SHA-256); the
@@ -244,8 +250,8 @@ final manifest still lists `report.html` and Verify recomputes it.
 
 | Field | Meaning |
 |-------|---------|
-| `category` | `cpu-pressure`, `memory-pressure`, `memory-paging`, `disk-pressure`, `disk-latency`, `disk-space`, or `coverage`. |
-| `sourceArtifact` | The artifact the metric came from (`performance-samples.csv`, `disk-samples.json`, `volume-metrics.json`). |
+| `category` | `cpu-pressure`, `memory-pressure`, `memory-paging`, `disk-pressure`, `disk-latency`, `disk-space`, `crash-evidence`, `servicing-failure`, or `coverage`. |
+| `sourceArtifact` | The artifact the metric came from, such as `performance-samples.csv`, `livekernelreports.json`, `servicing-log-analysis.json`, or `diagnostic-manifest.json`. |
 | `metric` | The measured field (for example `AverageCpuLoadPercent`, `ReadLatencySeconds`). |
 | `windowStart` / `windowEnd` | UTC timestamps of the first/last contributing sample. Sustained findings cite a real window; state/coverage findings may be `null`. |
 | `measuredValues` | The measured numbers behind the finding. |
@@ -277,18 +283,57 @@ result so an empty result is never mistaken for "nothing happened":
 
 ## Crash Analysis Block
 
-The `crashAnalysis` object summarizes crash evidence from the pulled System
-events:
+The `crashAnalysis` object joins crash evidence from the bounded System event
+query with the minidumps and LiveKernelReports collected into the case:
 
 | Field | Meaning |
 |-------|---------|
 | `bugchecks` | BugCheck 1001 events decoded to their `0x…` bugcheck codes (e.g. `0x0000001A`). |
 | `unexplainedShutdowns` | Kernel-Power 41 events with **no** bugcheck within 5 minutes — typically a hard freeze, power loss, or thermal cutout rather than a Windows-detected crash. |
+| `eventLookbackStartUtc` / `eventLookbackEndUtc` | The bounded event-query interval used for event correlation. A dump outside this interval is retained and labelled, not discarded. |
+| `eventCorrelationWindowMinutes` | The maximum time distance used to associate a dump's source write time with a BugCheck event. |
+| `minidumps` | Per-dump metadata with parsed filename date, optional event-correlated bugcheck code, correlation status, and a problem signature. This does not decode the dump binary. |
+| `minidumpSignatures` | Dedupe summary of minidumps by problem signature, with a bounded sample of filenames. |
+| `liveKernelReports` | Per-file LiveKernelReports metadata with a filename-derived class such as `livekernel:watchdog` or `livekernel:whea`. The class is a hint only. |
+| `liveKernelSignatures` | Dedupe summary of LiveKernelReports by filename-derived problem signature. |
 
-Both arrays are empty when no matching evidence is in the window. Correlation
-is evidence, not causation: a bugcheck code names the crash *type*, but naming
-the exact driver usually needs WinDbg `!analyze -v` against the matching
-minidump.
+The minidump `eventCorrelationStatus` values are `matched-bugcheck`,
+`no-matching-bugcheck`, `outside-event-lookback`, and `ambiguous-bugcheck`.
+When `SourceLastWriteTimeUtc` is available, it is authoritative for the event
+lookback; a stale filename date cannot suppress an in-window match, and a source
+time after the lookback end is outside even if a nearby event was queried.
+Filename dates are used as an outside-lookback hint only when source time is
+unavailable. Correlation is evidence, not causation: a bugcheck code names the crash *type*,
+but naming the exact driver usually needs WinDbg `!analyze -v` against the
+matching minidump. LiveKernelReports filename classes do not prove a WHEA,
+watchdog, or TDR cause.
+
+## Servicing Analysis Block
+
+When `-CollectBootFailureLogs` is requested and consented, the collector scans
+the copied `bootfailure\` files with a bounded byte-window reader. It emits
+`servicing-log-analysis.json` and stores the same object as `servicingAnalysis`
+in the manifest. The analysis artifact contains no raw log lines.
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `completed` when all analyzed inputs are complete, `partial` when one or more requested logs are unavailable or truncated, or `failed` only when the analyzer stage itself throws. |
+| `maxScanBytes` | Per-file scan bound. Files over the bound are reported as `oversized`, never truncated. |
+| `truncatedLogCount` | Number of readable log prefixes that reached the byte bound; these make the aggregate result `partial`. |
+| `unavailableLogCount` | Number of requested sources that were not copied or otherwise unavailable to the analyzer. |
+| `error` | Top-level analyzer error when `status` is `failed`; otherwise omitted or null. |
+| `logs` | Per-source status, copied artifact, line counts, matched-line counts, bounded bytes scanned, and normalized signatures. Non-copied sources remain visible as `not-copied`. |
+| `logs[].scanStatus` | `not-copied`, `invalid-metadata`, `missing`, `oversized`, `reparse-point`, `hardlink`, `identity-unavailable`, `completed`, or `failed`. Reparse-point and multi-link entries are refused rather than followed. |
+| `logs[].bytesScanned` / `logs[].scanTruncated` | Actual bytes fed to the analyzer and whether the configured byte bound was reached; these remain bounded even if the source grows while it is read. |
+| `logs[].signatures` | A normalized token such as `CBS_E_INVALID_PACKAGE`, `ERROR_SXS_COMPONENT_STORE_CORRUPT`, an HRESULT such as `0x800F081F`, or `generic-error`, with count and first/last line numbers. |
+
+Text signatures are evidence for review, not a package-health verdict. The
+collector does not run DISM/SFC, repair servicing state, or claim complete
+coverage of every CBS/DISM grammar. Raw copied logs remain the source of truth
+for context around a reported line range. The findings engine emits
+`servicingEvidencePartial` when at least one requested log was scanned and
+another was unavailable; it emits `servicingEvidenceUnavailable` when none was
+scanned, and `servicingAnalysisFailed` when the analysis stage itself failed.
 
 ## Network State Block
 

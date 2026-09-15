@@ -138,6 +138,39 @@ function Add-CollectionErrorText {
     })
 }
 
+function Write-CaseFileAtomically {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [AllowNull()]
+        [string]$Content
+    )
+
+    $fullPath = Assert-CaseFileDestinationSafe -Path $Path
+    $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+    $parentDirectory = Split-Path -Parent $fullPath
+
+    if ($null -eq $Content) { $Content = '' }
+    $contentBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Content)
+    $temporaryPath = Join-Path -Path $parentDirectory -ChildPath ('.' + [System.IO.Path]::GetFileName($fullPath) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $temporaryStream = $null
+    try {
+        $temporaryStream = [System.IO.File]::Open($temporaryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $temporaryStream.Write($contentBytes, 0, $contentBytes.Length)
+        $temporaryStream.Flush()
+        $temporaryStream.Dispose()
+        $temporaryStream = $null
+
+        $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $temporaryPath -DestinationPath $fullPath
+        $temporaryPath = $null
+    }
+    finally {
+        if ($null -ne $temporaryStream) { $temporaryStream.Dispose() }
+        if ($null -ne $temporaryPath -and [System.IO.File]::Exists($temporaryPath)) { [System.IO.File]::Delete($temporaryPath) }
+    }
+}
+
 function Write-JsonFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -149,10 +182,21 @@ function Write-JsonFile {
 
     # Explicit UTF-8 WITHOUT BOM: Windows PowerShell 5.1's Set-Content -Encoding
     # UTF8 writes a BOM while pwsh 7 does not, so manifests would differ by
-    # engine. WriteAllText with UTF8Encoding($false) makes the JSON contract
-    # byte-identical on both.
+    # engine.
     $json = $InputObject | ConvertTo-Json -Depth 8
-    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-CaseFileAtomically -Path $Path -Content $json
+}
+
+function Write-CaseCsvFile {
+    param(
+        [AllowNull()][object[]]$Rows,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $csvLines = @($Rows | ConvertTo-Csv -NoTypeInformation)
+    $csv = $csvLines -join [Environment]::NewLine
+    if ($csv.Length -gt 0) { $csv += [Environment]::NewLine }
+    Write-CaseFileAtomically -Path $Path -Content $csv
 }
 
 function Get-UtcTimestamp {
@@ -277,6 +321,324 @@ function Test-CasePathContained {
         $rootPrefix = $rootFull.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
     }
     return $candidateFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-CasePathHasReparsePoint {
+    <#
+      Refuses a file or any parent directory that is a junction, symlink or
+      other reparse point. Lexical containment alone is insufficient because a
+      path under the case directory can resolve outside it at read time.
+      Attribute-read failures are treated as unsafe.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Candidate
+    )
+
+    try {
+        $rootFull = [System.IO.Path]::GetFullPath($Root)
+        $candidateFull = [System.IO.Path]::GetFullPath($Candidate)
+        $rootRoot = [System.IO.Path]::GetPathRoot($rootFull)
+        if ($rootFull -eq $rootRoot) { $rootPrefix = $rootFull }
+        else { $rootPrefix = $rootFull.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar }
+        if ($candidateFull -ne $rootFull -and -not $candidateFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+
+        $current = $candidateFull
+        while ($true) {
+            try {
+                $attributes = [System.IO.File]::GetAttributes($current)
+                if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            }
+            catch {
+                # A missing final destination is safe to create; attribute
+                # failures for an existing path are not safe to read or write.
+                if ($current -eq $rootFull -or [System.IO.File]::Exists($current) -or [System.IO.Directory]::Exists($current)) { return $true }
+            }
+            if ($current -eq $rootFull) { break }
+            $parent = [System.IO.Directory]::GetParent($current)
+            if ($null -eq $parent) { return $true }
+            $current = [System.IO.Path]::GetFullPath($parent.FullName)
+            if (-not $current.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        return $false
+    }
+    catch {
+        return $true
+    }
+}
+
+function Get-CaseFileLinkCount {
+    <#
+      Return the filesystem link count for a case artifact. A copied artifact
+      should have exactly one link; rejecting a higher count prevents a hardlink
+      under the case directory from exposing or overwriting an outside file.
+      -1 means identity could not be established and callers must fail closed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (-not [System.IO.File]::Exists($Path)) { return 0 }
+    $runningOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+    if (-not $runningOnWindows) {
+        try {
+            $statCommand = Get-Command stat -ErrorAction Stop
+            $rawCount = & $statCommand.Source -c '%h' -- $Path 2>$null
+            [int64]$linkCount = 0
+            if ([int64]::TryParse(([string]$rawCount).Trim(), [ref]$linkCount)) { return $linkCount }
+        }
+        catch { }
+        return -1
+    }
+
+    try {
+        try { return [WpdFileIdentityNative]::GetLinkCount($Path) }
+        catch { }
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class WpdFileIdentityNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle fileHandle,
+        out BY_HANDLE_FILE_INFORMATION information);
+
+    public static FileStream OpenReadNoFollowSingleLink(string path)
+    {
+        const uint GENERIC_READ = 0x80000000;
+        const uint FILE_SHARE_READ = 0x00000001;
+        const uint FILE_SHARE_WRITE = 0x00000002;
+        const uint FILE_SHARE_DELETE = 0x00000004;
+        const uint OPEN_EXISTING = 3;
+        const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        SafeFileHandle handle = CreateFile(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        if (handle.IsInvalid) {
+            handle.Dispose();
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        try {
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(handle, out information)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if (information.NumberOfLinks != 1) {
+                throw new IOException("File has multiple filesystem links.");
+            }
+            return new FileStream(handle, FileAccess.Read, 65536, false);
+        }
+        catch {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static long GetLinkCount(string path)
+    {
+        const uint FILE_READ_ATTRIBUTES = 0x00000080;
+        const uint FILE_SHARE_READ = 0x00000001;
+        const uint FILE_SHARE_WRITE = 0x00000002;
+        const uint FILE_SHARE_DELETE = 0x00000004;
+        const uint OPEN_EXISTING = 3;
+        const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        using (SafeFileHandle handle = CreateFile(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero))
+        {
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(handle, out information)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return information.NumberOfLinks;
+        }
+    }
+}
+'@ -ErrorAction Stop
+        return [WpdFileIdentityNative]::GetLinkCount($Path)
+    }
+    catch {
+        return -1
+    }
+}
+
+function Assert-CaseFileDestinationSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+    if (Test-CasePathHasReparsePoint -Root $pathRoot -Candidate $fullPath) {
+        throw "File destination contains a reparse point: $fullPath"
+    }
+    if ([System.IO.Directory]::Exists($fullPath)) {
+        throw "File destination is a directory: $fullPath"
+    }
+    $linkCount = Get-CaseFileLinkCount -Path $fullPath
+    if ($linkCount -lt 0 -or $linkCount -gt 1) {
+        throw "File destination identity is unsafe: $fullPath"
+    }
+    $parentDirectory = Split-Path -Parent $fullPath
+    if (-not [System.IO.Directory]::Exists($parentDirectory)) {
+        throw "File destination directory does not exist: $parentDirectory"
+    }
+    return $fullPath
+}
+
+function Move-CaseTemporaryFileIntoPlace {
+    param(
+        [Parameter(Mandatory = $true)][string]$TemporaryPath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+
+    $temporaryFull = Assert-CaseFileDestinationSafe -Path $TemporaryPath
+    $destinationFull = Assert-CaseFileDestinationSafe -Path $DestinationPath
+    if (-not [System.IO.File]::Exists($temporaryFull)) {
+        throw "Temporary file does not exist: $temporaryFull"
+    }
+    $backupPath = $null
+    try {
+        if ([System.IO.File]::Exists($destinationFull)) {
+            $destinationDirectory = Split-Path -Parent $destinationFull
+            $backupPath = Join-Path -Path $destinationDirectory -ChildPath ('.' + [System.IO.Path]::GetFileName($destinationFull) + '.' + [Guid]::NewGuid().ToString('N') + '.bak')
+            [System.IO.File]::Replace($temporaryFull, $destinationFull, $backupPath)
+        }
+        else {
+            [System.IO.File]::Move($temporaryFull, $destinationFull)
+        }
+    }
+    finally {
+        if ($null -ne $backupPath -and [System.IO.File]::Exists($backupPath)) {
+            try { [System.IO.File]::Delete($backupPath) } catch { }
+        }
+    }
+    return $destinationFull
+}
+
+function Test-CasePathIsNetworkShare {
+    param(
+        [AllowNull()][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return $Path.StartsWith('\\', [System.StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith('//', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Copy-CaseFileBounded {
+    <#
+      Copy a file without following unsafe case paths or reading past the
+      source length observed at the start. A size change aborts the copy, so a
+      growing log/dump is never silently truncated or copied without its cap.
+      The destination is written to a unique file and replaced atomically.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [int64]$MaxBytes
+    )
+
+    if ($MaxBytes -lt 0) { throw 'Bounded copy maximum cannot be negative.' }
+    $sourceFull = [System.IO.Path]::GetFullPath($SourcePath)
+    $sourceRoot = [System.IO.Path]::GetPathRoot($sourceFull)
+    if (Test-CasePathHasReparsePoint -Root $sourceRoot -Candidate $sourceFull) {
+        throw "Source path contains a reparse point: $sourceFull"
+    }
+    if (-not [System.IO.File]::Exists($sourceFull)) {
+        throw "Source file does not exist: $sourceFull"
+    }
+    $sourceInfo = [System.IO.FileInfo]::new($sourceFull)
+    $sourceLength = $sourceInfo.Length
+    if ($sourceLength -gt $MaxBytes) {
+        throw "Source file exceeds bounded copy size of $MaxBytes bytes: $sourceFull"
+    }
+    $copyOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+    $destinationFull = Assert-CaseFileDestinationSafe -Path $DestinationPath
+    $destinationDirectory = Split-Path -Parent $destinationFull
+
+    $temporaryPath = Join-Path -Path $destinationDirectory -ChildPath ('.' + [System.IO.Path]::GetFileName($destinationFull) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $sourceStream = $null
+    $temporaryStream = $null
+    try {
+        if ($copyOnWindows) {
+            $sourceLinkCount = Get-CaseFileLinkCount -Path $sourceFull
+            if ($sourceLinkCount -ne 1) { throw "Source file identity is unsafe: $sourceFull" }
+            $sourceStream = [WpdFileIdentityNative]::OpenReadNoFollowSingleLink($sourceFull)
+        }
+        else {
+            $sourceStream = [System.IO.File]::OpenRead($sourceFull)
+        }
+        $temporaryStream = [System.IO.File]::Open($temporaryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $buffer = [byte[]]::new(65536)
+        $bytesCopied = 0L
+        while ($bytesCopied -lt $sourceLength) {
+            $remainingBytes = $sourceLength - $bytesCopied
+            $readCount = [int][Math]::Min([int64]$buffer.Length, $remainingBytes)
+            $readCount = $sourceStream.Read($buffer, 0, $readCount)
+            if ($readCount -le 0) { throw "Source changed while copying: $sourceFull" }
+            $temporaryStream.Write($buffer, 0, $readCount)
+            $bytesCopied += $readCount
+        }
+        $latestLength = ([System.IO.FileInfo]::new($sourceFull)).Length
+        if ($latestLength -ne $sourceLength -or $bytesCopied -ne $sourceLength) {
+            throw "Source changed while copying: $sourceFull"
+        }
+        $temporaryStream.Flush()
+        $temporaryStream.Dispose()
+        $temporaryStream = $null
+        $sourceStream.Dispose()
+        $sourceStream = $null
+
+        $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $temporaryPath -DestinationPath $destinationFull
+        $temporaryPath = $null
+        return $bytesCopied
+    }
+    finally {
+        if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+        if ($null -ne $temporaryStream) { $temporaryStream.Dispose() }
+        if ($null -ne $temporaryPath -and [System.IO.File]::Exists($temporaryPath)) { [System.IO.File]::Delete($temporaryPath) }
+    }
 }
 
 function Invoke-CasePackageVerification {
@@ -703,45 +1065,100 @@ function New-CasePackage {
         [string]$LeafName
     )
 
-    $packageStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
-    $packagePath = Join-Path -Path $DestinationDirectory -ChildPath "$LeafName-$packageStamp.zip"
-    if (Test-Path -LiteralPath $packagePath) {
-        throw "Case package already exists: $packagePath"
+    $directoryFull = [System.IO.Path]::GetFullPath($Directory)
+    $destinationDirectoryFull = [System.IO.Path]::GetFullPath($DestinationDirectory)
+    if (-not [System.IO.Directory]::Exists($directoryFull)) {
+        throw "Case package source directory does not exist: $directoryFull"
     }
+    if (-not [System.IO.Directory]::Exists($destinationDirectoryFull)) {
+        throw "Case package destination directory does not exist: $destinationDirectoryFull"
+    }
+    $pathRoot = [System.IO.Path]::GetPathRoot($directoryFull)
+    if (Test-CasePathHasReparsePoint -Root $pathRoot -Candidate $directoryFull) {
+        throw "Case package source directory contains a reparse point: $directoryFull"
+    }
+    $destinationRoot = [System.IO.Path]::GetPathRoot($destinationDirectoryFull)
+    if (Test-CasePathHasReparsePoint -Root $destinationRoot -Candidate $destinationDirectoryFull) {
+        throw "Case package destination directory contains a reparse point: $destinationDirectoryFull"
+    }
+    if ([string]::IsNullOrWhiteSpace($LeafName) -or [System.IO.Path]::GetFileName($LeafName) -ne $LeafName) {
+        throw "Case package leaf name must be a single safe file name: $LeafName"
+    }
+
+    $directoryPrefix = $directoryFull
+    if (-not $directoryPrefix.EndsWith([string][System.IO.Path]::DirectorySeparatorChar)) {
+        $directoryPrefix += [System.IO.Path]::DirectorySeparatorChar
+    }
+    $validatedEntries = @()
+    foreach ($relativeName in @($RelativeNames)) {
+        $relativeText = [string]$relativeName
+        if ([string]::IsNullOrWhiteSpace($relativeText) -or [System.IO.Path]::IsPathRooted($relativeText) -or $relativeText -match '(^|[\\/])\.\.?([\\/]|$)') {
+            throw "Case package entry is not a safe relative path: $relativeText"
+        }
+        $relativeForPath = $relativeText.Replace('\\', [string][System.IO.Path]::DirectorySeparatorChar).Replace('/', [string][System.IO.Path]::DirectorySeparatorChar)
+        $sourceFile = [System.IO.Path]::GetFullPath((Join-Path -Path $directoryFull -ChildPath $relativeForPath))
+        if (-not $sourceFile.StartsWith($directoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Case package entry escapes its source directory: $relativeText"
+        }
+        if (-not [System.IO.File]::Exists($sourceFile)) {
+            continue
+        }
+        if (Test-CasePathHasReparsePoint -Root $pathRoot -Candidate $sourceFile) {
+            throw "Case package source is a reparse point: $relativeText"
+        }
+        $sourceInfo = [System.IO.FileInfo]::new($sourceFile)
+        if ((Get-CaseFileLinkCount -Path $sourceFile) -ne 1) {
+            throw "Case package source has unsafe file identity: $relativeText"
+        }
+        $validatedEntries += [pscustomobject]@{
+            RelativeName = $relativeText.Replace('\\', '/')
+            SourcePath = $sourceFile
+            Length = $sourceInfo.Length
+        }
+    }
+
+    $packageStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
+    $packagePath = Join-Path -Path $destinationDirectoryFull -ChildPath "$LeafName-$packageStamp.zip"
+    $packagePath = Assert-CaseFileDestinationSafe -Path $packagePath
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-    $packageFileStream = [System.IO.File]::Open($packagePath, [System.IO.FileMode]::Create)
+    $packageFileStream = $null
+    $packageArchive = $null
+    $packageSucceeded = $false
     try {
+        $packageFileStream = [System.IO.File]::Open($packagePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
         $packageArchive = New-Object System.IO.Compression.ZipArchive($packageFileStream, [System.IO.Compression.ZipArchiveMode]::Create)
-        try {
-            foreach ($relativeName in $RelativeNames) {
-                $sourceFile = Join-Path -Path $Directory -ChildPath $relativeName
-                if (-not (Test-Path -LiteralPath $sourceFile)) {
-                    continue
+        foreach ($validatedEntry in $validatedEntries) {
+            $entry = $packageArchive.CreateEntry($validatedEntry.RelativeName, [System.IO.Compression.CompressionLevel]::Optimal)
+            $entryStream = $entry.Open()
+            $inputStream = $null
+            try {
+                $copyOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+                if ($copyOnWindows) {
+                    $inputStream = [WpdFileIdentityNative]::OpenReadNoFollowSingleLink($validatedEntry.SourcePath)
                 }
-                $entry = $packageArchive.CreateEntry($relativeName.Replace('\', '/'), [System.IO.Compression.CompressionLevel]::Optimal)
-                $entryStream = $entry.Open()
-                try {
-                    $inputStream = [System.IO.File]::OpenRead($sourceFile)
-                    try {
-                        $inputStream.CopyTo($entryStream)
-                    }
-                    finally {
-                        $inputStream.Dispose()
-                    }
+                else {
+                    $inputStream = [System.IO.File]::OpenRead($validatedEntry.SourcePath)
                 }
-                finally {
-                    $entryStream.Dispose()
+                $inputStream.CopyTo($entryStream)
+                if (([System.IO.FileInfo]::new($validatedEntry.SourcePath)).Length -ne $validatedEntry.Length) {
+                    throw "Case package source changed while reading: $($validatedEntry.RelativeName)"
                 }
             }
+            finally {
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+                $entryStream.Dispose()
+            }
         }
-        finally {
-            $packageArchive.Dispose()
-        }
+        $packageSucceeded = $true
     }
     finally {
-        $packageFileStream.Dispose()
+        if ($null -ne $packageArchive) { $packageArchive.Dispose() }
+        if ($null -ne $packageFileStream) { $packageFileStream.Dispose() }
+        if (-not $packageSucceeded -and [System.IO.File]::Exists($packagePath)) {
+            try { [System.IO.File]::Delete($packagePath) } catch { }
+        }
     }
 
     return $packagePath
@@ -1566,51 +1983,632 @@ function Test-CaptureWindowCoverage {
     }
 }
 
+function ConvertFrom-ServicingLogLines {
+    <#
+      Parse bounded text evidence without retaining the raw log in the analysis
+      artifact. CBS/DISM logs use several failure grammars, so retain normalized
+      signatures, counts and line ranges rather than trying to assign a cause.
+      The original copied log remains the evidence a technician can open.
+    #>
+    param(
+        [AllowNull()][object[]]$Lines,
+        [Parameter(Mandatory = $true)][string]$SourceName,
+        [int]$StartingLineNumber = 1
+    )
+
+    $lineCount = 0
+    $matchedLineCount = 0
+    $signatureMap = @{}
+    $signatureOrder = New-Object System.Collections.ArrayList
+    $addSignature = {
+        param(
+            [string]$Signature,
+            [string]$Kind,
+            [int]$LineNumber
+        )
+        if (-not $signatureMap.ContainsKey($Signature)) {
+            $signatureMap[$Signature] = [ordered]@{
+                signature = $Signature
+                kind = $Kind
+                count = 0
+                firstLineNumber = $LineNumber
+                lastLineNumber = $LineNumber
+            }
+            [void]$signatureOrder.Add($Signature)
+        }
+        $row = $signatureMap[$Signature]
+        $row.count = [int]$row.count + 1
+        if ($LineNumber -lt [int]$row.firstLineNumber) { $row.firstLineNumber = $LineNumber }
+        if ($LineNumber -gt [int]$row.lastLineNumber) { $row.lastLineNumber = $LineNumber }
+    }
+
+    $lineItems = if ($null -ne $Lines) { @($Lines) } else { @() }
+    foreach ($line in $lineItems) {
+        if ($null -eq $line) { continue }
+        $lineCount++
+        $lineNumber = $StartingLineNumber + $lineCount - 1
+        if ($line -is [string]) {
+            $text = [string]$line
+        }
+        else {
+            $text = Get-SafeObjectProperty -InputObject $line -Name 'Line'
+            if ($null -eq $text) { $text = [string]$line }
+        }
+
+        $lineSignatures = @{}
+        $cbsMatches = [regex]::Matches(
+            [string]$text,
+            '\bCBS_E_[A-Za-z0-9_]+\b',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        foreach ($match in $cbsMatches) {
+            $signature = $match.Value.ToUpperInvariant()
+            if (-not $lineSignatures.ContainsKey($signature)) {
+                $lineSignatures[$signature] = $true
+                & $addSignature $signature 'cbs-error' $lineNumber
+            }
+        }
+
+        $win32Matches = [regex]::Matches(
+            [string]$text,
+            '\bERROR_[A-Za-z0-9_]+\b',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        $ignoredSuccessStatus = $false
+        foreach ($match in $win32Matches) {
+            $signature = $match.Value.ToUpperInvariant()
+            if ($signature -in @('ERROR_SUCCESS', 'ERROR_SUCCESS_REBOOT_REQUIRED')) {
+                $ignoredSuccessStatus = $true
+                continue
+            }
+            if (-not $lineSignatures.ContainsKey($signature)) {
+                $lineSignatures[$signature] = $true
+                & $addSignature $signature 'win32-error' $lineNumber
+            }
+        }
+
+        $hasFailureContext = [string]$text -match '(?i)\b(error|failed|failure|fatal|hresult|hr|return\s+code|exit\s+code)\b'
+        if ($hasFailureContext) {
+            $hresultMatches = [regex]::Matches(
+                [string]$text,
+                '(?<![0-9A-Za-z])0x[0-9A-Fa-f]{8,}(?![0-9A-Za-z])'
+            )
+            foreach ($match in $hresultMatches) {
+                $rawHex = [string]$match.Value
+                $signature = '0x' + $rawHex.Substring(2).ToUpperInvariant()
+                if ($signature -in @('0x00000000', '0x00000BC2')) {
+                    $ignoredSuccessStatus = $true
+                    continue
+                }
+                if (-not $lineSignatures.ContainsKey($signature)) {
+                    $lineSignatures[$signature] = $true
+                    & $addSignature $signature 'hresult' $lineNumber
+                }
+            }
+        }
+
+        if ($lineSignatures.Count -eq 0 -and -not $ignoredSuccessStatus -and [string]$text -match '(?i)\b(error|failed|failure|fatal)\b') {
+            $lineSignatures['generic-error'] = $true
+            & $addSignature 'generic-error' 'generic-error' $lineNumber
+        }
+        if ($lineSignatures.Count -gt 0) { $matchedLineCount++ }
+    }
+
+    $signatureRows = @()
+    foreach ($signature in @($signatureOrder)) {
+        $row = $signatureMap[$signature]
+        $signatureRows += [pscustomobject]@{
+            signature = $row.signature
+            kind = $row.kind
+            count = $row.count
+            firstLineNumber = $row.firstLineNumber
+            lastLineNumber = $row.lastLineNumber
+        }
+    }
+
+    return [ordered]@{
+        sourceName = $SourceName
+        status = 'completed'
+        lineCount = $lineCount
+        matchedLineCount = $matchedLineCount
+        signatures = @($signatureRows)
+    }
+}
+
+function Get-ServicingLogAnalysis {
+    <#
+      Read copied boot/servicing logs into a bounded byte window, then parse
+      that window in small chunks. The collection stage already caps each copied
+      file; this second bound prevents an accidentally reused case folder or
+      future caller from analyzing an unbounded or concurrently growing file.
+      Only aggregate signatures leave this function - raw lines stay in the
+      copied log artifact.
+    #>
+    param(
+        [AllowNull()][object[]]$SourceEntries,
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [ValidateRange(1, 1073741824)][int64]$MaxScanBytes = 100MB
+    )
+
+    $logs = @()
+    $scannedLogCount = 0
+    $failedLogCount = 0
+    $truncatedLogCount = 0
+    $unavailableLogCount = 0
+    $rootPath = $null
+    $runningOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+    try { $rootPath = [System.IO.Path]::GetFullPath($OutputDirectory) } catch { $rootPath = $null }
+
+    foreach ($entry in $(if ($null -ne $SourceEntries) { @($SourceEntries) } else { @() })) {
+        if ($null -eq $entry) { continue }
+        $copied = [bool](Get-SafeObjectProperty -InputObject $entry -Name 'copied')
+        $copiedTo = [string](Get-SafeObjectProperty -InputObject $entry -Name 'copiedTo')
+        if (-not $copied) { $unavailableLogCount++ }
+        $record = [ordered]@{
+            name = [string](Get-SafeObjectProperty -InputObject $entry -Name 'name')
+            artifact = if ([string]::IsNullOrWhiteSpace($copiedTo)) { $null } else { $copiedTo.Replace('\', '/') }
+            found = [bool](Get-SafeObjectProperty -InputObject $entry -Name 'found')
+            copied = $copied
+            sizeBytes = Get-SafeObjectProperty -InputObject $entry -Name 'sizeBytes'
+            scanStatus = 'not-copied'
+            lineCount = 0
+            matchedLineCount = 0
+            bytesScanned = 0
+            scanTruncated = $false
+            signatures = @()
+            error = $null
+        }
+        if (-not $copied) {
+            $logs += [pscustomobject]$record
+            continue
+        }
+        if ($null -eq $rootPath -or [string]::IsNullOrWhiteSpace($copiedTo)) {
+            $record.scanStatus = 'invalid-metadata'
+            $record.error = 'Copied log did not contain a valid relative artifact path.'
+            $logs += [pscustomobject]$record
+            $failedLogCount++
+            continue
+        }
+
+        try {
+            $relativePath = $copiedTo.Replace('\', [string][System.IO.Path]::DirectorySeparatorChar)
+            if ([System.IO.Path]::IsPathRooted($relativePath)) { throw 'Artifact path is rooted.' }
+            $fullPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($rootPath, $relativePath))
+            $rootPrefix = $rootPath.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
+            if (-not $fullPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Artifact path escapes the case directory.'
+            }
+            if (-not [System.IO.File]::Exists($fullPath)) {
+                $record.scanStatus = 'missing'
+                $record.error = 'Copied log artifact was not present at the recorded path.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+            if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($fullPath)) -Candidate $fullPath) {
+                $record.scanStatus = 'reparse-point'
+                $record.error = 'Copied log artifact or one of its parent directories is a reparse point.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+            $linkCount = Get-CaseFileLinkCount -Path $fullPath
+            if ($linkCount -lt 1) {
+                $record.scanStatus = 'identity-unavailable'
+                $record.error = 'Could not establish the copied artifact link identity.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+            if ($linkCount -gt 1) {
+                $record.scanStatus = 'hardlink'
+                $record.error = 'Copied log artifact has multiple filesystem links and was not analyzed.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+
+            $fileInfo = [System.IO.FileInfo]::new($fullPath)
+            $record.sizeBytes = $fileInfo.Length
+            if ($fileInfo.Length -gt $MaxScanBytes) {
+                $record.scanStatus = 'oversized'
+                $record.error = "File exceeds the bounded servicing scan size of $MaxScanBytes bytes."
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+
+            $aggregateMap = @{}
+            $aggregateOrder = New-Object System.Collections.ArrayList
+            $aggregateMatchedLines = 0
+            $aggregateLineCount = 0
+            $reader = $null
+            $boundedStream = $null
+            $inputStream = $null
+            $bytesRead = 0L
+            $lineBuffer = New-Object System.Collections.ArrayList
+            $chunkStartLine = 1
+            try {
+                $boundedStream = [System.IO.MemoryStream]::new()
+                if ($runningOnWindows) {
+                    $inputStream = [WpdFileIdentityNative]::OpenReadNoFollowSingleLink($fullPath)
+                }
+                else {
+                    $inputStream = [System.IO.File]::OpenRead($fullPath)
+                }
+                $byteChunk = [byte[]]::new(65536)
+                while ($bytesRead -lt $MaxScanBytes) {
+                    $remainingBytes = $MaxScanBytes - $bytesRead
+                    $readCount = [int][Math]::Min([int64]$byteChunk.Length, $remainingBytes)
+                    $readCount = $inputStream.Read($byteChunk, 0, $readCount)
+                    if ($readCount -le 0) { break }
+                    $boundedStream.Write($byteChunk, 0, $readCount)
+                    $bytesRead += $readCount
+                }
+                $record.bytesScanned = $bytesRead
+                $latestLength = $fileInfo.Length
+                try { $latestLength = ([System.IO.FileInfo]::new($fullPath)).Length } catch { }
+                $record.scanTruncated = ($latestLength -gt $MaxScanBytes -or $latestLength -ne $fileInfo.Length -or ($bytesRead -ge $MaxScanBytes -and $fileInfo.Length -lt $MaxScanBytes))
+                $inputStream.Dispose()
+                $inputStream = $null
+                $boundedStream.Position = 0
+                $reader = [System.IO.StreamReader]::new($boundedStream, $true)
+                while (-not $reader.EndOfStream) {
+                    $readLine = $reader.ReadLine()
+                    if ($null -eq $readLine) { break }
+                    [void]$lineBuffer.Add($readLine)
+                    $aggregateLineCount++
+                    if ($lineBuffer.Count -ge 1000) {
+                        $part = ConvertFrom-ServicingLogLines -SourceName $record.name -Lines @($lineBuffer) -StartingLineNumber $chunkStartLine
+                        $aggregateMatchedLines += [int]$part.matchedLineCount
+                        foreach ($signature in @($part.signatures)) {
+                            $signatureName = [string]$signature.signature
+                            if (-not $aggregateMap.ContainsKey($signatureName)) {
+                                $aggregateMap[$signatureName] = [ordered]@{
+                                    signature = $signatureName
+                                    kind = [string]$signature.kind
+                                    count = 0
+                                    firstLineNumber = [int]$signature.firstLineNumber
+                                    lastLineNumber = [int]$signature.lastLineNumber
+                                }
+                                [void]$aggregateOrder.Add($signatureName)
+                            }
+                            $aggregate = $aggregateMap[$signatureName]
+                            $aggregate.count = [int]$aggregate.count + [int]$signature.count
+                            if ([int]$signature.firstLineNumber -lt [int]$aggregate.firstLineNumber) { $aggregate.firstLineNumber = [int]$signature.firstLineNumber }
+                            if ([int]$signature.lastLineNumber -gt [int]$aggregate.lastLineNumber) { $aggregate.lastLineNumber = [int]$signature.lastLineNumber }
+                        }
+                        [void]$lineBuffer.Clear()
+                        $chunkStartLine = $aggregateLineCount + 1
+                    }
+                }
+                if ($lineBuffer.Count -gt 0) {
+                    $part = ConvertFrom-ServicingLogLines -SourceName $record.name -Lines @($lineBuffer) -StartingLineNumber $chunkStartLine
+                    $aggregateMatchedLines += [int]$part.matchedLineCount
+                    foreach ($signature in @($part.signatures)) {
+                        $signatureName = [string]$signature.signature
+                        if (-not $aggregateMap.ContainsKey($signatureName)) {
+                            $aggregateMap[$signatureName] = [ordered]@{
+                                signature = $signatureName
+                                kind = [string]$signature.kind
+                                count = 0
+                                firstLineNumber = [int]$signature.firstLineNumber
+                                lastLineNumber = [int]$signature.lastLineNumber
+                            }
+                            [void]$aggregateOrder.Add($signatureName)
+                        }
+                        $aggregate = $aggregateMap[$signatureName]
+                        $aggregate.count = [int]$aggregate.count + [int]$signature.count
+                        if ([int]$signature.firstLineNumber -lt [int]$aggregate.firstLineNumber) { $aggregate.firstLineNumber = [int]$signature.firstLineNumber }
+                        if ([int]$signature.lastLineNumber -gt [int]$aggregate.lastLineNumber) { $aggregate.lastLineNumber = [int]$signature.lastLineNumber }
+                    }
+                }
+            }
+            finally {
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+                if ($null -ne $reader) { $reader.Dispose() }
+                elseif ($null -ne $boundedStream) { $boundedStream.Dispose() }
+            }
+
+            $signatureRows = @()
+            foreach ($signatureName in @($aggregateOrder)) {
+                $aggregate = $aggregateMap[$signatureName]
+                $signatureRows += [pscustomobject]@{
+                    signature = $aggregate.signature
+                    kind = $aggregate.kind
+                    count = $aggregate.count
+                    firstLineNumber = $aggregate.firstLineNumber
+                    lastLineNumber = $aggregate.lastLineNumber
+                }
+            }
+            $record.scanStatus = 'completed'
+            $record.lineCount = $aggregateLineCount
+            $record.matchedLineCount = $aggregateMatchedLines
+            $record.signatures = @($signatureRows)
+            if ($record.scanTruncated) { $truncatedLogCount++ }
+            $logs += [pscustomobject]$record
+            $scannedLogCount++
+        }
+        catch {
+            $record.scanStatus = 'failed'
+            $record.error = $_.Exception.Message
+            $logs += [pscustomobject]$record
+            $failedLogCount++
+        }
+    }
+
+    $overallStatus = 'completed'
+    if ($failedLogCount -gt 0 -or $truncatedLogCount -gt 0 -or $unavailableLogCount -gt 0) { $overallStatus = 'partial' }
+    return [ordered]@{
+        status = $overallStatus
+        maxScanBytes = $MaxScanBytes
+        logCount = @($logs).Count
+        scannedLogCount = $scannedLogCount
+        failedLogCount = $failedLogCount
+        truncatedLogCount = $truncatedLogCount
+        unavailableLogCount = $unavailableLogCount
+        logs = @($logs)
+    }
+}
+
+function ConvertTo-CrashDateTime {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    try { return ([datetime]$Value).ToUniversalTime() } catch { return $null }
+}
+
+function ConvertTo-CrashIsoTimestamp {
+    param([AllowNull()][object]$Value)
+
+    $parsed = ConvertTo-CrashDateTime $Value
+    if ($null -eq $parsed) { return $null }
+    return $parsed.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-CrashFilenameDate {
+    param([AllowNull()][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $shortDate = [regex]::Match($Name, '(?i)(?<!\d)(?<date>\d{6})-\d+-\d+\.dmp$')
+    if ($shortDate.Success) {
+        try {
+            return [datetime]::ParseExact($shortDate.Groups['date'].Value, 'MMddyy', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd')
+        }
+        catch { }
+    }
+    $longDate = [regex]::Match($Name, '(?i)(?<date>\d{8})[-_]\d{4}(?:[-_]\d+)?\.dmp$')
+    if ($longDate.Success) {
+        try {
+            return [datetime]::ParseExact($longDate.Groups['date'].Value, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd')
+        }
+        catch { }
+    }
+    return $null
+}
+
 function Get-CrashAnalysis {
     <#
-      Decodes BSOD/bugcheck evidence and flags unexplained abrupt shutdowns:
-      Kernel-Power 41 without a matching BugCheck event (usually a hard freeze,
-      power loss, or thermal cutout rather than a Windows-detected crash).
+      Decodes BSOD/bugcheck evidence and joins it to the crash artifacts this
+      collector copies. The System event query is intentionally bounded to its
+      lookback window; dump rows outside that window remain visible and are
+      labelled instead of being silently lost. Filename hints are classification
+      evidence only - they are never presented as a root cause.
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [object[]]$Events
+        [object[]]$Events,
+
+        [AllowNull()][object[]]$MinidumpFiles = @(),
+
+        [AllowNull()][object[]]$LiveKernelReports = @(),
+
+        [AllowNull()][object]$EventWindowStartUtc,
+
+        [AllowNull()][object]$EventWindowEndUtc
     )
 
-    $bugchecks = @(
-        # Event Viewer may display this source as "BugCheck", while the
-        # underlying provider is usually Microsoft-Windows-WER-SystemErrorReporting.
-        $Events | Where-Object {
-            $_.Id -eq 1001 -and
-            ($_.ProviderName -eq 'BugCheck' -or $_.ProviderName -match 'WER-SystemErrorReporting')
-        } | ForEach-Object {
-            $code = $null
-            if ($_.Message -match '0x[0-9A-Fa-f]{8}') {
-                $code = $matches[0]
-            }
-            [pscustomobject]@{
-                TimeCreated = $_.TimeCreated
-                BugcheckCode = $code
-                Message = $_.Message
-            }
+    $eventItems = if ($null -ne $Events) { @($Events) } else { @() }
+    $lookbackStart = ConvertTo-CrashDateTime $EventWindowStartUtc
+    $lookbackEnd = ConvertTo-CrashDateTime $EventWindowEndUtc
+    $bugchecks = @()
+    foreach ($event in $eventItems) {
+        if ($null -eq $event) { continue }
+        $eventId = Get-SafeObjectProperty -InputObject $event -Name 'Id'
+        $provider = [string](Get-SafeObjectProperty -InputObject $event -Name 'ProviderName')
+        if ($eventId -ne 1001 -or ($provider -ne 'BugCheck' -and $provider -notmatch 'WER-SystemErrorReporting')) { continue }
+        $message = [string](Get-SafeObjectProperty -InputObject $event -Name 'Message')
+        $code = $null
+        if ($message -match '(?i)(?<![0-9a-z])0x[0-9a-f]{8}(?![0-9a-z])') {
+            $code = '0x' + $matches[0].Substring(2).ToUpperInvariant()
         }
-    )
+        $parsedEventTime = ConvertTo-CrashDateTime (Get-SafeObjectProperty -InputObject $event -Name 'TimeCreated')
+        if ($null -ne $parsedEventTime -and (($null -ne $lookbackStart -and $parsedEventTime -lt $lookbackStart) -or ($null -ne $lookbackEnd -and $parsedEventTime -gt $lookbackEnd))) { continue }
+        $bugchecks += [pscustomobject]@{
+            TimeCreated = ConvertTo-CrashIsoTimestamp $parsedEventTime
+            BugcheckCode = $code
+            Message = $message
+        }
+    }
 
-    $unexplained = @(
-        $Events | Where-Object { $_.ProviderName -match 'Kernel-Power' -and $_.Id -eq 41 } | Where-Object {
-            $crashTime = $_.TimeCreated
-            -not ($bugchecks | Where-Object { [math]::Abs(($_.TimeCreated - $crashTime).TotalMinutes) -le 5 })
-        } | ForEach-Object {
-            [pscustomobject]@{
-                TimeCreated = $_.TimeCreated
-                Message = $_.Message
+    $unexplained = @()
+    foreach ($event in $eventItems) {
+        if ($null -eq $event) { continue }
+        $eventId = Get-SafeObjectProperty -InputObject $event -Name 'Id'
+        $provider = [string](Get-SafeObjectProperty -InputObject $event -Name 'ProviderName')
+        if ($eventId -ne 41 -or $provider -notmatch 'Kernel-Power') { continue }
+        $crashTime = ConvertTo-CrashDateTime (Get-SafeObjectProperty -InputObject $event -Name 'TimeCreated')
+        if ($null -ne $crashTime -and (($null -ne $lookbackStart -and $crashTime -lt $lookbackStart) -or ($null -ne $lookbackEnd -and $crashTime -gt $lookbackEnd))) { continue }
+        $hasMatchingBugcheck = $false
+        if ($null -ne $crashTime) {
+            foreach ($bugcheck in $bugchecks) {
+                $bugcheckTime = ConvertTo-CrashDateTime $bugcheck.TimeCreated
+                if ($null -ne $bugcheckTime -and [math]::Abs(($bugcheckTime - $crashTime).TotalMinutes) -le 5) {
+                    $hasMatchingBugcheck = $true
+                    break
+                }
             }
         }
-    )
+        if (-not $hasMatchingBugcheck) {
+            $unexplained += [pscustomobject]@{
+                TimeCreated = ConvertTo-CrashIsoTimestamp $crashTime
+                Message = [string](Get-SafeObjectProperty -InputObject $event -Name 'Message')
+            }
+        }
+    }
+
+    $dumpRows = @()
+    foreach ($dump in $(if ($null -ne $MinidumpFiles) { @($MinidumpFiles) } else { @() })) {
+        if ($null -eq $dump) { continue }
+        $name = [string](Get-SafeObjectProperty -InputObject $dump -Name 'Name')
+        $sourceTime = ConvertTo-CrashDateTime (Get-SafeObjectProperty -InputObject $dump -Name 'SourceLastWriteTimeUtc')
+        $matchingBugchecks = @()
+        if ($null -ne $sourceTime) {
+            foreach ($bugcheck in $bugchecks) {
+                $bugcheckTime = ConvertTo-CrashDateTime $bugcheck.TimeCreated
+                if ($null -ne $bugcheckTime -and [math]::Abs(($bugcheckTime - $sourceTime).TotalMinutes) -le 5) {
+                    $matchingBugchecks += $bugcheck
+                }
+            }
+        }
+        $distinctCodes = New-Object System.Collections.ArrayList
+        $codeSet = @{}
+        foreach ($matchingBugcheck in $matchingBugchecks) {
+            $matchingCode = [string](Get-SafeObjectProperty -InputObject $matchingBugcheck -Name 'BugcheckCode')
+            if (-not [string]::IsNullOrWhiteSpace($matchingCode) -and -not $codeSet.ContainsKey($matchingCode)) {
+                $codeSet[$matchingCode] = $true
+                [void]$distinctCodes.Add($matchingCode)
+            }
+        }
+        $filenameDate = Get-CrashFilenameDate $name
+        $filenameOutsideLookback = $false
+        if (-not [string]::IsNullOrWhiteSpace($filenameDate)) {
+            $filenameDateValue = [datetime]::ParseExact($filenameDate, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+            if (($null -ne $lookbackStart -and $filenameDateValue.Date -lt $lookbackStart.Date) -or ($null -ne $lookbackEnd -and $filenameDateValue.Date -gt $lookbackEnd.Date)) {
+                $filenameOutsideLookback = $true
+            }
+        }
+        $sourceOutsideLookback = $false
+        if ($null -ne $sourceTime) {
+            if (($null -ne $lookbackStart -and $sourceTime -lt $lookbackStart) -or ($null -ne $lookbackEnd -and $sourceTime -gt $lookbackEnd)) {
+                $sourceOutsideLookback = $true
+            }
+        }
+        $correlationStatus = 'no-matching-bugcheck'
+        $correlatedCode = $null
+        $correlatedTime = $null
+        if ($sourceOutsideLookback -or ($null -eq $sourceTime -and $filenameOutsideLookback)) {
+            $correlationStatus = 'outside-event-lookback'
+        }
+        elseif ($distinctCodes.Count -eq 1) {
+            $correlationStatus = 'matched-bugcheck'
+            $correlatedCode = [string]$distinctCodes[0]
+            if ($matchingBugchecks.Count -gt 0) { $correlatedTime = $matchingBugchecks[0].TimeCreated }
+        }
+        elseif ($distinctCodes.Count -gt 1) {
+            $correlationStatus = 'ambiguous-bugcheck'
+        }
+        $problemSignature = if ($null -ne $correlatedCode) { "bugcheck:$correlatedCode" } elseif ($correlationStatus -eq 'ambiguous-bugcheck') { 'minidump:ambiguous-bugcheck' } else { 'minidump:unknown' }
+        $dumpRows += [pscustomobject]@{
+            Name = $name
+            SizeBytes = Get-SafeObjectProperty -InputObject $dump -Name 'SizeBytes'
+            SourceLastWriteTimeUtc = ConvertTo-CrashIsoTimestamp $sourceTime
+            filenameDate = $filenameDate
+            bugcheckCode = $correlatedCode
+            bugcheckTimeUtc = ConvertTo-CrashIsoTimestamp $correlatedTime
+            eventCorrelationStatus = $correlationStatus
+            problemSignature = $problemSignature
+            signatureSource = if ($null -ne $correlatedCode) { 'event-bugcheck-correlation' } else { 'none' }
+        }
+    }
+
+    $liveRows = @()
+    foreach ($live in $(if ($null -ne $LiveKernelReports) { @($LiveKernelReports) } else { @() })) {
+        if ($null -eq $live) { continue }
+        $name = [string](Get-SafeObjectProperty -InputObject $live -Name 'Name')
+        $upperName = $name.ToUpperInvariant()
+        $hint = 'unknown'
+        if ($upperName -match 'WHEA') { $hint = 'whea' }
+        elseif ($upperName -match 'WATCHDOG') { $hint = 'watchdog' }
+        elseif ($upperName -match 'TDR|DISPLAY|VIDEO') { $hint = 'tdr' }
+        $liveRows += [pscustomobject]@{
+            Name = $name
+            FullPath = Get-SafeObjectProperty -InputObject $live -Name 'FullPath'
+            SizeBytes = Get-SafeObjectProperty -InputObject $live -Name 'SizeBytes'
+            LastWriteTimeUtc = ConvertTo-CrashIsoTimestamp (Get-SafeObjectProperty -InputObject $live -Name 'LastWriteTimeUtc')
+            Directory = Get-SafeObjectProperty -InputObject $live -Name 'Directory'
+            filenameDate = Get-CrashFilenameDate $name
+            problemSignature = "livekernel:$hint"
+            signatureSource = 'filename-hint'
+        }
+    }
+
+    $minidumpSignatureMap = @{}
+    $minidumpSignatureOrder = New-Object System.Collections.ArrayList
+    foreach ($row in $dumpRows) {
+        $signature = [string]$row.problemSignature
+        if (-not $minidumpSignatureMap.ContainsKey($signature)) {
+            $minidumpSignatureMap[$signature] = [ordered]@{
+                problemSignature = $signature
+                signatureSource = [string]$row.signatureSource
+                count = 0
+                files = New-Object System.Collections.ArrayList
+            }
+            [void]$minidumpSignatureOrder.Add($signature)
+        }
+        $group = $minidumpSignatureMap[$signature]
+        $group.count = [int]$group.count + 1
+        if ($group.files.Count -lt 20) { [void]$group.files.Add($row.Name) }
+    }
+    $minidumpSignatures = @()
+    foreach ($signature in @($minidumpSignatureOrder)) {
+        $group = $minidumpSignatureMap[$signature]
+        $minidumpSignatures += [pscustomobject]@{
+            problemSignature = $group.problemSignature
+            signatureSource = $group.signatureSource
+            count = $group.count
+            files = @($group.files)
+        }
+    }
+
+    $liveSignatureMap = @{}
+    $liveSignatureOrder = New-Object System.Collections.ArrayList
+    foreach ($row in $liveRows) {
+        $signature = [string]$row.problemSignature
+        if (-not $liveSignatureMap.ContainsKey($signature)) {
+            $liveSignatureMap[$signature] = [ordered]@{
+                problemSignature = $signature
+                signatureSource = 'filename-hint'
+                count = 0
+                files = New-Object System.Collections.ArrayList
+            }
+            [void]$liveSignatureOrder.Add($signature)
+        }
+        $group = $liveSignatureMap[$signature]
+        $group.count = [int]$group.count + 1
+        if ($group.files.Count -lt 20) { [void]$group.files.Add($row.Name) }
+    }
+    $liveSignatures = @()
+    foreach ($signature in @($liveSignatureOrder)) {
+        $group = $liveSignatureMap[$signature]
+        $liveSignatures += [pscustomobject]@{
+            problemSignature = $group.problemSignature
+            signatureSource = $group.signatureSource
+            count = $group.count
+            files = @($group.files)
+        }
+    }
 
     return [ordered]@{
-        bugchecks = $bugchecks
-        unexplainedShutdowns = $unexplained
+        eventLookbackStartUtc = ConvertTo-CrashIsoTimestamp $lookbackStart
+        eventLookbackEndUtc = ConvertTo-CrashIsoTimestamp $lookbackEnd
+        eventCorrelationWindowMinutes = 5
+        bugchecks = @($bugchecks)
+        unexplainedShutdowns = @($unexplained)
+        minidumps = @($dumpRows)
+        minidumpSignatures = @($minidumpSignatures)
+        liveKernelReports = @($liveRows)
+        liveKernelSignatures = @($liveSignatures)
     }
 }
 
@@ -2088,6 +3086,9 @@ function Get-SafeObjectProperty {
 
     if ($null -eq $InputObject) { return $null }
     try {
+        if ($InputObject -is [System.Collections.IDictionary]) {
+            if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        }
         $property = $InputObject.PSObject.Properties[$Name]
         if ($null -ne $property) { return $property.Value }
     }
@@ -2955,7 +3956,13 @@ function Evaluate-Findings {
         [object]$ProcessMemoryTop,
 
         [AllowNull()]
-        [object]$MemoryMetricsRaw
+        [object]$MemoryMetricsRaw,
+
+        [AllowNull()]
+        [object]$CrashAnalysis,
+
+        [AllowNull()]
+        [object]$ServicingAnalysis
     )
 
     $findings = @()
@@ -3310,6 +4317,254 @@ function Evaluate-Findings {
         }
     }
 
+    # ---- Crash evidence: events plus the dump artifacts collected with them -
+    # A 24-hour event query is a bounded view, not a crash-history boundary.
+    # Dump and LiveKernelReports metadata therefore gets its own findings even
+    # when no matching event was pulled.
+    if ($null -ne $CrashAnalysis) {
+        $crashBugchecksValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'bugchecks'
+        $crashShutdownsValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'unexplainedShutdowns'
+        $crashDumpsValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'minidumps'
+        $crashLiveReportsValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'liveKernelReports'
+        $crashLiveSignaturesValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'liveKernelSignatures'
+        $crashBugchecks = @()
+        $crashShutdowns = @()
+        $crashDumps = @()
+        $crashLiveReports = @()
+        $crashLiveSignatures = @()
+        if ($null -ne $crashBugchecksValue) { $crashBugchecks = @($crashBugchecksValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashShutdownsValue) { $crashShutdowns = @($crashShutdownsValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashDumpsValue) { $crashDumps = @($crashDumpsValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashLiveReportsValue) { $crashLiveReports = @($crashLiveReportsValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashLiveSignaturesValue) { $crashLiveSignatures = @($crashLiveSignaturesValue | Where-Object { $null -ne $_ }) }
+
+        if ($crashBugchecks.Count -gt 0) {
+            $codes = New-Object System.Collections.ArrayList
+            $codeSet = @{}
+            foreach ($bugcheck in $crashBugchecks) {
+                $code = [string](Get-SafeObjectProperty -InputObject $bugcheck -Name 'BugcheckCode')
+                if (-not [string]::IsNullOrWhiteSpace($code) -and -not $codeSet.ContainsKey($code)) {
+                    $codeSet[$code] = $true
+                    [void]$codes.Add($code)
+                }
+            }
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'system-events-last-24-hours.json'
+                metric = 'bugcheckEvents'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashBugchecks.Count
+                    bugcheckCodes = @($codes) -join ', '
+                }
+                ruleCondition = "The bounded System event query contains $($crashBugchecks.Count) BugCheck/WER event(s)"
+                uncertainty = 'The event query is limited to the recorded lookback; a code identifies a crash type but not its exact driver or root cause'
+                nextSteps = 'Open the event artifact and, when a matching dump is listed, analyze that dump with WinDbg !analyze -v'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($crashShutdowns.Count -gt 0) {
+            $shutdownTimes = @($crashShutdowns | ForEach-Object { [string](Get-SafeObjectProperty -InputObject $_ -Name 'TimeCreated') })
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'system-events-last-24-hours.json'
+                metric = 'unexplainedShutdowns'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashShutdowns.Count
+                    times = $shutdownTimes -join '; '
+                }
+                ruleCondition = "Kernel-Power 41 has no BugCheck/WER event within $([string](Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'eventCorrelationWindowMinutes')) minutes"
+                uncertainty = 'This pattern is consistent with a hard freeze, power loss or thermal cutout, but the event correlation does not establish which occurred'
+                nextSteps = 'Compare the shutdown timestamp with the dump and LiveKernelReports findings and inspect hardware/power evidence'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($crashDumps.Count -gt 0) {
+            $matchedDumpCount = @($crashDumps | Where-Object { (Get-SafeObjectProperty -InputObject $_ -Name 'eventCorrelationStatus') -eq 'matched-bugcheck' }).Count
+            $outsideDumpCount = @($crashDumps | Where-Object { (Get-SafeObjectProperty -InputObject $_ -Name 'eventCorrelationStatus') -eq 'outside-event-lookback' }).Count
+            $dumpNames = @($crashDumps | ForEach-Object { [string](Get-SafeObjectProperty -InputObject $_ -Name 'Name') } | Select-Object -First 20)
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'diagnostic-manifest.json'
+                metric = 'minidumpEvidence'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashDumps.Count
+                    matchedBugcheckCount = $matchedDumpCount
+                    outsideEventLookbackCount = $outsideDumpCount
+                    files = $dumpNames -join '; '
+                }
+                ruleCondition = "The case contains $($crashDumps.Count) copied minidump artifact(s), including dumps outside the bounded event lookback when present"
+                uncertainty = 'A dump proves that crash evidence exists; filename dates and nearby event matches are correlation aids, not proof of the failing component'
+                nextSteps = 'Open minidumps\<name> from the case and run WinDbg !analyze -v; do not infer a driver from the filename alone'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($crashLiveReports.Count -gt 0) {
+            $liveSignatureText = @($crashLiveSignatures | ForEach-Object {
+                    "$([string](Get-SafeObjectProperty -InputObject $_ -Name 'problemSignature')) x $([string](Get-SafeObjectProperty -InputObject $_ -Name 'count'))"
+                }) -join '; '
+            $liveNames = @($crashLiveReports | ForEach-Object { [string](Get-SafeObjectProperty -InputObject $_ -Name 'Name') } | Select-Object -First 20)
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'livekernelreports.json'
+                metric = 'liveKernelReportEvidence'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashLiveReports.Count
+                    problemSignatures = $liveSignatureText
+                    files = $liveNames -join '; '
+                }
+                ruleCondition = "The case contains $($crashLiveReports.Count) LiveKernelReports artifact(s)"
+                uncertainty = 'LiveKernelReports filenames provide bounded classification hints only; they do not decode the dump or prove a WHEA, watchdog or TDR cause'
+                nextSteps = 'Open livekernelreports.json, correlate LastWriteTimeUtc with incident-events.json, and analyze the matching dump with the vendor or Microsoft debugger'
+                suggestedWprProfile = $null
+            }
+        }
+    }
+
+    # ---- CBS/DISM/setup text evidence ----------------------------------------
+    # The scanner emits only normalized signatures and line ranges. Aggregate
+    # the same signature across logs so recurring CBS_E_* failures become one
+    # actionable finding instead of a raw-log archaeology exercise.
+    if ($null -ne $ServicingAnalysis) {
+        $servicingStatus = [string](Get-CaseJsonProperty -InputObject $ServicingAnalysis -Name 'status')
+        $servicingError = [string](Get-CaseJsonProperty -InputObject $ServicingAnalysis -Name 'error')
+        $servicingLogsValue = Get-CaseJsonProperty -InputObject $ServicingAnalysis -Name 'logs'
+        $servicingLogs = @()
+        if ($null -ne $servicingLogsValue) { $servicingLogs = @($servicingLogsValue | Where-Object { $null -ne $_ }) }
+        $servicingMap = @{}
+        $servicingOrder = New-Object System.Collections.ArrayList
+        $completedServicingLogCount = 0
+        $incompleteServicingLogCount = 0
+        $truncatedServicingLogCount = 0
+        foreach ($servicingLog in $servicingLogs) {
+            $scanStatus = [string](Get-SafeObjectProperty -InputObject $servicingLog -Name 'scanStatus')
+            $scanTruncated = [bool](Get-SafeObjectProperty -InputObject $servicingLog -Name 'scanTruncated')
+            if ($scanStatus -eq 'completed') {
+                $completedServicingLogCount++
+            }
+            if ($scanStatus -ne 'completed' -or $scanTruncated) {
+                $incompleteServicingLogCount++
+            }
+            if ($scanTruncated) {
+                $truncatedServicingLogCount++
+            }
+            $logName = [string](Get-SafeObjectProperty -InputObject $servicingLog -Name 'name')
+            $logArtifact = [string](Get-SafeObjectProperty -InputObject $servicingLog -Name 'artifact')
+            foreach ($signature in @(Get-SafeObjectProperty -InputObject $servicingLog -Name 'signatures')) {
+                $signatureName = [string](Get-SafeObjectProperty -InputObject $signature -Name 'signature')
+                if ([string]::IsNullOrWhiteSpace($signatureName)) { continue }
+                if (-not $servicingMap.ContainsKey($signatureName)) {
+                    $servicingMap[$signatureName] = [ordered]@{
+                        signature = $signatureName
+                        kind = [string](Get-SafeObjectProperty -InputObject $signature -Name 'kind')
+                        count = 0
+                        logs = New-Object System.Collections.ArrayList
+                        firstLineNumber = $null
+                        lastLineNumber = $null
+                    }
+                    [void]$servicingOrder.Add($signatureName)
+                }
+                $aggregate = $servicingMap[$signatureName]
+                $aggregate.count = [int]$aggregate.count + [int](Get-SafeObjectProperty -InputObject $signature -Name 'count')
+                $signatureKind = [string](Get-SafeObjectProperty -InputObject $signature -Name 'kind')
+                if ($aggregate.kind -ne $signatureKind) { $aggregate.kind = 'mixed' }
+                if (-not [string]::IsNullOrWhiteSpace($logName) -and -not @($aggregate.logs | Where-Object { $_ -eq $logName })) { [void]$aggregate.logs.Add($logName) }
+                $firstLine = Get-SafeObjectProperty -InputObject $signature -Name 'firstLineNumber'
+                $lastLine = Get-SafeObjectProperty -InputObject $signature -Name 'lastLineNumber'
+                if ($null -ne $firstLine -and ($null -eq $aggregate.firstLineNumber -or [int]$firstLine -lt [int]$aggregate.firstLineNumber)) { $aggregate.firstLineNumber = [int]$firstLine }
+                if ($null -ne $lastLine -and ($null -eq $aggregate.lastLineNumber -or [int]$lastLine -gt [int]$aggregate.lastLineNumber)) { $aggregate.lastLineNumber = [int]$lastLine }
+            }
+        }
+
+        foreach ($signatureName in @($servicingOrder)) {
+            $aggregate = $servicingMap[$signatureName]
+            $findings += [pscustomobject]@{
+                category = 'servicing-failure'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = $aggregate.signature
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $aggregate.count
+                    kind = $aggregate.kind
+                    logs = @($aggregate.logs) -join ', '
+                    firstLineNumber = $aggregate.firstLineNumber
+                    lastLineNumber = $aggregate.lastLineNumber
+                    recurring = ($aggregate.count -gt 1)
+                }
+                ruleCondition = "The bounded servicing-log scan found $($aggregate.count) occurrence(s) of $($aggregate.signature)"
+                uncertainty = 'Text matching identifies a recurring error signature, not the current package state or the root cause; a full CBS/DISM review is still required'
+                nextSteps = 'Open the referenced bootfailure log artifact(s) around the reported line range and correlate the signature with the servicing operation; no repair is performed automatically'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($servicingStatus -eq 'failed') {
+            $findings += [pscustomobject]@{
+                category = 'coverage'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = 'servicingAnalysisFailed'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    status = $servicingStatus
+                    logCount = $servicingLogs.Count
+                    error = $servicingError
+                }
+                ruleCondition = 'The servicing-log analysis stage failed before producing a complete result'
+                uncertainty = 'CBS/DISM/setup evidence was not analyzed; the failure message may identify an access or runtime problem'
+                nextSteps = 'Review collectionErrors and servicing-log-analysis.json, then re-run with readable copied servicing logs'
+                suggestedWprProfile = $null
+            }
+        }
+        elseif ($servicingLogs.Count -eq 0 -or $completedServicingLogCount -eq 0) {
+            $findings += [pscustomobject]@{
+                category = 'coverage'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = 'servicingEvidenceUnavailable'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    logCount = $servicingLogs.Count
+                    completedLogCount = $completedServicingLogCount
+                }
+                ruleCondition = 'No copied CBS/DISM/setup log was available for text analysis'
+                uncertainty = 'Servicing health is unknown when the requested log evidence was not copied or could not be read'
+                nextSteps = 'Re-run with boot-failure log consent or inspect the source logs directly'
+                suggestedWprProfile = $null
+            }
+        }
+        elseif ($incompleteServicingLogCount -gt 0) {
+            $findings += [pscustomobject]@{
+                category = 'coverage'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = 'servicingEvidencePartial'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    logCount = $servicingLogs.Count
+                    completedLogCount = $completedServicingLogCount
+                    incompleteLogCount = $incompleteServicingLogCount
+                    truncatedLogCount = $truncatedServicingLogCount
+                }
+                ruleCondition = "$incompleteServicingLogCount of $($servicingLogs.Count) requested servicing log(s) could not be fully scanned"
+                uncertainty = 'Findings cover only the readable servicing logs; unavailable or truncated logs may contain additional failures'
+                nextSteps = 'Review the servicing-log-analysis.json errors and re-run with readable copied CBS/DISM/setup logs'
+                suggestedWprProfile = $null
+            }
+        }
+    }
+
     return $findings
 }
 
@@ -3457,6 +4712,8 @@ function ConvertTo-FindingsHtml {
     $pressureFindings = @($Findings | Where-Object { $_.category -match 'pressure|paging|disk' })
     $coverageFindings = @($Findings | Where-Object { $_.category -eq 'coverage' })
     $evidenceFindings = @($Findings | Where-Object { $_.category -eq 'evidence-coverage' })
+    $crashFindings = @($Findings | Where-Object { $_.category -eq 'crash-evidence' })
+    $servicingFindings = @($Findings | Where-Object { $_.category -eq 'servicing-failure' })
     $otherFindings = @($Findings | Where-Object {
             $_.category -notmatch 'pressure|paging|disk|coverage'
         })
@@ -3477,8 +4734,18 @@ function ConvertTo-FindingsHtml {
             [void]$sb.AppendLine("<tr><th>Rule</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
             # The measured numbers are the evidence; a finding that names a rule
             # without the values behind it cannot be checked by the reader.
-            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
-                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
@@ -3500,6 +4767,19 @@ function ConvertTo-FindingsHtml {
             [void]$sb.AppendLine("<table>")
             [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Condition</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
+            }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
             [void]$sb.AppendLine('</table>')
@@ -3516,8 +4796,18 @@ function ConvertTo-FindingsHtml {
             [void]$sb.AppendLine('<table>')
             [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Condition</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
-            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
-                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
@@ -3527,8 +4817,14 @@ function ConvertTo-FindingsHtml {
     }
 
     if ($otherFindings.Count -gt 0) {
-        [void]$sb.AppendLine('<h2>Attribution And Supporting Evidence</h2>')
-        [void]$sb.AppendLine('<p class="no-external">Attribution is not proof of causation: it says where a resource went, not why the machine slowed down.</p>')
+        $supportingHeading = 'Attribution And Supporting Evidence'
+        $supportingLead = 'Attribution is not proof of causation: it says where a resource went, not why the machine slowed down.'
+        if ($crashFindings.Count -gt 0 -or $servicingFindings.Count -gt 0) {
+            $supportingHeading = 'Crash, Servicing And Supporting Evidence'
+            $supportingLead = 'Crash and servicing records are evidence to correlate, not proof of causation or a recommendation to repair automatically.'
+        }
+        [void]$sb.AppendLine("<h2>$(ConvertTo-HtmlEncoded $supportingHeading)</h2>")
+        [void]$sb.AppendLine(('<p class="no-external">{0}</p>' -f (ConvertTo-HtmlEncoded $supportingLead)))
         foreach ($finding in $otherFindings) {
             [void]$sb.AppendLine("<div class='finding pressure'>")
             [void]$sb.AppendLine("<h3>$(ConvertTo-HtmlEncoded $finding.category)</h3>")
@@ -3539,8 +4835,18 @@ function ConvertTo-FindingsHtml {
                 [void]$sb.AppendLine("<tr><th>Window</th><td>$(ConvertTo-HtmlEncoded $finding.windowStart) to $(ConvertTo-HtmlEncoded $finding.windowEnd)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Rule</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
-            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
-                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
@@ -3617,11 +4923,17 @@ function Write-CollectionOutputs {
 
         [AllowNull()][object]$CaptureWindow,
 
-        [AllowNull()][object]$ProcessMemoryTop
+        [AllowNull()][object]$ProcessMemoryTop,
+
+        [AllowNull()][object]$CrashAnalysis,
+
+        [AllowNull()][object]$ServicingAnalysis
     )
 
     $windowStart = Get-CaseJsonProperty -InputObject $CollectionManifest -Name 'startedAtUtc'
     $windowEnd = Get-CaseJsonProperty -InputObject $CollectionManifest -Name 'completedAtUtc'
+    if ($null -ne $CrashAnalysis) { $CollectionManifest.crashAnalysis = $CrashAnalysis }
+    if ($null -ne $ServicingAnalysis) { $CollectionManifest.servicingAnalysis = $ServicingAnalysis }
 
     # Disk interval series (raw paired counters) and volume state are evidence:
     # write and register them here so the shared tail - not the Windows-only
@@ -3648,9 +4960,19 @@ function Write-CollectionOutputs {
         Add-CollectionError -Stage 'volume-metrics-export' -ErrorRecord $_
     }
 
+    if ($null -ne $ServicingAnalysis) {
+        try {
+            Write-JsonFile -InputObject $ServicingAnalysis -Path (Join-Path -Path $OutputDirectory -ChildPath 'servicing-log-analysis.json')
+            if (-not $CollectedArtifacts.Contains('servicing-log-analysis.json')) { [void]$CollectedArtifacts.Add('servicing-log-analysis.json') }
+        }
+        catch {
+            Add-CollectionError -Stage 'servicing-analysis-export' -ErrorRecord $_
+        }
+    }
+
     $findingsList = @()
     try {
-        $findingsList = @(Evaluate-Findings -Samples $Samples -DiskSeries $DiskSeries -VolumeMetrics $VolumeMetrics -MemoryMetrics $MemoryMetrics -WindowStart $windowStart -WindowEnd $windowEnd -CaptureWindow $CaptureWindow -ProcessMemoryTop $ProcessMemoryTop -MemoryMetricsRaw $MemoryMetrics)
+        $findingsList = @(Evaluate-Findings -Samples $Samples -DiskSeries $DiskSeries -VolumeMetrics $VolumeMetrics -MemoryMetrics $MemoryMetrics -WindowStart $windowStart -WindowEnd $windowEnd -CaptureWindow $CaptureWindow -ProcessMemoryTop $ProcessMemoryTop -MemoryMetricsRaw $MemoryMetrics -CrashAnalysis $CrashAnalysis -ServicingAnalysis $ServicingAnalysis)
         Write-JsonFile -InputObject $findingsList -Path (Join-Path -Path $OutputDirectory -ChildPath 'findings.json')
         if (-not $CollectedArtifacts.Contains('findings.json')) { [void]$CollectedArtifacts.Add('findings.json') }
     }
@@ -3663,7 +4985,7 @@ function Write-CollectionOutputs {
 
     try {
         $reportHtml = ConvertTo-FindingsHtml -Findings $findingsList -Manifest $CollectionManifest -SymptomContext $SymptomContext
-        [System.IO.File]::WriteAllText((Join-Path -Path $OutputDirectory -ChildPath 'report.html'), $reportHtml, (New-Object System.Text.UTF8Encoding($false)))
+        Write-CaseFileAtomically -Path (Join-Path -Path $OutputDirectory -ChildPath 'report.html') -Content $reportHtml
         if (-not $CollectedArtifacts.Contains('report.html')) { [void]$CollectedArtifacts.Add('report.html') }
     }
     catch {
@@ -3677,6 +4999,9 @@ function Write-CollectionOutputs {
     return $CollectionManifest
 }
 
+if (Test-CasePathIsNetworkShare -Path $OutputDirectory) {
+    throw "OutputDirectory '$OutputDirectory' is a network-share path; local collection requires a local destination."
+}
 try {
     $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 }
@@ -3786,6 +5111,7 @@ if ($CollectMinidumps) {
 
 if ($CollectBootFailureLogs) {
     $planManifest.plannedActions += 'collect-boot-failure-evidence-after-explicit-consent'
+    $planManifest.plannedActions += 'analyze-servicing-logs-after-explicit-consent'
     $planManifest.bootFailureLogs = [ordered]@{
         maxBytesPerFile = $script:MaxBootFailureLogBytes
         sources = @('srt-trail', 'boot-log', 'cbs-log', 'setupapi-panther', 'setupapi-error', 'dism-log')
@@ -3832,7 +5158,13 @@ if ($SymptomContext -or $Preset) {
 
 if ($Mode -eq 'Plan') {
     try {
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
         New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
     }
     catch {
         throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
@@ -3874,7 +5206,13 @@ if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 # Consent gates passed: only now may the output directory be created, so a
 # consent-refusing Collect leaves no side effects behind.
 try {
+    if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+        throw 'OutputDirectory is a reparse point and is not a safe case root.'
+    }
     New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+    if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+        throw 'OutputDirectory is a reparse point and is not a safe case root.'
+    }
 }
 catch {
     throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
@@ -3992,7 +5330,15 @@ if ($RemoteComputer) {
 
         $remoteManifestPath = Join-Path $remoteOutDir 'diagnostic-manifest.json'
         $localManifestPath = Join-Path $resolvedOutputDirectory 'diagnostic-manifest.json'
-        Copy-Item -FromSession $session -Path $remoteManifestPath -Destination $localManifestPath -Force
+        $localManifestTemporaryPath = Join-Path $resolvedOutputDirectory ('.diagnostic-manifest.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            $null = Assert-CaseFileDestinationSafe -Path $localManifestTemporaryPath
+            Copy-Item -FromSession $session -Path $remoteManifestPath -Destination $localManifestTemporaryPath
+            $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $localManifestTemporaryPath -DestinationPath $localManifestPath
+        }
+        finally {
+            if ([System.IO.File]::Exists($localManifestTemporaryPath)) { [System.IO.File]::Delete($localManifestTemporaryPath) }
+        }
         $remotePulledManifest = Get-Content -LiteralPath $localManifestPath -Raw | ConvertFrom-Json
         if ($remotePulledManifest.mode -ne 'Collect') {
             throw 'Remote manifest mode was not Collect; refusing to certify the pulled case.'
@@ -4003,10 +5349,24 @@ if ($RemoteComputer) {
             $remoteArtifactPath = Join-Path $remoteOutDir $artifactName
             $localArtifactPath = Join-Path $resolvedOutputDirectory $artifactName
             $localArtifactDir = Split-Path -Parent $localArtifactPath
+            if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($localArtifactDir)) -Candidate $localArtifactDir) {
+                throw "Remote artifact directory contains a reparse point: $localArtifactDir"
+            }
             if (-not (Test-Path -LiteralPath $localArtifactDir)) {
                 New-Item -ItemType Directory -Force -Path $localArtifactDir | Out-Null
             }
-            Copy-Item -FromSession $session -Path $remoteArtifactPath -Destination $localArtifactPath -Force
+            if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($localArtifactDir)) -Candidate $localArtifactDir) {
+                throw "Remote artifact directory became a reparse point: $localArtifactDir"
+            }
+            $localArtifactTemporaryPath = Join-Path $localArtifactDir ('.' + [System.IO.Path]::GetFileName($localArtifactPath) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            try {
+                $null = Assert-CaseFileDestinationSafe -Path $localArtifactTemporaryPath
+                Copy-Item -FromSession $session -Path $remoteArtifactPath -Destination $localArtifactTemporaryPath
+                $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $localArtifactTemporaryPath -DestinationPath $localArtifactPath
+            }
+            finally {
+                if ([System.IO.File]::Exists($localArtifactTemporaryPath)) { [System.IO.File]::Delete($localArtifactTemporaryPath) }
+            }
             $remotePulledFileCount++
             $localHash = (Get-FileHash -LiteralPath $localArtifactPath -Algorithm SHA256).Hash
             if ($localHash -eq $artifact.Sha256) {
@@ -4227,7 +5587,7 @@ if ($MarkerMode) {
         try {
             [void](Read-Host 'Press Enter (or type MARK) when the slowdown happens')
             $stamp = (Get-Date).ToUniversalTime().ToString('o')
-            Set-Content -LiteralPath $Path -Value $stamp -Encoding Ascii -ErrorAction Stop
+            Write-CaseFileAtomically -Path $Path -Content $stamp
             return [pscustomobject]@{ MarkerFile = $Path; WrittenAtUtc = $stamp }
         }
         catch {
@@ -4474,7 +5834,7 @@ $samplingActualSeconds = [Math]::Round((New-TimeSpan -Start ([datetime]$samplerS
 # counter window (the job also self-terminates at its maximum window).
 if ($null -ne $wprBackgroundJob) {
     try {
-        Set-Content -LiteralPath $wprStopSentinelPath -Value $completedAtSamplingUtc -Encoding Ascii -ErrorAction Stop
+        Write-CaseFileAtomically -Path $wprStopSentinelPath -Content $completedAtSamplingUtc
     }
     catch {
         Add-CollectionError -Stage 'wpr-stop-signal' -ErrorRecord $_
@@ -4623,7 +5983,7 @@ if ($null -ne $diskSourceError) {
 }
 
 try {
-    $samples | Export-Csv -LiteralPath (Join-Path -Path $resolvedOutputDirectory -ChildPath 'performance-samples.csv') -NoTypeInformation -Encoding UTF8
+    Write-CaseCsvFile -Rows $samples -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'performance-samples.csv')
     [void]$collectedArtifacts.Add('performance-samples.csv')
 }
 catch {
@@ -4634,7 +5994,7 @@ catch {
 # the commit charge", as CSV (one row per process per sample) plus a top-consumer
 # summary the report can cite.
 try {
-    $processMemorySeries | Export-Csv -LiteralPath (Join-Path -Path $resolvedOutputDirectory -ChildPath 'process-memory-samples.csv') -NoTypeInformation -Encoding UTF8
+    Write-CaseCsvFile -Rows $processMemorySeries -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'process-memory-samples.csv')
     [void]$collectedArtifacts.Add('process-memory-samples.csv')
 }
 catch {
@@ -4754,10 +6114,13 @@ catch {
 
 $systemLogInfo = $null
 $safeEvents = $null
+$eventStartTime = $null
+$eventEndTime = $null
 try {
     $eventStartTime = (Get-Date).AddHours(-24)
     $systemLogInfo = Get-WinEvent -ListLog 'System' -ErrorAction Stop
     $safeEvents = Get-EventsSafe -LogName 'System' -StartTime $eventStartTime -MaxEvents $MaxEventCount
+    $eventEndTime = Get-Date
     $events = $safeEvents.Events
     Write-JsonFile -InputObject $events -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'system-events-last-24-hours.json')
     [void]$collectedArtifacts.Add('system-events-last-24-hours.json')
@@ -4859,16 +6222,15 @@ catch {
 }
 
 $crashAnalysis = [ordered]@{
+    eventLookbackStartUtc = $null
+    eventLookbackEndUtc = $null
+    eventCorrelationWindowMinutes = 5
     bugchecks = @()
     unexplainedShutdowns = @()
-}
-try {
-    if ($safeEvents -and $safeEvents.Events.Count -gt 0) {
-        $crashAnalysis = Get-CrashAnalysis -Events $safeEvents.Events
-    }
-}
-catch {
-    Add-CollectionError -Stage 'crash-analysis' -ErrorRecord $_
+    minidumps = @()
+    minidumpSignatures = @()
+    liveKernelReports = @()
+    liveKernelSignatures = @()
 }
 
 # ---- Minidump collection (consent-gated; read-only copy of crash dumps) ----
@@ -4888,7 +6250,13 @@ $minidumpFiles = @()
 if ($CollectMinidumps) {
     try {
         $minidumpDir = Join-Path $resolvedOutputDirectory 'minidumps'
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($minidumpDir)) -Candidate $minidumpDir) {
+            throw 'Minidump output directory is a reparse point or contains a reparse-point parent.'
+        }
         New-Item -ItemType Directory -Force -Path $minidumpDir | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($minidumpDir)) -Candidate $minidumpDir) {
+            throw 'Minidump output directory is a reparse point or contains a reparse-point parent.'
+        }
 
         $memoryDumpPath = Join-Path $env:SystemRoot 'MEMORY.DMP'
         if (Test-Path -LiteralPath $memoryDumpPath) {
@@ -4916,13 +6284,14 @@ if ($CollectMinidumps) {
                     continue
                 }
                 $minidumpDest = Join-Path $minidumpDir $dump.Name
-                Copy-Item -LiteralPath $dump.FullName -Destination $minidumpDest -Force
-                $minidumpTotalBytes += $dump.Length
+                $remainingMinidumpBytes = $script:MaxMinidumpTotalBytes - $minidumpTotalBytes
+                $copiedDumpBytes = Copy-CaseFileBounded -SourcePath $dump.FullName -DestinationPath $minidumpDest -MaxBytes $remainingMinidumpBytes
+                $minidumpTotalBytes += $copiedDumpBytes
                 $minidumpCopiedCount++
                 [void]$collectedArtifacts.Add("minidumps\$($dump.Name)")
                 $minidumpFiles += [pscustomobject]@{
                     Name = $dump.Name
-                    SizeBytes = $dump.Length
+                    SizeBytes = $copiedDumpBytes
                     SourceLastWriteTimeUtc = $dump.LastWriteTime.ToUniversalTime().ToString('o')
                 }
             }
@@ -4948,7 +6317,13 @@ $bootFailureSources = @()
 if ($CollectBootFailureLogs) {
     try {
         $bootFailureDir = Join-Path $resolvedOutputDirectory 'bootfailure'
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($bootFailureDir)) -Candidate $bootFailureDir) {
+            throw 'Boot-failure output directory is a reparse point or contains a reparse-point parent.'
+        }
         New-Item -ItemType Directory -Force -Path $bootFailureDir | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($bootFailureDir)) -Candidate $bootFailureDir) {
+            throw 'Boot-failure output directory is a reparse point or contains a reparse-point parent.'
+        }
 
         $bootFailureCandidates = @(
             [pscustomobject]@{ Name = 'srt-trail'; SourcePath = (Join-Path $env:SystemRoot 'System32\LogFiles\Srt\SrtTrail.txt') }
@@ -4973,7 +6348,7 @@ if ($CollectBootFailureLogs) {
                 }
                 if ($candidateItem.Length -le $script:MaxBootFailureLogBytes) {
                     $bootFailureDest = Join-Path $bootFailureDir $candidateItem.Name
-                    Copy-Item -LiteralPath $candidate.SourcePath -Destination $bootFailureDest -Force
+                    $null = Copy-CaseFileBounded -SourcePath $candidate.SourcePath -DestinationPath $bootFailureDest -MaxBytes $script:MaxBootFailureLogBytes
                     $entry.copied = $true
                     $entry.copiedTo = "bootfailure\$($candidateItem.Name)"
                     $bootFailureCopiedCount++
@@ -5004,6 +6379,48 @@ if ($CollectBootFailureLogs) {
         Add-CollectionError -Stage 'boot-failure-log-collection' -ErrorRecord $_
         $bootFailureStatus = 'failed'
     }
+}
+
+# Analyze the copied text only after the boot-failure collection has established
+# the final relative artifact paths. The analysis artifact is written by the
+# shared tail together with findings.json, so it is hash-registered and included
+# in a package when requested.
+$servicingAnalysis = $null
+if ($CollectBootFailureLogs) {
+    try {
+        $servicingAnalysis = Get-ServicingLogAnalysis -SourceEntries @($bootFailureSources) -OutputDirectory $resolvedOutputDirectory -MaxScanBytes $script:MaxBootFailureLogBytes
+    }
+    catch {
+        Add-CollectionError -Stage 'servicing-log-analysis' -ErrorRecord $_
+        $servicingAnalysis = [ordered]@{
+            status = 'failed'
+            maxScanBytes = $script:MaxBootFailureLogBytes
+            logCount = @($bootFailureSources).Count
+            scannedLogCount = 0
+            failedLogCount = 1
+            truncatedLogCount = 0
+            unavailableLogCount = @($bootFailureSources).Count
+            logs = @()
+            error = $_.Exception.Message
+        }
+    }
+}
+
+# Run crash analysis after both consent-gated artifact stages. A dump or
+# LiveKernelReport can be older than the 24-hour event query and must still
+# reach the findings engine.
+try {
+    $crashEvents = @()
+    if ($null -ne $safeEvents) { $crashEvents = @($safeEvents.Events) }
+    $crashAnalysis = Get-CrashAnalysis `
+        -Events $crashEvents `
+        -MinidumpFiles @($minidumpFiles) `
+        -LiveKernelReports @($liveKernelReports) `
+        -EventWindowStartUtc $eventStartTime `
+        -EventWindowEndUtc $eventEndTime
+}
+catch {
+    Add-CollectionError -Stage 'crash-analysis' -ErrorRecord $_
 }
 
 if ($CaptureDefender) {
@@ -5294,6 +6711,7 @@ if ($CollectBootFailureLogs) {
         skippedOversizedCount = $bootFailureSkippedOversizedCount
         sourceEntries = @($bootFailureSources)
     }
+    $collectionManifest.servicingAnalysis = $servicingAnalysis
 }
 
 if ($diskMetrics) {
@@ -5341,7 +6759,9 @@ $collectionManifest = Write-CollectionOutputs `
     -MemoryMetrics $finalMemMetrics `
     -SymptomContext $SymptomContext `
     -CaptureWindow $collectionManifest.captureWindow `
-    -ProcessMemoryTop @($processMemoryTop)
+    -ProcessMemoryTop @($processMemoryTop) `
+    -CrashAnalysis $crashAnalysis `
+    -ServicingAnalysis $servicingAnalysis
 
 $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"

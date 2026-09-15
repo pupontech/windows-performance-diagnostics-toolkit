@@ -51,6 +51,19 @@ remediation planning (see `docs/windows-live-test-matrix.md`).
 
 ## Planned (P2)
 
+### M2: Crash and servicing evidence findings (in progress)
+
+- Bounded streaming analysis of copied CBS, DISM, setup and boot logs. It emits
+  normalized error signatures, counts and line ranges without duplicating raw
+  log text into the analysis artifact.
+- Crash findings combine the bounded System event view with copied minidumps and
+  LiveKernelReports. Older dump evidence remains visible when it predates the
+  event lookback; nearby BugCheck codes and filename dates/classes are labelled
+  as correlation hints, not decoded root causes.
+- `servicing-log-analysis.json`, `findings.json`, the manifest and the offline
+  report carry the new evidence. Full CBS/DISM grammar coverage and binary dump
+  decoding remain outside this first vertical slice.
+
 - Baseline comparison: compare current collection against a known-good baseline
 - Boot/login diagnostics: measure logon duration, startup item impact
 - Application diagnostics: per-application resource usage tracking

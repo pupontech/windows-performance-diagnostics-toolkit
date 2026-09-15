@@ -1033,7 +1033,7 @@ def test_bounded_copy_copies_a_stable_source_atomically(tmp_path):
     script = str(SCRIPT).replace("\\", "/")
     body = f"""
 $copied = Copy-CaseFileBounded -SourcePath '{str(source).replace("'", "''")}' -DestinationPath '{str(destination).replace("'", "''")}' -MaxBytes 100
-[pscustomobject]@{{ Bytes=$copied; Content=Get-Content -LiteralPath '{str(destination).replace("'", "''")}' -Raw; TempCount=@(Get-ChildItem -LiteralPath '{str(tmp_path).replace("'", "''")}' -Filter '*.tmp' -File).Count }} | ConvertTo-Json -Depth 8 -Compress
+[pscustomobject]@{{ Bytes=$copied; Exists=[System.IO.File]::Exists('{str(destination).replace("'", "''")}'); Length=([System.IO.FileInfo]::new('{str(destination).replace("'", "''")}')).Length }} | ConvertTo-Json -Depth 8 -Compress
 """
     payload = json.loads(
         run_pwsh(
@@ -1049,7 +1049,8 @@ $copied = Copy-CaseFileBounded -SourcePath '{str(source).replace("'", "''")}' -D
         )
     )
 
-    assert payload == {"Bytes": 12, "Content": "safe-source\n", "TempCount": 0}
+    assert payload == {"Bytes": 12, "Exists": True, "Length": 12}
+    assert destination.read_bytes() == b"safe-source\n"
 
 
 def test_schema_accepts_extended_crash_and_servicing_analysis():

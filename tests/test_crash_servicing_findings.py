@@ -970,7 +970,19 @@ try {{ Write-JsonFile -InputObject ([ordered]@{{ status='replacement' }}) -Path 
 catch {{ $status = 'refused' }}
 [pscustomobject]@{{ Status=$status; Sentinel=Get-Content -LiteralPath '{str(sentinel).replace("'", "''")}' -Raw }} | ConvertTo-Json -Depth 8 -Compress
 """
-    payload = json.loads(run_pwsh(body, []))
+    payload = json.loads(
+        run_pwsh(
+            body,
+            [
+                "Write-JsonFile",
+                "Write-CaseFileAtomically",
+                "Assert-CaseFileDestinationSafe",
+                "Move-CaseTemporaryFileIntoPlace",
+                "Test-CasePathHasReparsePoint",
+                "Get-CaseFileLinkCount",
+            ],
+        )
+    )
 
     assert payload == {"Status": "refused", "Sentinel": "do-not-overwrite"}
 
@@ -996,7 +1008,19 @@ try {{ Copy-CaseFileBounded -SourcePath '{str(source).replace("'", "''")}' -Dest
 catch {{ $status = 'refused' }}
 [pscustomobject]@{{ Status=$status; Sentinel=Get-Content -LiteralPath '{str(sentinel).replace("'", "''")}' -Raw }} | ConvertTo-Json -Depth 8 -Compress
 """
-    payload = json.loads(run_pwsh(body, []))
+    payload = json.loads(
+        run_pwsh(
+            body,
+            [
+                "Copy-CaseFileBounded",
+                "Write-CaseFileAtomically",
+                "Assert-CaseFileDestinationSafe",
+                "Move-CaseTemporaryFileIntoPlace",
+                "Test-CasePathHasReparsePoint",
+                "Get-CaseFileLinkCount",
+            ],
+        )
+    )
 
     assert payload == {"Status": "refused", "Sentinel": "do-not-overwrite"}
 
@@ -1014,7 +1038,19 @@ $null = . '{script}' -Mode Plan -OutputDirectory '{str(plan).replace("'", "''")}
 $copied = Copy-CaseFileBounded -SourcePath '{str(source).replace("'", "''")}' -DestinationPath '{str(destination).replace("'", "''")}' -MaxBytes 100
 [pscustomobject]@{{ Bytes=$copied; Content=Get-Content -LiteralPath '{str(destination).replace("'", "''")}' -Raw; TempCount=@(Get-ChildItem -LiteralPath '{str(tmp_path).replace("'", "''")}' -Filter '*.tmp' -File).Count }} | ConvertTo-Json -Depth 8 -Compress
 """
-    payload = json.loads(run_pwsh(body, []))
+    payload = json.loads(
+        run_pwsh(
+            body,
+            [
+                "Copy-CaseFileBounded",
+                "Write-CaseFileAtomically",
+                "Assert-CaseFileDestinationSafe",
+                "Move-CaseTemporaryFileIntoPlace",
+                "Test-CasePathHasReparsePoint",
+                "Get-CaseFileLinkCount",
+            ],
+        )
+    )
 
     assert payload == {"Bytes": 12, "Content": "safe-source\n", "TempCount": 0}
 

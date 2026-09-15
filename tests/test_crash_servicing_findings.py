@@ -964,7 +964,6 @@ def test_json_writer_refuses_a_hardlink_destination(tmp_path):
     plan = tmp_path / "plan"
     script = str(SCRIPT).replace("\\", "/")
     body = f"""
-$null = . '{script}' -Mode Plan -OutputDirectory '{str(plan).replace("'", "''")}'
 $status = 'completed'
 try {{ Write-JsonFile -InputObject ([ordered]@{{ status='replacement' }}) -Path '{str(destination).replace("'", "''")}' }}
 catch {{ $status = 'refused' }}
@@ -1002,7 +1001,6 @@ def test_bounded_copy_refuses_a_hardlink_destination(tmp_path):
     plan = tmp_path / "plan"
     script = str(SCRIPT).replace("\\", "/")
     body = f"""
-$null = . '{script}' -Mode Plan -OutputDirectory '{str(plan).replace("'", "''")}'
 $status = 'completed'
 try {{ Copy-CaseFileBounded -SourcePath '{str(source).replace("'", "''")}' -DestinationPath '{str(destination).replace("'", "''")}' -MaxBytes 100 | Out-Null }}
 catch {{ $status = 'refused' }}
@@ -1034,7 +1032,6 @@ def test_bounded_copy_copies_a_stable_source_atomically(tmp_path):
     plan = tmp_path / "plan"
     script = str(SCRIPT).replace("\\", "/")
     body = f"""
-$null = . '{script}' -Mode Plan -OutputDirectory '{str(plan).replace("'", "''")}'
 $copied = Copy-CaseFileBounded -SourcePath '{str(source).replace("'", "''")}' -DestinationPath '{str(destination).replace("'", "''")}' -MaxBytes 100
 [pscustomobject]@{{ Bytes=$copied; Content=Get-Content -LiteralPath '{str(destination).replace("'", "''")}' -Raw; TempCount=@(Get-ChildItem -LiteralPath '{str(tmp_path).replace("'", "''")}' -Filter '*.tmp' -File).Count }} | ConvertTo-Json -Depth 8 -Compress
 """

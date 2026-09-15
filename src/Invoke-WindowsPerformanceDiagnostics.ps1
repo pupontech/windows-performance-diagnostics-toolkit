@@ -502,21 +502,16 @@ function Move-CaseTemporaryFileIntoPlace {
     if (-not [System.IO.File]::Exists($temporaryFull)) {
         throw "Temporary file does not exist: $temporaryFull"
     }
-    $backupPath = $null
-    try {
-        if ([System.IO.File]::Exists($destinationFull)) {
-            $destinationDirectory = Split-Path -Parent $destinationFull
-            $backupPath = Join-Path -Path $destinationDirectory -ChildPath ('.' + [System.IO.Path]::GetFileName($destinationFull) + '.' + [Guid]::NewGuid().ToString('N') + '.bak')
-            [System.IO.File]::Replace($temporaryFull, $destinationFull, $backupPath)
+    if ([System.IO.File]::Exists($destinationFull)) {
+        $destinationLinkCount = Get-CaseFileLinkCount -Path $destinationFull
+        if ($destinationLinkCount -ne 1) {
+            throw "File destination identity is unsafe: $destinationFull"
         }
-        else {
-            [System.IO.File]::Move($temporaryFull, $destinationFull)
-        }
+        [System.IO.File]::Delete($destinationFull)
+        [System.IO.File]::Move($temporaryFull, $destinationFull)
     }
-    finally {
-        if ($null -ne $backupPath -and [System.IO.File]::Exists($backupPath)) {
-            try { [System.IO.File]::Delete($backupPath) } catch { }
-        }
+    else {
+        [System.IO.File]::Move($temporaryFull, $destinationFull)
     }
     return $destinationFull
 }
@@ -535,7 +530,9 @@ function Copy-CaseFileBounded {
       Copy a file without following unsafe case paths or reading past the
       source length observed at the start. A size change aborts the copy, so a
       growing log/dump is never silently truncated or copied without its cap.
-      The destination is written to a unique file and replaced atomically.
+      The destination is written to a unique file and placed only after a final
+      identity check; an existing single-link file is replaced without following
+      a hardlink target.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$SourcePath,

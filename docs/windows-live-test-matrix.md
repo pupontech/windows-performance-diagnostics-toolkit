@@ -22,6 +22,15 @@ drive-to-disk evidence are present rather than merely plausible.
 
 ## Test cases
 
+Rows WPD-04 through WPD-07 (and WPD-08 through WPD-10) are executed by the
+harnesses under `tests/live/` on the owner's GitHub-hosted Windows runners, with
+their verdicts, assertions and evidence uploaded by the `wpd-live-gates` job in
+`.github/workflows/ci.yml`. That environment is a Windows **Server** SKU, so
+client-only behaviour (interactive UAC prompts, Defender real-time protection on
+a Win10/11 client, MOTW recovery) still needs the owner spot check described
+below. Everything else below is an owner-live activity on a real Windows 10/11
+client:
+
 | ID | Action | Expected result | Evidence to preserve |
 |---|---|---|---|
 | WPD-01 | Run `-Mode Plan` | Creates `diagnostic-plan.json`; no Windows event/process/performance artifacts are collected. | Plan JSON |

@@ -93,6 +93,14 @@ jobs:
           $env:WPD_POWERSHELL_EXE = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
           python -m pytest tests/test_live_case_helpers.py -q
 
+      - name: Run WPD-06/07 harness helper tests (Windows PowerShell 5.1)
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          python -m pip install --disable-pip-version-check pytest pyyaml
+          $env:WPD_POWERSHELL_EXE = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+          python -m pytest tests/test_live_case_0607_helpers.py -q
+
       - name: Run Plan mode
         shell: pwsh
         run: |
@@ -370,11 +378,12 @@ jobs:
             Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
           }
 
-  # WPD-04/05/08/09/10: live collection manifest, standard-account safety,
-  # WPR consent and elevation gates on a real Windows VM. The WPD-04/05 cases
-  # are kept in this job so all live gates share the same trigger, OS matrix and
-  # evidence upload; the old standalone WPD-04/05 workflow is intentionally
-  # removed to avoid duplicate pull-request runs.
+  # WPD-04/05/06/07/08/09/10: live collection manifest, standard-account safety,
+  # bounded event summary, no-side-effect observation, WPR consent and elevation
+  # gates on a real Windows VM. The WPD-04/05/06/07 cases are kept in this job so
+  # all live gates share the same trigger, OS matrix and evidence upload; the old
+  # standalone WPD-04/05 workflow is intentionally removed to avoid duplicate
+  # pull-request runs.
   # (GitHub-hosted windows-2022/windows-2025 runner = the owner-provided Windows
   # environment; elevated by default, Windows PowerShell 5.1, real wpr.exe.)
   # WPD-08 consent refusal and WPD-10 elevated capture run directly in the
@@ -538,17 +547,55 @@ jobs:
           & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0405.ps1" -Case WPD-05 -ToolkitScript $env:WPD_TOOLKIT -Label 'release-v1.0.0'
           exit $LASTEXITCODE
 
-      - name: Summarize WPD-04/05 live-case verdicts
+      - name: WPD-06 - bounded event summary (build under test ${{ steps.wpd0405_build.outputs.short }})
+        if: always()
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.wpd0405_build.outputs.source_script }}
+        run: |
+          $label = 'source-${{ steps.wpd0405_build.outputs.short }}'
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0607.ps1" -Case WPD-06 -ToolkitScript $env:WPD_TOOLKIT -Label $label -MaxEventCount 50
+          exit $LASTEXITCODE
+
+      - name: WPD-07 - no exclusions, startup edits, log clearing or uploads (build under test ${{ steps.wpd0405_build.outputs.short }})
+        if: always()
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.wpd0405_build.outputs.source_script }}
+        run: |
+          $label = 'source-${{ steps.wpd0405_build.outputs.short }}'
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0607.ps1" -Case WPD-07 -ToolkitScript $env:WPD_TOOLKIT -Label $label -MaxEventCount 200
+          exit $LASTEXITCODE
+
+      - name: WPD-06 - bounded event summary (published release v1.0.0)
+        if: always() && steps.wpd0405_release.outputs.ok == 'true'
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.wpd0405_release.outputs.script }}
+        run: |
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0607.ps1" -Case WPD-06 -ToolkitScript $env:WPD_TOOLKIT -Label 'release-v1.0.0' -MaxEventCount 50
+          exit $LASTEXITCODE
+
+      - name: WPD-07 - no exclusions, startup edits, log clearing or uploads (published release v1.0.0)
+        if: always() && steps.wpd0405_release.outputs.ok == 'true'
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.wpd0405_release.outputs.script }}
+        run: |
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0607.ps1" -Case WPD-07 -ToolkitScript $env:WPD_TOOLKIT -Label 'release-v1.0.0' -MaxEventCount 200
+          exit $LASTEXITCODE
+
+      - name: Summarize WPD-04/05/06/07 live-case verdicts
         if: always()
         shell: pwsh
         run: |
           $results = @(Get-ChildItem -LiteralPath 'C:\WPD\results' -Filter 'WPD-*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)
           if ($results.Count -eq 0) {
-            Write-Output "::warning::no WPD-04/05 result JSON was produced"
-            "## WPD-04/05 live cases`n`nNo result JSON was produced (the harness did not reach its verdict stage)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            Write-Output "::warning::no live-case result JSON was produced"
+            "## WPD-04/05/06/07 live cases`n`nNo result JSON was produced (the harness did not reach its verdict stage)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             exit 0
           }
-          $lines = @('## WPD-04/05 live cases', '', '| Case | Build | Verdict | Assertions | Toolkit SHA-256 | Host |', '|---|---|---|---|---|---|')
+          $lines = @('## WPD-04/05/06/07 live cases', '', '| Case | Build | Verdict | Assertions | Toolkit SHA-256 | Host |', '|---|---|---|---|---|---|')
           foreach ($file in $results) {
             try {
               $r = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
@@ -776,7 +823,7 @@ jobs:
           Write-Output "WPD-09 PASS: wpr.status=skipped-elevation-required, no ETL, no elevation attempted"
           exit 0
 
-      - name: Upload WPD-04/05/08/09/10 evidence
+      - name: Upload WPD-04/05/06/07/08/09/10 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:

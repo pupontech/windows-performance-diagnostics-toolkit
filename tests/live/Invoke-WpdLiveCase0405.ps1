@@ -622,18 +622,20 @@ function Get-WpdSafetyDeclarationCheck {
     $ok = $true
     $sawAny = $false
 
-    if ($null -ne $Manifest.safety) {
+    $safetyProperty = if ($null -ne $Manifest) { $Manifest.PSObject.Properties['safety'] } else { $null }
+    if ($null -ne $safetyProperty -and $null -ne $safetyProperty.Value) {
         $sawAny = $true
-        $s = $Manifest.safety
+        $s = $safetyProperty.Value
         $parts += ('safety(localOnly={0},readOnly={1},requiresExplicitCollectionConsent={2},automaticUpload={3},automaticRemediation={4},automaticLogClearing={5})' -f `
             $s.localOnly, $s.readOnly, $s.requiresExplicitCollectionConsent, $s.automaticUpload, $s.automaticRemediation, $s.automaticLogClearing)
         $ok = $ok -and ($s.localOnly -eq $true) -and ($s.readOnly -eq $true) -and ($s.requiresExplicitCollectionConsent -eq $true) -and `
             ($s.automaticUpload -eq $false) -and ($s.automaticRemediation -eq $false) -and ($s.automaticLogClearing -eq $false)
     }
 
-    if ($null -ne $Manifest.privacy) {
+    $privacyProperty = if ($null -ne $Manifest) { $Manifest.PSObject.Properties['privacy'] } else { $null }
+    if ($null -ne $privacyProperty -and $null -ne $privacyProperty.Value) {
         $sawAny = $true
-        $p = $Manifest.privacy
+        $p = $privacyProperty.Value
         $parts += ('privacy(secretsCollected={0},redactionApplied={1},level={2},requestedLevel={3})' -f `
             $p.secretsCollected, $p.redactionApplied, $p.level, $p.requestedLevel)
         $ok = $ok -and ($p.secretsCollected -eq $false)

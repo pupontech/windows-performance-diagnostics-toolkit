@@ -6,10 +6,10 @@
 .DESCRIPTION
   Runs ONE case on a Windows host and returns an unambiguous verdict:
 
-    WPD-04  Inspect manifest hashes — every emitted data artifact is listed in
+    WPD-04  Inspect manifest hashes - every emitted data artifact is listed in
             diagnostic-manifest.json with a SHA-256 and a size, and the recorded
             hash/size match an independent re-read of the file on disk.
-    WPD-05  Run on a standard (non-admin) account — the collection completes
+    WPD-05  Run on a standard (non-admin) account - the collection completes
             (partially, with the failures declared under collectionErrors) and
             the toolkit neither changes machine configuration nor elevates
             itself.

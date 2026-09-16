@@ -23,6 +23,7 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 EVENT_FUNCTIONS = [
     "Get-WpdProperty",
     "Get-WpdUtcStamp",
+    "Get-WpdStringSha256",
     "Get-WpdEventKey",
     "Compare-WpdEventEvidence",
 ]

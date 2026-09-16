@@ -1,0 +1,11 @@
+{
+  "id": "symbols-unavailable",
+  "title": "Managed symbols absent beside the trace",
+  "driver": {
+    "kind": "symbols",
+    "args": {
+      "tracePath": "C:\\case\\trace.etl"
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

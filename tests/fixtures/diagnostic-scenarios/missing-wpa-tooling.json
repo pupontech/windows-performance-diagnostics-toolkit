@@ -1,0 +1,11 @@
+{
+  "id": "missing-wpa-tooling",
+  "title": "Windows Performance Toolkit is not installed",
+  "driver": {
+    "kind": "tool",
+    "args": {
+      "searchPath": "C:\\Program Files\\Windows Kits\\10\\Windows Performance Toolkit"
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

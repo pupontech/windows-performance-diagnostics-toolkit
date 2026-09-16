@@ -1,0 +1,41 @@
+{
+  "id": "whea-uncorrected-recurrence",
+  "title": "WHEA uncorrected recurrence on one component",
+  "driver": {
+    "kind": "whea",
+    "args": {
+      "records": [
+        {
+          "provider": "Microsoft-Windows-WHEA-Logger",
+          "eventId": 17,
+          "timeCreatedUtc": "2026-09-10T08:00:00Z",
+          "message": "A corrected hardware error has occurred.",
+          "eventData": {
+            "ErrorSource": "PCI Express Root Port A"
+          }
+        },
+        {
+          "provider": "Microsoft-Windows-WHEA-Logger",
+          "eventId": 17,
+          "timeCreatedUtc": "2026-09-10T09:00:00Z",
+          "message": "A corrected hardware error has occurred.",
+          "eventData": {
+            "ErrorSource": "PCI Express Root Port A"
+          }
+        },
+        {
+          "provider": "Microsoft-Windows-WHEA-Logger",
+          "eventId": 18,
+          "timeCreatedUtc": "2026-09-10T10:00:00Z",
+          "message": "An uncorrected hardware error has occurred.",
+          "eventData": {
+            "ErrorSource": "PCI Express Root Port A"
+          }
+        }
+      ],
+      "windowStart": "2026-09-10T00:00:00Z",
+      "windowEnd": "2026-09-11T00:00:00Z"
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

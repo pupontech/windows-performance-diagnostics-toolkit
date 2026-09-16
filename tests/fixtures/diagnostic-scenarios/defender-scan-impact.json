@@ -1,0 +1,12 @@
+{
+  "id": "defender-scan-impact",
+  "title": "Defender scan impact without consent",
+  "driver": {
+    "kind": "defender",
+    "args": {
+      "consent": false,
+      "moduleAvailable": true
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

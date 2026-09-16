@@ -1,0 +1,22 @@
+{
+  "id": "dpc-isr-share",
+  "title": "DPC and interrupt share below the long-execution threshold",
+  "driver": {
+    "kind": "dpc",
+    "args": {
+      "rows": [
+        {
+          "DpcTimePercent": 8,
+          "InterruptTimePercent": 4,
+          "DpcsQueuedPerSec": 1200,
+          "InterruptsPerSec": 9000,
+          "DpcDurationMicroseconds": 300
+        }
+      ],
+      "config": {
+        "DpcLongExecutionThresholdMicroseconds": 1000
+      }
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

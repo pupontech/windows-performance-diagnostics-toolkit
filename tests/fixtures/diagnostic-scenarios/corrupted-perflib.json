@@ -1,0 +1,21 @@
+{
+  "id": "corrupted-perflib",
+  "title": "Perflib counters are corrupted",
+  "driver": {
+    "kind": "perflib",
+    "args": {
+      "rows": [
+        {
+          "Value": 10
+        },
+        {
+          "Error": "The performance counter provider could not be queried."
+        },
+        {
+          "Value": "not-a-number"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

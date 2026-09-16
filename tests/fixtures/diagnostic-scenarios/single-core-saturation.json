@@ -1,0 +1,187 @@
+{
+  "id": "single-core-saturation",
+  "title": "One logical processor saturated, machine mostly idle",
+  "driver": {
+    "kind": "cpu",
+    "args": {
+      "rows": [
+        {
+          "TimestampUtc": "2026-09-10T22:00:00Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 100,
+          "KernelTimePercent": 12,
+          "UserTimePercent": 88
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:00Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 6,
+          "KernelTimePercent": 4,
+          "UserTimePercent": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:00Z",
+          "ProcessorNumber": 2,
+          "CpuTimePercent": 4,
+          "KernelTimePercent": 3,
+          "UserTimePercent": 1
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:00Z",
+          "ProcessorNumber": 3,
+          "CpuTimePercent": 8,
+          "KernelTimePercent": 5,
+          "UserTimePercent": 3,
+          "UtilityPercent": 118
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:05Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 100,
+          "KernelTimePercent": 12,
+          "UserTimePercent": 88
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:05Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 6,
+          "KernelTimePercent": 4,
+          "UserTimePercent": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:05Z",
+          "ProcessorNumber": 2,
+          "CpuTimePercent": 4,
+          "KernelTimePercent": 3,
+          "UserTimePercent": 1
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:05Z",
+          "ProcessorNumber": 3,
+          "CpuTimePercent": 8,
+          "KernelTimePercent": 5,
+          "UserTimePercent": 3,
+          "UtilityPercent": 118
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:10Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 100,
+          "KernelTimePercent": 12,
+          "UserTimePercent": 88
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:10Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 6,
+          "KernelTimePercent": 4,
+          "UserTimePercent": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:10Z",
+          "ProcessorNumber": 2,
+          "CpuTimePercent": 4,
+          "KernelTimePercent": 3,
+          "UserTimePercent": 1
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:10Z",
+          "ProcessorNumber": 3,
+          "CpuTimePercent": 8,
+          "KernelTimePercent": 5,
+          "UserTimePercent": 3,
+          "UtilityPercent": 118
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:15Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 100,
+          "KernelTimePercent": 12,
+          "UserTimePercent": 88
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:15Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 6,
+          "KernelTimePercent": 4,
+          "UserTimePercent": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:15Z",
+          "ProcessorNumber": 2,
+          "CpuTimePercent": 4,
+          "KernelTimePercent": 3,
+          "UserTimePercent": 1
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:15Z",
+          "ProcessorNumber": 3,
+          "CpuTimePercent": 8,
+          "KernelTimePercent": 5,
+          "UserTimePercent": 3,
+          "UtilityPercent": 118
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:20Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 100,
+          "KernelTimePercent": 12,
+          "UserTimePercent": 88
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:20Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 6,
+          "KernelTimePercent": 4,
+          "UserTimePercent": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:20Z",
+          "ProcessorNumber": 2,
+          "CpuTimePercent": 4,
+          "KernelTimePercent": 3,
+          "UserTimePercent": 1
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:20Z",
+          "ProcessorNumber": 3,
+          "CpuTimePercent": 8,
+          "KernelTimePercent": 5,
+          "UserTimePercent": 3,
+          "UtilityPercent": 118
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:25Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 100,
+          "KernelTimePercent": 12,
+          "UserTimePercent": 88
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:25Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 6,
+          "KernelTimePercent": 4,
+          "UserTimePercent": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:25Z",
+          "ProcessorNumber": 2,
+          "CpuTimePercent": 4,
+          "KernelTimePercent": 3,
+          "UserTimePercent": 1
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:25Z",
+          "ProcessorNumber": 3,
+          "CpuTimePercent": 8,
+          "KernelTimePercent": 5,
+          "UserTimePercent": 3,
+          "UtilityPercent": 118
+        }
+      ],
+      "logicalProcessorCount": 4
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

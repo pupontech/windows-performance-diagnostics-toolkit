@@ -104,20 +104,25 @@ def test_event_evidence_accepts_an_ordered_bounded_corroborated_summary():
         r"""
 $lookback = [datetime]::UtcNow.AddHours(-24)
 $live = @(
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(23); Id = 5000; ProviderName = 'Live'; Message = 'm1' }
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(22); Id = 5001; ProviderName = 'Live'; Message = 'm2' }
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(21); Id = 777; ProviderName = 'WpdLiveControl'; Message = 'controlled' }
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(20); Id = 5002; ProviderName = 'Live'; Message = 'm4' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(23); RecordId = 4004; Id = 5000; ProviderName = 'Live'; Message = 'm1' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(22); RecordId = 4003; Id = 5001; ProviderName = 'Live'; Message = 'm2' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(21); RecordId = 4002; Id = 777; ProviderName = 'WpdLiveControl'; Message = 'controlled' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(20); RecordId = 4001; Id = 5002; ProviderName = 'Live'; Message = 'm4' }
 )
 $artifact = @($live[0..2])
-$evidence = Compare-WpdEventEvidence -ArtifactRows $artifact -LiveRows $live -Bound 3 -LookbackStartUtc $lookback
+$evidence = Compare-WpdEventEvidence -ArtifactRows $artifact -LiveRows $live -Bound 3 -LookbackStartUtc $lookback -CollectEndedUtc $lookback.AddHours(24)
 [pscustomobject]@{
     count = $evidence.artifactCount
     liveCount = $evidence.liveRowCount
-    ordered = $evidence.orderedNewestFirst
+    orderMatchesLive = $evidence.orderMatchesLive
+    contiguous = $evidence.contiguousInLive
+    liveDescending = $evidence.liveDescendingByRecordId
+    headIndex = $evidence.headIndexInLive
+    inversions = $evidence.timeCreatedInversions
     missing = @($evidence.missingFromLiveLog).Count
     duplicates = $evidence.duplicateKeys
     outside = $evidence.rowsOutsideLookback
+    headAtCollectEnd = $evidence.liveHeadAtCollectEndUtc
     oldest = $evidence.oldestArtifactUtc
     newest = $evidence.newestArtifactUtc
 } | ConvertTo-Json -Compress
@@ -127,42 +132,147 @@ $evidence = Compare-WpdEventEvidence -ArtifactRows $artifact -LiveRows $live -Bo
 
     assert payload["count"] == 3
     assert payload["liveCount"] == 4
-    assert payload["ordered"] is True
+    assert payload["orderMatchesLive"] is True
+    assert payload["contiguous"] is True
+    assert payload["liveDescending"] is True
+    assert payload["headIndex"] == 0
+    assert payload["inversions"] == 0
     assert payload["missing"] == 0
     assert payload["duplicates"] == 0
     assert payload["outside"] == 0
+    assert payload["headAtCollectEnd"] is not None
     assert payload["oldest"] < payload["newest"]
 
 
-def test_event_evidence_flags_fabricated_unordered_and_out_of_lookback_rows():
+def test_event_evidence_flags_a_fabricated_missing_and_out_of_lookback_row():
     payload = run_pwsh_json(
         r"""
 $lookback = [datetime]::UtcNow.AddHours(-24)
 $live = @(
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(1); Id = 10; ProviderName = 'Live'; Message = 'm' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(1); RecordId = 2002; Id = 10; ProviderName = 'Live'; Message = 'm' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(1); RecordId = 2001; Id = 11; ProviderName = 'Live'; Message = 'old' }
 )
 $artifact = @(
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(1); Id = 10; ProviderName = 'Live'; Message = 'm' }
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(3); Id = 99; ProviderName = 'Fabricated'; Message = 'x' }
-    [pscustomobject]@{ TimeCreated = $lookback.AddHours(-5); Id = 11; ProviderName = 'Live'; Message = 'old' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(1); RecordId = 2002; Id = 10; ProviderName = 'Live'; Message = 'm' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(3); RecordId = 9999; Id = 99; ProviderName = 'Fabricated'; Message = 'x' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(-5); RecordId = 100; Id = 11; ProviderName = 'Live'; Message = 'old' }
 )
 $evidence = Compare-WpdEventEvidence -ArtifactRows $artifact -LiveRows $live -Bound 5 -LookbackStartUtc $lookback
 [pscustomobject]@{
-    ordered = $evidence.orderedNewestFirst
     missing = @($evidence.missingFromLiveLog)
     missingCount = @($evidence.missingFromLiveLog).Count
+    contiguous = $evidence.contiguousInLive
+    orderMatchesLive = $evidence.orderMatchesLive
     outside = $evidence.rowsOutsideLookback
     bounded = ($evidence.artifactCount -le $evidence.bound)
+    headIndex = $evidence.headIndexInLive
 } | ConvertTo-Json -Compress
 """,
         EVENT_FUNCTIONS,
     )
 
-    assert payload["ordered"] is False
     assert payload["missingCount"] == 2
     assert "Fabricated" in payload["missing"][0]
+    assert payload["contiguous"] is False
     assert payload["outside"] == 1
     assert payload["bounded"] is True
+
+
+def test_event_evidence_follows_record_order_when_timestamps_invert():
+    # Mirrors the live run: the log's newest record carries a TimeCreated a few
+    # milliseconds EARLIER than the record after it, because each writer stamps
+    # the time at its own API call. The artifact must still follow record order,
+    # and the inversion must be reported as evidence, not as a failure.
+    payload = run_pwsh_json(
+        r"""
+$lookback = [datetime]::UtcNow.AddHours(-24)
+$live = @(
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(23).AddMilliseconds(100); RecordId = 101; Id = 7036; ProviderName = 'Service Control Manager'; Message = 'newer record, earlier stamp' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(23).AddMilliseconds(200); RecordId = 100; Id = 777; ProviderName = 'EventLog'; Message = 'older record, later stamp' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(22); RecordId = 99; Id = 7036; ProviderName = 'Service Control Manager'; Message = 'third' }
+)
+$artifact = @($live[0..1])
+$evidence = Compare-WpdEventEvidence -ArtifactRows $artifact -LiveRows $live -Bound 2 -LookbackStartUtc $lookback -CollectEndedUtc $lookback.AddHours(24)
+[pscustomobject]@{
+    inversions = $evidence.timeCreatedInversions
+    orderMatchesLive = $evidence.orderMatchesLive
+    contiguous = $evidence.contiguousInLive
+    liveDescending = $evidence.liveDescendingByRecordId
+    headIndex = $evidence.headIndexInLive
+    headAtCollectEnd = $evidence.liveHeadAtCollectEndUtc
+    newestArtifact = $evidence.newestArtifactUtc
+    artifactHeadStamp = [string]$artifact[0].TimeCreated
+} | ConvertTo-Json -Compress
+""",
+        EVENT_FUNCTIONS,
+    )
+
+    assert payload["inversions"] == 1, "the inverted TimeCreated column must be reported"
+    assert payload["orderMatchesLive"] is True, "record order is what the artifact has to follow"
+    assert payload["contiguous"] is True
+    assert payload["liveDescending"] is True
+    assert payload["headIndex"] == 0
+    # The artifact's own head stamp is OLDER than the live head stamp at
+    # collection end (the inversion), which is exactly why the harness head check
+    # carries a small slack instead of demanding exact equality.
+    assert payload["headAtCollectEnd"] >= payload["newestArtifact"]
+    assert payload["artifactHeadStamp"] < payload["headAtCollectEnd"]
+
+
+def test_event_head_position_rule_accepts_a_head_block_and_rejects_a_mid_log_block():
+    payload = run_pwsh_json(
+        r"""
+[pscustomobject]@{
+    atHead = Test-WpdEventHeadPosition -RecordsNewerThanHead 0 -RecordsSinceCollectionStart 3
+    appendedDuringRun = Test-WpdEventHeadPosition -RecordsNewerThanHead 2 -RecordsSinceCollectionStart 3
+    exactBoundary = Test-WpdEventHeadPosition -RecordsNewerThanHead 3 -RecordsSinceCollectionStart 3
+    midLog = Test-WpdEventHeadPosition -RecordsNewerThanHead 50 -RecordsSinceCollectionStart 3
+    noHeadRow = Test-WpdEventHeadPosition -RecordsNewerThanHead $null -RecordsSinceCollectionStart 3
+} | ConvertTo-Json -Compress
+""",
+        ["Test-WpdEventHeadPosition"],
+    )
+
+    assert payload["atHead"] is True
+    assert payload["appendedDuringRun"] is True, "records appended after the collector read are accounted for"
+    assert payload["exactBoundary"] is True
+    assert payload["midLog"] is False, "a summary from the middle of the log leaves unaccounted records"
+    assert payload["noHeadRow"] is False
+
+
+def test_event_evidence_detects_a_gap_and_a_reordered_block():
+    payload = run_pwsh_json(
+        r"""
+$lookback = [datetime]::UtcNow.AddHours(-24)
+$live = @(
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(23); RecordId = 5005; Id = 1; ProviderName = 'P'; Message = 'a' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(22); RecordId = 5004; Id = 2; ProviderName = 'P'; Message = 'b' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(21); RecordId = 5003; Id = 3; ProviderName = 'P'; Message = 'c' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(20); RecordId = 5002; Id = 4; ProviderName = 'P'; Message = 'd' }
+)
+# Rows 1 and 4 of the live sequence: a gap where rows 2 and 3 should be.
+$gapped = @($live[0], $live[3])
+$gappedEvidence = Compare-WpdEventEvidence -ArtifactRows $gapped -LiveRows $live -Bound 2 -LookbackStartUtc $lookback
+# The first three rows of the live sequence, reversed: a contiguous block in the
+# wrong order.
+$reordered = @($live[2], $live[1], $live[0])
+$reorderedEvidence = Compare-WpdEventEvidence -ArtifactRows $reordered -LiveRows $live -Bound 3 -LookbackStartUtc $lookback
+[pscustomobject]@{
+    gappedContiguous = $gappedEvidence.contiguousInLive
+    gappedOrderOk = $gappedEvidence.orderMatchesLive
+    reorderedContiguous = $reorderedEvidence.contiguousInLive
+    reorderedOrderOk = $reorderedEvidence.orderMatchesLive
+    reorderedMissing = @($reorderedEvidence.missingFromLiveLog).Count
+} | ConvertTo-Json -Compress
+""",
+        EVENT_FUNCTIONS,
+    )
+
+    assert payload["gappedContiguous"] is False, "a skipped row must break the block"
+    assert payload["gappedOrderOk"] is True
+    assert payload["reorderedMissing"] == 0
+    assert payload["reorderedOrderOk"] is False, "rows must not be reordered"
+    assert payload["reorderedContiguous"] is True
 
 
 def test_netstat_parser_keeps_tcp_and_udp_rows_and_ignores_headers():

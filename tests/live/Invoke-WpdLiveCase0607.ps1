@@ -194,21 +194,32 @@ function Get-WpdEventKey {
 
 function Compare-WpdEventEvidence {
     <#
-      Compares the collected event summary against rows an independent Event
+      Compares the collected event summary against the rows an independent Event
       Viewer query returns. Reports, without deciding:
         - how many artifact rows exist and what bound was requested,
-        - whether the artifact is ordered newest-first,
+        - whether the artifact's rows form a gap-free block that preserves the
+          live log's own newest-first (record) order,
+        - how far the artifact head sits behind the live log head at read time,
         - which artifact rows the live log does not contain,
-        - the artifact's own time span,
-        - how many artifact rows fall outside the 24-hour lookback.
-      A row count above the requested bound, or any artifact row the live log
-      cannot corroborate, is the failure signature this case exists to catch.
+        - the artifact's own time span and how many rows fall outside the
+          lookback,
+        - how often the artifact's TimeCreated column is not monotonic.
+      Record order and TimeCreated order are not the same thing on Windows: the
+      log orders records by insertion, while each writer stamps TimeCreated when
+      it calls the API, so a record written second can carry a time a few
+      milliseconds earlier. The artifact must follow the log's record order; its
+      TimeCreated column may show small inversions and that is a property of the
+      log, recorded here as evidence rather than treated as a defect.
+      A row count above the requested bound, a gap in the block, or any artifact
+      row the live log cannot corroborate is the failure signature this case
+      exists to catch.
     #>
     param(
         [AllowEmptyCollection()][object[]]$ArtifactRows = @(),
         [AllowEmptyCollection()][object[]]$LiveRows = @(),
         [int]$Bound = 0,
-        [AllowNull()]$LookbackStartUtc = $null
+        [AllowNull()]$LookbackStartUtc = $null,
+        [AllowNull()]$CollectEndedUtc = $null
     )
 
     $artifactKeys = New-Object System.Collections.ArrayList
@@ -221,14 +232,48 @@ function Compare-WpdEventEvidence {
         }
     }
 
-    $orderedNewestFirst = $true
+    $timeCreatedInversions = 0
     for ($index = 1; $index -lt $times.Count; $index++) {
-        if ($times[$index] -gt $times[$index - 1]) { $orderedNewestFirst = $false }
+        if ($times[$index] -gt $times[$index - 1]) { $timeCreatedInversions++ }
     }
 
-    $liveKeys = @{}
-    foreach ($row in @($LiveRows)) { $liveKeys[(Get-WpdEventKey -Row $row)] = $true }
-    $missing = @($artifactKeys | Where-Object { -not $liveKeys.ContainsKey($_) })
+    # Live sequence: one position per identity, and whether the sequence really
+    # is in reverse record order (the premise of the block check below).
+    $liveIndex = @{}
+    $liveDescendingByRecordId = $true
+    $previousRecordId = $null
+    $position = 0
+    $recordIdsPresent = $true
+    foreach ($row in @($LiveRows)) {
+        $key = Get-WpdEventKey -Row $row
+        if (-not $liveIndex.ContainsKey($key)) { $liveIndex[$key] = $position }
+        $position++
+        $recordId = Get-WpdProperty -InputObject $row -Name 'RecordId'
+        if ($null -eq $recordId) { $recordIdsPresent = $false; continue }
+        if ($null -ne $previousRecordId -and [int64]$recordId -gt [int64]$previousRecordId) { $liveDescendingByRecordId = $false }
+        $previousRecordId = $recordId
+    }
+
+    $indices = New-Object System.Collections.ArrayList
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($key in @($artifactKeys)) {
+        if ($liveIndex.ContainsKey($key)) { [void]$indices.Add([int]$liveIndex[$key]) }
+        else { [void]$missing.Add($key) }
+    }
+
+    $orderMatchesLive = $true
+    for ($index = 1; $index -lt $indices.Count; $index++) {
+        if ($indices[$index] -le $indices[$index - 1]) { $orderMatchesLive = $false }
+    }
+    # Contiguity is order independent: the artifact's rows have to occupy one
+    # unbroken run of positions in the live sequence. Order is checked separately
+    # above, so the two properties stay independent in the evidence.
+    $contiguousInLive = $false
+    if ($indices.Count -gt 0 -and $missing.Count -eq 0) {
+        $sortedIndices = @($indices | Sort-Object)
+        $contiguousInLive = (([int]$sortedIndices[$sortedIndices.Count - 1] - [int]$sortedIndices[0] + 1) -eq $sortedIndices.Count)
+    }
+    $headIndex = if ($indices.Count -gt 0) { $indices[0] } else { $null }
 
     $outsideLookback = 0
     $lookback = $null
@@ -241,18 +286,59 @@ function Compare-WpdEventEvidence {
         }
     }
 
+    # Newest live record that already existed when the collection finished: the
+    # artifact head has to reach at least that far back-to-front.
+    $liveHeadAtCollectEndUtc = $null
+    if ($null -ne $CollectEndedUtc) {
+        $collectEnd = $null
+        try { $collectEnd = ([datetime]$CollectEndedUtc).ToUniversalTime() } catch { $collectEnd = $null }
+        if ($null -ne $collectEnd) {
+            foreach ($row in @($LiveRows)) {
+                $rowTime = Get-WpdProperty -InputObject $row -Name 'TimeCreated'
+                if ($null -eq $rowTime) { continue }
+                try { $rowUtc = ([datetime]$rowTime).ToUniversalTime() } catch { continue }
+                if ($rowUtc -gt $collectEnd) { continue }
+                if ($null -eq $liveHeadAtCollectEndUtc -or $rowUtc -gt $liveHeadAtCollectEndUtc) { $liveHeadAtCollectEndUtc = $rowUtc }
+            }
+        }
+    }
+
     $sorted = @($times | Sort-Object)
     return [pscustomobject]@{
-        artifactCount        = @($ArtifactRows).Count
-        bound                = $Bound
-        liveRowCount         = @($LiveRows).Count
-        orderedNewestFirst   = $orderedNewestFirst
-        duplicateKeys        = (@($artifactKeys).Count - @($artifactKeys | Select-Object -Unique).Count)
-        missingFromLiveLog   = @($missing)
-        rowsOutsideLookback  = $outsideLookback
-        oldestArtifactUtc    = if ($sorted.Count -gt 0) { $sorted[0].ToString('yyyy-MM-ddTHH:mm:ss.fffZ') } else { $null }
-        newestArtifactUtc    = if ($sorted.Count -gt 0) { $sorted[$sorted.Count - 1].ToString('yyyy-MM-ddTHH:mm:ss.fffZ') } else { $null }
+        artifactCount             = @($ArtifactRows).Count
+        bound                     = $Bound
+        liveRowCount              = @($LiveRows).Count
+        liveDescendingByRecordId  = ($liveDescendingByRecordId -and $recordIdsPresent)
+        orderMatchesLive          = $orderMatchesLive
+        contiguousInLive          = $contiguousInLive
+        headIndexInLive           = $headIndex
+        timeCreatedInversions     = $timeCreatedInversions
+        duplicateKeys             = (@($artifactKeys).Count - @($artifactKeys | Select-Object -Unique).Count)
+        missingFromLiveLog        = @($missing)
+        rowsOutsideLookback       = $outsideLookback
+        liveHeadAtCollectEndUtc   = if ($null -ne $liveHeadAtCollectEndUtc) { $liveHeadAtCollectEndUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ') } else { $null }
+        oldestArtifactUtc         = if ($sorted.Count -gt 0) { $sorted[0].ToString('yyyy-MM-ddTHH:mm:ss.fffZ') } else { $null }
+        newestArtifactUtc         = if ($sorted.Count -gt 0) { $sorted[$sorted.Count - 1].ToString('yyyy-MM-ddTHH:mm:ss.fffZ') } else { $null }
     }
+}
+
+function Test-WpdEventHeadPosition {
+    <#
+      Head rule for the bounded event summary, expressed in record space:
+      the number of records newer than the summary's head can never exceed the
+      number of records written since the collection started. Nothing is newer
+      than the head of the log, so a summary that really starts at the head has
+      zero unaccounted records; a summary taken from the middle of the log
+      leaves every record between the true head and its own head unaccounted.
+      A null head count (no head row) is a failure.
+    #>
+    param(
+        [AllowNull()]$RecordsNewerThanHead,
+        [Parameter(Mandatory = $true)][int]$RecordsSinceCollectionStart
+    )
+
+    if ($null -eq $RecordsNewerThanHead) { return $false }
+    return ([int]$RecordsNewerThanHead -le $RecordsSinceCollectionStart)
 }
 
 function ConvertFrom-WpdNetstat {
@@ -1001,6 +1087,7 @@ function Get-WpdLiveEventRows {
             try { $message = $record.FormatDescription() } catch { $message = '[message text unavailable]' }
             [void]$buffer.Add([pscustomobject]@{
                 TimeCreated      = $record.TimeCreated
+                RecordId         = if ($null -ne $record.RecordId) { [int64]$record.RecordId } else { $null }
                 LevelDisplayName = $level
                 Id               = $record.Id
                 ProviderName     = $record.ProviderName
@@ -1015,23 +1102,6 @@ function Get-WpdLiveEventRows {
         $reader.Dispose()
     }
     return @($buffer)
-}
-
-function Get-WpdNewestEventCrossApi {
-    <# Newest record of a log read through Get-WinEvent (a different API than the reader above). #>
-    param([Parameter(Mandatory = $true)][string]$LogName)
-    try {
-        $event = Get-WinEvent -LogName $LogName -MaxEvents 1 -ErrorAction Stop
-        if ($null -eq $event) { return $null }
-        return [pscustomobject]@{
-            Id           = $event.Id
-            ProviderName = $event.ProviderName
-            TimeCreated  = $event.TimeCreated
-        }
-    }
-    catch {
-        return $null
-    }
 }
 
 function Get-WpdControlledEventRecord {
@@ -1557,9 +1627,9 @@ try {
             $liveRows = @()
             if ($artifactRows.Count -gt 0) {
                 $oldestArtifact = ($artifactRows | ForEach-Object { [datetime]$_.TimeCreated } | Sort-Object | Select-Object -First 1)
-                $liveRows = @(Get-WpdLiveEventRows -LogName 'System' -StartTime $lookbackStart -MaxRows 2000 -MinimumUtc $oldestArtifact)
+                $liveRows = @(Get-WpdLiveEventRows -LogName 'System' -StartTime $lookbackStart -MaxRows 2000 -MinimumUtc ($oldestArtifact.AddSeconds(-5)))
             }
-            $eventEvidence = Compare-WpdEventEvidence -ArtifactRows $artifactRows -LiveRows $liveRows -Bound $requestedBound -LookbackStartUtc $lookbackStart
+            $eventEvidence = Compare-WpdEventEvidence -ArtifactRows $artifactRows -LiveRows $liveRows -Bound $requestedBound -LookbackStartUtc $lookbackStart -CollectEndedUtc $collectEndedAt
             $eventComparisonFile = Join-Path $logsDirectory "$Case-$Label-event-comparison.json"
             Write-WpdJsonFile -InputObject ([ordered]@{
                 case                = $Case
@@ -1576,34 +1646,42 @@ try {
                 -Observed ("$($eventEvidence.artifactCount) rows (bound $requestedBound)") -Outcome ($eventEvidence.artifactCount -le $requestedBound)
             Add-WpdAssertion -Name 'bounded-truncation-exercised' -Expected 'the live 24h log holds more records than the bound, so the summary is a strict subset and the bound really truncated' `
                 -Observed ("live24h=$liveEventCount artifact=$($eventEvidence.artifactCount) bound=$requestedBound") -Outcome ($liveEventCount -gt $requestedBound)
-            Add-WpdAssertion -Name 'event-summary-newest-first' -Expected 'artifact rows are ordered newest-first' `
-                -Observed $eventEvidence.orderedNewestFirst -Outcome ($eventEvidence.orderedNewestFirst)
-            # Identical rows (same id, provider, second and message) are recorded
-            # as evidence but are not a failure: a busy host legitimately logs
-            # repeated identical events, and the bound only has to be honoured.
             Add-WpdAssertion -Name 'every-artifact-event-exists-in-live-system-log' -Expected 'each collected row is corroborated by an independent Event Viewer read of the live System log' `
                 -Observed $(if ($eventEvidence.missingFromLiveLog.Count -eq 0) { "all $($eventEvidence.artifactCount) rows corroborated" } else { "missing: $($eventEvidence.missingFromLiveLog -join ', ')" }) `
                 -Outcome ($eventEvidence.missingFromLiveLog.Count -eq 0)
+            Add-WpdAssertion -Name 'event-summary-is-a-gap-free-newest-block' -Expected 'the artifact rows sit in the live log as one gap-free block that preserves the log record order (a skipped or invented row would break it)' `
+                -Observed ("contiguous=$($eventEvidence.contiguousInLive) orderMatchesLive=$($eventEvidence.orderMatchesLive) liveDescendingByRecordId=$($eventEvidence.liveDescendingByRecordId) headIndex=$($eventEvidence.headIndexInLive)") `
+                -Outcome ($eventEvidence.contiguousInLive -and $eventEvidence.orderMatchesLive -and $eventEvidence.liveDescendingByRecordId)
             Add-WpdAssertion -Name 'artifact-events-inside-24h-lookback' -Expected 'no collected row predates the 24h lookback the collector declares' `
-                -Observed ("rowsOutsideLookback=$($eventEvidence.rowsOutsideLookback) oldest=$($eventEvidence.oldestArtifactUtc) newest=$($eventEvidence.newestArtifactUtc)") `
+                -Observed ("rowsOutsideLookback=$($eventEvidence.rowsOutsideLookback) oldest=$($eventEvidence.oldestArtifactUtc) newest=$($eventEvidence.newestArtifactUtc) timeCreatedInversions=$($eventEvidence.timeCreatedInversions)") `
                 -Outcome ($eventEvidence.rowsOutsideLookback -eq 0)
 
-            $newestCrossApi = Get-WpdNewestEventCrossApi -LogName 'System'
-            $newestArtifactRow = $null
-            $newestArtifactTime = $null
+            # Head check: the summary must reach the log head that existed when
+            # the collection ran. The rule is phrased in record space, where the
+            # log is exact: the number of records that sit newer than the
+            # summary's head can never exceed the number of records written since
+            # the collection started. A summary taken from the middle of the log
+            # leaves that many unaccounted records behind and fails here. This
+            # avoids any wall-clock race between the collector's own read and the
+            # end of the run, and it tolerates the log's TimeCreated inversions.
+            $artifactHeadRow = $null
+            $artifactHeadTime = $null
             if ($artifactRows.Count -gt 0) {
-                $newestArtifactRow = @($artifactRows | Sort-Object -Property @{ Expression = { [datetime]$_.TimeCreated } } -Descending)[0]
-                $newestArtifactTime = ([datetime]$newestArtifactRow.TimeCreated).ToUniversalTime()
+                $artifactHeadRow = @($artifactRows)[0]
+                try { $artifactHeadTime = ([datetime]$artifactHeadRow.TimeCreated).ToUniversalTime() } catch { $artifactHeadTime = $null }
             }
-            # Anchor check through a second event API: the live log must be at
-            # least as new as the summary's newest row (newer traffic after the
-            # collection is normal), and the summary's newest row itself is
-            # corroborated by the windowed row comparison above.
-            $crossApiAnchored = ($null -ne $newestCrossApi -and $null -ne $newestArtifactTime -and
-                ([datetime]$newestCrossApi.TimeCreated).ToUniversalTime() -ge $newestArtifactTime)
-            Add-WpdAssertion -Name 'artifact-anchored-to-live-log-through-second-api' -Expected 'the live System log read through Get-WinEvent is at least as new as the summary newest row, so the bounded summary is anchored at the live log head' `
-                -Observed $(if ($newestArtifactRow -and $newestCrossApi) { "artifact newest=$(Get-WpdUtcStamp -Value $newestArtifactRow.TimeCreated) ($($newestArtifactRow.ProviderName)/$($newestArtifactRow.Id)); live newest=$(Get-WpdUtcStamp -Value $newestCrossApi.TimeCreated) ($($newestCrossApi.ProviderName)/$($newestCrossApi.Id))" } else { 'one side unavailable' }) `
-                -Outcome $crossApiAnchored
+            $recordsSinceCollectStart = 0
+            $collectStartCompare = $collectStartedAt.ToUniversalTime().AddSeconds(-5)
+            foreach ($row in @($liveRows)) {
+                $rowTime = Get-WpdProperty -InputObject $row -Name 'TimeCreated'
+                if ($null -eq $rowTime) { continue }
+                try { $rowUtc = ([datetime]$rowTime).ToUniversalTime() } catch { continue }
+                if ($rowUtc -ge $collectStartCompare) { $recordsSinceCollectStart++ }
+            }
+            $headReaches = Test-WpdEventHeadPosition -RecordsNewerThanHead $eventEvidence.headIndexInLive -RecordsSinceCollectionStart $recordsSinceCollectStart
+            Add-WpdAssertion -Name 'artifact-head-reaches-the-live-log-head' -Expected 'no more records sit newer than the summary head than were written since the collection started (a summary taken from the middle of the log leaves exactly that many unaccounted records)' `
+                -Observed $(if ($null -ne $artifactHeadTime) { "recordsNewerThanHead=$($eventEvidence.headIndexInLive); recordsWrittenSinceCollectionStart=$recordsSinceCollectStart; artifact head=$(Get-WpdUtcStamp -Value $artifactHeadRow.TimeCreated) ($($artifactHeadRow.ProviderName)/$($artifactHeadRow.Id)); newestSystemStampAtCollectionEnd=$($eventEvidence.liveHeadAtCollectEndUtc)" } else { 'no artifact head row' }) `
+                -Outcome $headReaches
 
             $controlledRetained = $false
             if ($controlledEvent.record -and $artifactRows.Count -gt 0) {
@@ -1627,8 +1705,9 @@ try {
                 -Outcome ($stateDeltas.Count -eq 0)
 
             if ($run.exitCode -eq 0 -and $eventEvidence.artifactCount -gt 0 -and $eventEvidence.artifactCount -le $requestedBound -and
-                $eventEvidence.missingFromLiveLog.Count -eq 0 -and $eventEvidence.orderedNewestFirst -and $eventEvidence.rowsOutsideLookback -eq 0 -and
-                $stateDeltas.Count -eq 0 -and $unlistedFiles.Count -eq 0 -and $artifactsOutside.Count -eq 0 -and $crossApiAnchored -and
+                $eventEvidence.missingFromLiveLog.Count -eq 0 -and $eventEvidence.contiguousInLive -and $eventEvidence.orderMatchesLive -and
+                $eventEvidence.liveDescendingByRecordId -and $eventEvidence.rowsOutsideLookback -eq 0 -and $headReaches -and
+                $stateDeltas.Count -eq 0 -and $unlistedFiles.Count -eq 0 -and $artifactsOutside.Count -eq 0 -and
                 ($controlledRetained -or ($null -ne $displacement -and $displacement -gt $requestedBound))) {
                 $caseOutcome = 'PASS'
             }

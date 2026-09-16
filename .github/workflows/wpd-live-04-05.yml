@@ -1,0 +1,233 @@
+name: WPD Live Cases 04-05
+
+# Execution harness for docs/windows-live-test-matrix.md WPD-04 and WPD-05.
+#
+# Environment actually used (recorded in every result JSON): the owner's
+# GitHub-hosted Windows runner VMs (windows-2022 / windows-2025), i.e. real
+# Windows Server SKUs provisioned and started by GitHub under the repository
+# owner's account. No agent provisions or configures a VM for this workflow.
+# As with the existing wpd-live-gates job in ci.yml, the runner is not a
+# human-started Windows 10/11 *client*, so a client-SKU spot check stays an
+# owner activity; everything else in the matrix preconditions is verified here.
+#
+# WPD-05 needs a standard (non-admin) account. The harness creates a disposable
+# standard local user on the runner and records that as a harness-side change
+# (it is the test rig, not the toolkit).
+#
+# Each case runs twice per OS: against the build under test (the pushed commit /
+# PR head) and against the published v1.0.0 release asset, whose .sha256 is
+# verified before use (matrix precondition "Verify the script hash against the
+# release asset before testing"). A case step's conclusion is its PASS/FAIL.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  wpd-cases-04-05:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - name: Check out the build under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Record host and build under test
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'C:\WPD'
+          New-Item -ItemType Directory -Force -Path (Join-Path $base 'results'), (Join-Path $base 'logs') | Out-Null
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE 'src\Invoke-WindowsPerformanceDiagnostics.ps1'
+          if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) { throw "source script not found: $scriptPath" }
+          $os = Get-CimInstance -ClassName Win32_OperatingSystem
+          $wps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $commit = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+          $short = (& git -C $env:GITHUB_WORKSPACE rev-parse --short HEAD).Trim()
+          $record = [ordered]@{
+            event                 = $env:GITHUB_EVENT_NAME
+            ref                   = $env:GITHUB_REF
+            checkedOutCommit      = $commit
+            checkedOutShort       = $short
+            pullRequestHeadSha    = '${{ github.event.pull_request.head.sha }}'
+            osCaption             = $os.Caption
+            osVersion             = $os.Version
+            osBuildNumber         = $os.BuildNumber
+            osProductType         = $os.ProductType
+            runnerImage           = $env:ImageOS
+            runnerName            = $env:RUNNER_NAME
+            machineIdentifier     = $env:COMPUTERNAME
+            collectorRuntime      = $wps
+            collectorRuntimeVersion = (& $wps -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')
+            sourceScript          = $scriptPath
+            sourceScriptSha256    = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash
+            harnessElevated       = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            recordedAtUtc         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          }
+          $recordPath = Join-Path $base 'results\build-under-test.json'
+          $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $recordPath -Encoding utf8
+          Get-Content -LiteralPath $recordPath | ForEach-Object { Write-Output $_ }
+          "short=$short" >> $env:GITHUB_OUTPUT
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "source_script=$scriptPath" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Stage the published v1.0.0 release asset and verify its hash
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'C:\WPD'
+          $releaseDir = Join-Path $base 'toolkit-release'
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          $tag = 'v1.0.0'
+          $zipName = 'windows-performance-diagnostics-toolkit-1.0.0.zip'
+          $shaName = 'windows-performance-diagnostics-toolkit-1.0.0.sha256'
+          $baseUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag"
+          $zipPath = Join-Path $base $zipName
+          $shaPath = Join-Path $base $shaName
+          try {
+            Invoke-WebRequest -Uri "$baseUrl/$zipName" -OutFile $zipPath -UseBasicParsing
+            Invoke-WebRequest -Uri "$baseUrl/$shaName" -OutFile $shaPath -UseBasicParsing
+          }
+          catch {
+            Write-Output "::warning::release asset download failed: $($_.Exception.Message)"
+            "ok=false" >> $env:GITHUB_OUTPUT
+            "reason=download failed: $($_.Exception.Message)" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $expected = ((Get-Content -LiteralPath $shaPath -Raw).Trim() -split '\s+')[0]
+          $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+          $verified = ($expected -ieq $actual)
+          Write-Output "release zip: $actual"
+          Write-Output "release .sha256 asset: $expected"
+          if (-not $verified) {
+            Write-Output "::error::release asset hash mismatch (asset=$expected, downloaded=$actual)"
+            "ok=false" >> $env:GITHUB_OUTPUT
+            "reason=hash mismatch" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $releaseDir -Force
+          $script = @(Get-ChildItem -LiteralPath $releaseDir -Recurse -Filter 'Invoke-WindowsPerformanceDiagnostics.ps1' -File |
+            Where-Object { $_.Directory.Name -eq 'src' } | Select-Object -First 1)
+          if ($script.Count -eq 0) {
+            Write-Output "::warning::release zip extracted but src\Invoke-WindowsPerformanceDiagnostics.ps1 is absent (Defender/MOTW removal is WPD-11 territory)"
+            "ok=false" >> $env:GITHUB_OUTPUT
+            "reason=release script absent after extraction" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $motw = Test-Path -LiteralPath "$($script[0].FullName):Zone.Identifier"
+          # MOTW quarantine behavior is case WPD-11; here the zone marker is
+          # recorded and cleared so WPD-04/05 measure collection safety only.
+          Get-ChildItem -LiteralPath $releaseDir -Recurse -File | Unblock-File
+          $recordPath = Join-Path $base 'results\release-asset.json'
+          [ordered]@{
+            tag                 = $tag
+            assetName           = $zipName
+            downloadedZipSha256 = $actual
+            publishedSha256     = $expected
+            hashVerified        = $verified
+            extractedScript     = $script[0].FullName
+            extractedSha256     = (Get-FileHash -LiteralPath $script[0].FullName -Algorithm SHA256).Hash
+            motwBeforeUnblock   = $motw
+            recordedAtUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $recordPath -Encoding utf8
+          Get-Content -LiteralPath $recordPath | ForEach-Object { Write-Output $_ }
+          "ok=true" >> $env:GITHUB_OUTPUT
+          "script=$($script[0].FullName)" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: WPD-04 - manifest hashes (build under test ${{ steps.build.outputs.short }})
+        if: always()
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.build.outputs.source_script }}
+        run: |
+          $label = 'source-${{ steps.build.outputs.short }}'
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0405.ps1" -Case WPD-04 -ToolkitScript $env:WPD_TOOLKIT -Label $label
+          exit $LASTEXITCODE
+
+      - name: WPD-05 - standard (non-admin) account (build under test ${{ steps.build.outputs.short }})
+        if: always()
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.build.outputs.source_script }}
+        run: |
+          $label = 'source-${{ steps.build.outputs.short }}'
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0405.ps1" -Case WPD-05 -ToolkitScript $env:WPD_TOOLKIT -Label $label
+          exit $LASTEXITCODE
+
+      - name: WPD-04 - manifest hashes (published release v1.0.0)
+        if: always() && steps.release.outputs.ok == 'true'
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.release.outputs.script }}
+        run: |
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0405.ps1" -Case WPD-04 -ToolkitScript $env:WPD_TOOLKIT -Label 'release-v1.0.0'
+          exit $LASTEXITCODE
+
+      - name: WPD-05 - standard (non-admin) account (published release v1.0.0)
+        if: always() && steps.release.outputs.ok == 'true'
+        shell: pwsh
+        env:
+          WPD_TOOLKIT: ${{ steps.release.outputs.script }}
+        run: |
+          & "$env:GITHUB_WORKSPACE\tests\live\Invoke-WpdLiveCase0405.ps1" -Case WPD-05 -ToolkitScript $env:WPD_TOOLKIT -Label 'release-v1.0.0'
+          exit $LASTEXITCODE
+
+      - name: Summarize live-case verdicts
+        if: always()
+        shell: pwsh
+        run: |
+          $results = @(Get-ChildItem -LiteralPath 'C:\WPD\results' -Filter 'WPD-*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)
+          if ($results.Count -eq 0) {
+            Write-Output "::warning::no live-case result JSON was produced"
+            "## WPD-04/05 live cases`n`nNo result JSON was produced (the harness did not reach its verdict stage)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            exit 0
+          }
+          $lines = @('## WPD-04/05 live cases', '', '| Case | Build | Verdict | Assertions | Toolkit SHA-256 | Host |', '|---|---|---|---|---|---|')
+          foreach ($file in $results) {
+            try {
+              $r = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+              $assertionCount = @($r.assertions).Count
+              $failCount = @($r.failures).Count
+              $sha = [string]$r.toolkit.sha256
+              $shortSha = if ($sha.Length -ge 12) { $sha.Substring(0, 12) } else { $sha }
+              $lines += ('| {0} | {1} | {2} | {3} ({4} failed) | {5} | {6} build {7} |' -f `
+                $r.case, $r.label, $r.verdict, $assertionCount, $failCount, $shortSha, $r.environment.osCaption, $r.environment.osBuildNumber)
+              if ($r.verdict -ne 'PASS') {
+                Write-Output "::error::$($r.case) [$($r.label)] FAILED: $(@($r.failures) -join ' | ')"
+              }
+              else {
+                Write-Output "$($r.case) [$($r.label)] PASS ($assertionCount assertions)"
+              }
+            }
+            catch {
+              $lines += ('| ? | {0} | UNREADABLE | - | - | - |' -f $file.Name)
+            }
+          }
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines | ForEach-Object { Write-Output $_ }
+          exit 0
+
+      - name: Upload live-case evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpd-live-04-05-${{ matrix.os }}
+          if-no-files-found: warn
+          path: |
+            C:\WPD\results
+            C:\WPD\logs
+            C:\WPD\WPD-04\*\diagnostic-manifest.json
+            C:\WPD\WPD-05\*\diagnostic-manifest.json

@@ -260,6 +260,7 @@ $reorderedEvidence = Compare-WpdEventEvidence -ArtifactRows $reordered -LiveRows
 [pscustomobject]@{
     gappedContiguous = $gappedEvidence.contiguousInLive
     gappedOrderOk = $gappedEvidence.orderMatchesLive
+    gappedMissing = @($gappedEvidence.missingFromLiveLog).Count
     reorderedContiguous = $reorderedEvidence.contiguousInLive
     reorderedOrderOk = $reorderedEvidence.orderMatchesLive
     reorderedMissing = @($reorderedEvidence.missingFromLiveLog).Count
@@ -270,9 +271,42 @@ $reorderedEvidence = Compare-WpdEventEvidence -ArtifactRows $reordered -LiveRows
 
     assert payload["gappedContiguous"] is False, "a skipped row must break the block"
     assert payload["gappedOrderOk"] is True
-    assert payload["reorderedMissing"] == 0
+    assert payload["gappedMissing"] == 0
     assert payload["reorderedOrderOk"] is False, "rows must not be reordered"
-    assert payload["reorderedContiguous"] is True
+    assert payload["reorderedMissing"] > 0, "reordering shows up as rows the ordered walk cannot place"
+
+
+def test_event_evidence_matches_identical_rows_one_position_each():
+    # A service can log the same message twice inside the same second: two
+    # artifact rows share an identity and must each consume their own live
+    # position instead of collapsing onto the first match.
+    payload = run_pwsh_json(
+        r"""
+$lookback = [datetime]::UtcNow.AddHours(-24)
+$stamp = $lookback.AddHours(23)
+$live = @(
+    [pscustomobject]@{ TimeCreated = $stamp; RecordId = 3003; Id = 7036; ProviderName = 'SCM'; Message = 'same' }
+    [pscustomobject]@{ TimeCreated = $stamp; RecordId = 3002; Id = 7036; ProviderName = 'SCM'; Message = 'same' }
+    [pscustomobject]@{ TimeCreated = $lookback.AddHours(22); RecordId = 3001; Id = 1; ProviderName = 'Other'; Message = 'x' }
+)
+$artifact = @($live[0], $live[1])
+$evidence = Compare-WpdEventEvidence -ArtifactRows $artifact -LiveRows $live -Bound 2 -LookbackStartUtc $lookback
+[pscustomobject]@{
+    orderMatchesLive = $evidence.orderMatchesLive
+    contiguous = $evidence.contiguousInLive
+    missing = @($evidence.missingFromLiveLog).Count
+    duplicates = $evidence.duplicateKeys
+    headIndex = $evidence.headIndexInLive
+} | ConvertTo-Json -Compress
+""",
+        EVENT_FUNCTIONS,
+    )
+
+    assert payload["orderMatchesLive"] is True
+    assert payload["contiguous"] is True
+    assert payload["missing"] == 0
+    assert payload["duplicates"] == 1, "the repeated identity is still reported as evidence"
+    assert payload["headIndex"] == 0
 
 
 def test_netstat_parser_keeps_tcp_and_udp_rows_and_ignores_headers():

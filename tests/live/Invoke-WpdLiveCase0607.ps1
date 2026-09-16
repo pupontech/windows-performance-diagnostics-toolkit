@@ -237,34 +237,49 @@ function Compare-WpdEventEvidence {
         if ($times[$index] -gt $times[$index - 1]) { $timeCreatedInversions++ }
     }
 
-    # Live sequence: one position per identity, and whether the sequence really
-    # is in reverse record order (the premise of the block check below).
-    $liveIndex = @{}
+    # Live sequence: the identity of every live row in record order, and whether
+    # the sequence really is in reverse record order (the premise of the block
+    # check below).
+    $liveKeys = New-Object System.Collections.ArrayList
     $liveDescendingByRecordId = $true
     $previousRecordId = $null
-    $position = 0
     $recordIdsPresent = $true
     foreach ($row in @($LiveRows)) {
-        $key = Get-WpdEventKey -Row $row
-        if (-not $liveIndex.ContainsKey($key)) { $liveIndex[$key] = $position }
-        $position++
+        [void]$liveKeys.Add((Get-WpdEventKey -Row $row))
         $recordId = Get-WpdProperty -InputObject $row -Name 'RecordId'
         if ($null -eq $recordId) { $recordIdsPresent = $false; continue }
         if ($null -ne $previousRecordId -and [int64]$recordId -gt [int64]$previousRecordId) { $liveDescendingByRecordId = $false }
         $previousRecordId = $recordId
     }
 
+    <#
+      Match the artifact against the live sequence as an ordered subsequence,
+      consuming live positions monotonically. Two identical events inside the
+      same second are legitimate on Windows (a service logging the same message
+      twice), so each artifact row must consume its OWN live position instead of
+      all of them collapsing onto the first match - which is what a plain
+      identity lookup does. With a monotone walk a reordered block cannot be
+      matched (the rows it needs sit behind the cursor) and a gap shows up in the
+      contiguity check.
+    #>
     $indices = New-Object System.Collections.ArrayList
     $missing = New-Object System.Collections.ArrayList
+    $cursor = 0
     foreach ($key in @($artifactKeys)) {
-        if ($liveIndex.ContainsKey($key)) { [void]$indices.Add([int]$liveIndex[$key]) }
-        else { [void]$missing.Add($key) }
+        $matched = -1
+        for ($position = $cursor; $position -lt $liveKeys.Count; $position++) {
+            if ([string]$liveKeys[$position] -eq [string]$key) { $matched = $position; break }
+        }
+        if ($matched -ge 0) {
+            [void]$indices.Add($matched)
+            $cursor = $matched + 1
+        }
+        else {
+            [void]$missing.Add($key)
+        }
     }
 
-    $orderMatchesLive = $true
-    for ($index = 1; $index -lt $indices.Count; $index++) {
-        if ($indices[$index] -le $indices[$index - 1]) { $orderMatchesLive = $false }
-    }
+    $orderMatchesLive = ($missing.Count -eq 0)
     # Contiguity is order independent: the artifact's rows have to occupy one
     # unbroken run of positions in the live sequence. Order is checked separately
     # above, so the two properties stay independent in the evidence.
@@ -1627,7 +1642,7 @@ try {
             $liveRows = @()
             if ($artifactRows.Count -gt 0) {
                 $oldestArtifact = ($artifactRows | ForEach-Object { [datetime]$_.TimeCreated } | Sort-Object | Select-Object -First 1)
-                $liveRows = @(Get-WpdLiveEventRows -LogName 'System' -StartTime $lookbackStart -MaxRows 2000 -MinimumUtc ($oldestArtifact.AddSeconds(-5)))
+                $liveRows = @(Get-WpdLiveEventRows -LogName 'System' -StartTime $lookbackStart -MaxRows 2000 -MinimumUtc ($oldestArtifact.AddSeconds(-60)))
             }
             $eventEvidence = Compare-WpdEventEvidence -ArtifactRows $artifactRows -LiveRows $liveRows -Bound $requestedBound -LookbackStartUtc $lookbackStart -CollectEndedUtc $collectEndedAt
             $eventComparisonFile = Join-Path $logsDirectory "$Case-$Label-event-comparison.json"

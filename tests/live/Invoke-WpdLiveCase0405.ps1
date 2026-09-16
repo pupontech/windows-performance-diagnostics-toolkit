@@ -354,10 +354,45 @@ function New-WpdStandardTestUser {
     }
 }
 
+# Runs a probe command as the standard test account and returns its raw output.
+# This is the positive control for "the account really is a non-admin user":
+# whoami /user, /groups and /priv report the account the process actually ran as
+# and the integrity level of its token.
+function Invoke-WpdStandardUserProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$UserName,
+        [Parameter(Mandatory = $true)][string]$Password,
+        [int]$Timeout = 60
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $psi.Arguments = '/c "whoami /user & whoami /groups & whoami /priv"'
+    $psi.UseShellExecute = $false
+    $psi.UserName = $UserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = (ConvertTo-SecureString $Password -AsPlainText -Force)
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = $env:SystemRoot
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($Timeout * 1000)) {
+        try { $process.Kill() } catch { }
+        throw "standard-user probe did not finish within ${Timeout}s"
+    }
+    $stdoutTask.Wait(5000) | Out-Null
+    $stderrTask.Wait(5000) | Out-Null
+    return [pscustomobject]@{
+        exitCode = $process.ExitCode
+        output   = ($stdoutTask.Result + $stderrTask.Result)
+    }
+}
+
 function Grant-WpdBatchLogonRight {
     param([Parameter(Mandatory = $true)][string]$UserName)
-
-    $sections = New-Object System.Collections.ArrayList
     $sid = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
     $export = Join-Path $StagingRoot 'harness-sec-export.cfg'
     $apply = Join-Path $StagingRoot 'harness-sec-apply.cfg'
@@ -408,16 +443,32 @@ function Start-WpdStandardUserCollection {
     # identity.
     $ownerSamples = New-Object System.Collections.ArrayList
     $descendantSamples = New-Object System.Collections.ArrayList
+    $samplingNotes = New-Object System.Collections.ArrayList
     $deadline = (Get-Date).AddSeconds($Timeout)
     $lastOwner = $null
     while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
+        # Primary: Get-Process -IncludeUserName (elevated caller sees the owner).
+        try {
+            $live = Get-Process -Id $process.Id -IncludeUserName -ErrorAction Stop
+            $ownerName = [string]$live.UserName
+            if ($ownerName -and $ownerName -ne $lastOwner) {
+                [void]$ownerSamples.Add([pscustomobject]@{ atUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); pid = $process.Id; owner = $ownerName; source = 'Get-Process' })
+                $lastOwner = $ownerName
+            }
+        }
+        catch {
+            $note = "Get-Process sampling: $($_.Exception.Message)"
+            if (-not $samplingNotes.Contains($note)) { [void]$samplingNotes.Add($note) }
+        }
+
+        # Secondary: CIM ownership sample (also catches descendants).
         try {
             $instance = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction Stop
-            if ($instance) {
+            if ($instance -and -not $lastOwner) {
                 $owner = $instance.GetOwner()
                 $ownerName = '{0}\{1}' -f $owner.Domain, $owner.User
-                if ($ownerName -ne $lastOwner) {
-                    [void]$ownerSamples.Add([pscustomobject]@{ atUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); pid = $process.Id; owner = $ownerName })
+                if ($ownerName) {
+                    [void]$ownerSamples.Add([pscustomobject]@{ atUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); pid = $process.Id; owner = $ownerName; source = 'Win32_Process.GetOwner' })
                     $lastOwner = $ownerName
                 }
             }
@@ -429,8 +480,10 @@ function Start-WpdStandardUserCollection {
             }
         }
         catch {
-            # sampling is best-effort evidence; a transient CIM failure is not a case failure
+            $note = "CIM sampling: $($_.Exception.Message)"
+            if (-not $samplingNotes.Contains($note)) { [void]$samplingNotes.Add($note) }
         }
+
         if ($process.WaitForExit(500)) { break }
     }
 
@@ -450,6 +503,7 @@ function Start-WpdStandardUserCollection {
         pid               = $process.Id
         ownerSamples      = @($ownerSamples)
         descendants       = @($descendantSamples | Select-Object -Unique -Property pid, name, owner)
+        samplingNotes     = @($samplingNotes)
         stdout            = $stdout
         stderr            = $stderr
         logPath           = $LogPath
@@ -554,6 +608,45 @@ function Get-WpdCollectionErrorRecords {
     return $rows
 }
 
+<#
+  Declarations the build makes about itself: v1.0.x builds carry a `safety`
+  block, later builds add a `privacy` block. Both are recorded as evidence and
+  asserted against their own claims (they are declarations, not proof - the
+  independent proof is the artifact owner, the strict configuration fingerprint,
+  the unlisted-file check and the absence of a completed remote block).
+#>
+function Get-WpdSafetyDeclarationCheck {
+    param($Manifest)
+
+    $parts = @()
+    $ok = $true
+    $sawAny = $false
+
+    if ($null -ne $Manifest.safety) {
+        $sawAny = $true
+        $s = $Manifest.safety
+        $parts += ('safety(localOnly={0},readOnly={1},requiresExplicitCollectionConsent={2},automaticUpload={3},automaticRemediation={4},automaticLogClearing={5})' -f `
+            $s.localOnly, $s.readOnly, $s.requiresExplicitCollectionConsent, $s.automaticUpload, $s.automaticRemediation, $s.automaticLogClearing)
+        $ok = $ok -and ($s.localOnly -eq $true) -and ($s.readOnly -eq $true) -and ($s.requiresExplicitCollectionConsent -eq $true) -and `
+            ($s.automaticUpload -eq $false) -and ($s.automaticRemediation -eq $false) -and ($s.automaticLogClearing -eq $false)
+    }
+
+    if ($null -ne $Manifest.privacy) {
+        $sawAny = $true
+        $p = $Manifest.privacy
+        $parts += ('privacy(secretsCollected={0},redactionApplied={1},level={2},requestedLevel={3})' -f `
+            $p.secretsCollected, $p.redactionApplied, $p.level, $p.requestedLevel)
+        $ok = $ok -and ($p.secretsCollected -eq $false)
+    }
+
+    if (-not $sawAny) {
+        $parts += 'no safety or privacy declaration block present'
+        $ok = $false
+    }
+
+    return [pscustomobject]@{ ok = $ok; observed = ($parts -join ' ') }
+}
+
 #endregion
 
 #region case bodies --------------------------------------------------------------
@@ -653,9 +746,9 @@ try {
             $collectionErrors = @(Get-WpdCollectionErrorRecords -Manifest $manifest)
             Write-Output ("collectionErrors: {0}" -f $(if ($collectionErrors.Count -eq 0) { 'none' } else { ($collectionErrors | ForEach-Object { "$($_.stage)=$($_.message)" }) -join ' ; ' }))
 
-            $secretsCollected = $null
-            if ($null -ne $manifest.privacy) { $secretsCollected = $manifest.privacy.secretsCollected }
-            Add-WpdAssertion -Name 'privacy-secrets-collected-false' -Expected '$false' -Observed $secretsCollected -Outcome ($secretsCollected -eq $false)
+            $safetyCheck = Get-WpdSafetyDeclarationCheck -Manifest $manifest
+            Add-WpdAssertion -Name 'safety-declarations-hold' -Expected 'localOnly/readOnly true, automaticUpload/Remediation/LogClearing false, explicit consent required, and secretsCollected false when the build declares a privacy block' `
+                -Observed $safetyCheck.observed -Outcome $safetyCheck.ok
 
             $remoteStatus = 'absent'
             if ($null -ne $manifest.PSObject.Properties['remote'] -and $null -ne $manifest.remote) { $remoteStatus = [string]$manifest.remote.status }
@@ -669,7 +762,7 @@ try {
 
             if ($collection.exitCode -eq 0 -and $artifactEntries.Count -ge 2 -and $badHash.Count -eq 0 -and $badSize.Count -eq 0 -and
                 $missingOnDisk.Count -eq 0 -and $sizeMismatch.Count -eq 0 -and $hashMismatch.Count -eq 0 -and $unlistedFiles.Count -eq 0 -and
-                $secretsCollected -eq $false -and $remoteStatus -ne 'completed' -and $fingerprintDeltas.Count -eq 0) {
+                $safetyCheck.ok -and $remoteStatus -ne 'completed' -and $fingerprintDeltas.Count -eq 0) {
                 $caseOutcome = 'PASS'
             }
         }
@@ -692,8 +785,22 @@ try {
 
         $inUsers = Test-WpdLocalUserGroupMembership -UserName $standardUserName -GroupName 'Users'
         $inAdmins = Test-WpdLocalUserGroupMembership -UserName $standardUserName -GroupName 'Administrators'
-        Add-WpdAssertion -Name 'precondition-standard-account' -Expected 'test account is a member of Users and not of Administrators' `
-            -Observed ("Users=$inUsers Administrators=$inAdmins") -Outcome ($inUsers -and -not $inAdmins)
+
+        # Positive control: run whoami as the standard account before the case.
+        # (An ADSI-created account's primary group is Users, so it does not appear
+        # in the Users group's member list; the token itself is the evidence.)
+        $probe = Invoke-WpdStandardUserProbe -UserName $standardUserName -Password $standardUserPassword
+        $probeRunsAsUser = ($probe.output -match [regex]::Escape($standardUserName))
+        $probeHasAdminSid = ($probe.output -match 'S-1-5-32-544')
+        $probeElevated = ($probe.output -match 'High Mandatory Level')
+        $probeIntegrity = (@($probe.output -split "`r?`n" | Where-Object { $_ -match 'Mandatory Label' }) -join ' ').Trim()
+        $probeUserLine = (@($probe.output -split "`r?`n" | Where-Object { $_ -match [regex]::Escape($standardUserName) } | Select-Object -First 1) -join ' ').Trim()
+        Add-WpdAssertion -Name 'precondition-standard-account-token' `
+            -Expected 'the test account token runs as the account, has no Administrators SID, and is not a high-integrity (elevated) token' `
+            -Observed ("whoamiRunsAsUser=$probeRunsAsUser hasAdministratorsSid=$probeHasAdminSid highIntegrity=$probeElevated integrity='$probeIntegrity'") `
+            -Outcome ($probe.exitCode -eq 0 -and $probeRunsAsUser -and -not $probeHasAdminSid -and -not $probeElevated)
+        Add-WpdAssertion -Name 'precondition-not-local-administrator' -Expected 'test account is not a member of Administrators' `
+            -Observed ("AdministratorsMember=$inAdmins UsersGroupListed=$inUsers") -Outcome (-not $inAdmins)
 
         $configBefore = Get-WpdConfigFingerprint -StandardUserName $standardUserName
         $run = Start-WpdStandardUserCollection -ScriptPath $stagedScript -OutputDirectory $caseDirectory `
@@ -710,7 +817,18 @@ try {
             expectedOwner   = $expectedOwner
             pid             = $run.pid
             ownerSamples    = $ownerSamples
+            samplingNotes   = @($run.samplingNotes)
             descendants     = @($run.descendants)
+            tokenProbe      = [pscustomobject]@{
+                exitCode             = $probe.exitCode
+                runsAsTestAccount    = $probeRunsAsUser
+                hasAdministratorsSid = $probeHasAdminSid
+                highIntegrity        = $probeElevated
+                integrityLine        = $probeIntegrity
+                userLine             = $probeUserLine
+                groupSummary         = $(if ($probeHasAdminSid) { 'Administrators SID present' } else { 'Administrators SID absent' })
+                fullOutputLocation   = 'harness transcript (C:\WPD\logs)'
+            }
             consoleLog      = $run.logPath
             setupLog        = $harnessLog
         }
@@ -744,9 +862,9 @@ try {
             $collectionErrors = @(Get-WpdCollectionErrorRecords -Manifest $manifest)
             Write-Output ("collectionErrors: {0}" -f $(if ($collectionErrors.Count -eq 0) { 'none' } else { ($collectionErrors | ForEach-Object { "$($_.stage)=$($_.message)" }) -join ' ; ' }))
 
-            $secretsCollected = $null
-            if ($null -ne $manifest.privacy) { $secretsCollected = $manifest.privacy.secretsCollected }
-            Add-WpdAssertion -Name 'privacy-secrets-collected-false' -Expected '$false' -Observed $secretsCollected -Outcome ($secretsCollected -eq $false)
+            $safetyCheck = Get-WpdSafetyDeclarationCheck -Manifest $manifest
+            Add-WpdAssertion -Name 'safety-declarations-hold' -Expected 'localOnly/readOnly true, automaticUpload/Remediation/LogClearing false, explicit consent required, and secretsCollected false when the build declares a privacy block' `
+                -Observed $safetyCheck.observed -Outcome $safetyCheck.ok
 
             $manifestEvidence = @(Get-WpdManifestEvidence -OutputDirectory $caseDirectory -Manifest $manifest)
             $hashMismatch = @($manifestEvidence | Where-Object { $_.fileExists -and -not $_.hashMatches })
@@ -788,8 +906,9 @@ try {
                 -Observed $inAdminsAfter -Outcome (-not $inAdminsAfter)
 
             if ($run.exitCode -eq 0 -and $ownerSamples.Count -gt 0 -and $foreignOwners.Count -eq 0 -and $foreignDescendants.Count -eq 0 -and
-                $matchedMarkers.Count -eq 0 -and $secretsCollected -eq $false -and $hashMismatch.Count -eq 0 -and $unlistedFiles.Count -eq 0 -and
-                $fingerprintDeltas.Count -eq 0 -and -not $inAdminsAfter -and ($inUsers -and -not $inAdmins)) {
+                $matchedMarkers.Count -eq 0 -and $safetyCheck.ok -and $hashMismatch.Count -eq 0 -and $unlistedFiles.Count -eq 0 -and
+                $fingerprintDeltas.Count -eq 0 -and -not $inAdminsAfter -and -not $inAdmins -and $probe.exitCode -eq 0 -and
+                $probeRunsAsUser -and -not $probeHasAdminSid -and -not $probeElevated) {
                 if ($collectionErrors.Count -gt 0) {
                     if (@($collectionErrors | Where-Object { $_.stage -and $_.message }).Count -eq $collectionErrors.Count) { $caseOutcome = 'PASS' }
                 }

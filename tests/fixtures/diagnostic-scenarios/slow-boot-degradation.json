@@ -1,0 +1,79 @@
+{
+  "id": "slow-boot-degradation",
+  "title": "Slow boot with disk latency in the same window",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T18:00:00Z",
+          "TimeToDesktopSeconds": 185,
+          "ReadLatencySeconds": 0.05
+        },
+        {
+          "TimestampUtc": "2026-09-10T18:00:05Z",
+          "TimeToDesktopSeconds": 185,
+          "ReadLatencySeconds": 0.05
+        },
+        {
+          "TimestampUtc": "2026-09-10T18:00:10Z",
+          "TimeToDesktopSeconds": 185,
+          "ReadLatencySeconds": 0.05
+        }
+      ],
+      "rules": [
+        {
+          "id": "boot-degradation",
+          "category": "boot-degradation",
+          "title": "Slow boot to desktop",
+          "summary": "The recorded time to desktop exceeded the configured threshold.",
+          "metric": "TimeToDesktopSeconds",
+          "comparator": "gt",
+          "threshold": 120,
+          "minimumSamples": 1,
+          "minimumDurationSeconds": 1,
+          "sourceArtifact": "boot-trace.json",
+          "severity": {
+            "default": "low",
+            "escalations": []
+          },
+          "confidence": {
+            "default": "Low",
+            "conditions": [
+              {
+                "level": "Medium",
+                "when": "a boot recording exists for the affected boot and a slow phase can be identified in it"
+              },
+              {
+                "level": "Low",
+                "when": "no boot recording exists, so the value comes from a coarse timestamp difference only"
+              }
+            ]
+          },
+          "correlationRequirements": [
+            {
+              "metric": "ReadLatencySeconds",
+              "comparator": "ge",
+              "threshold": 0.02,
+              "kind": "required-any-of",
+              "note": "Boot delay must be linked to a phase; disk latency in the same boot window is one such link"
+            }
+          ],
+          "uncertainty": "Elapsed time to desktop does not identify the slow phase.",
+          "nextSteps": [
+            "Collect a boot trace for the affected boot."
+          ],
+          "suggestedWprProfile": "GeneralProfile"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "boot-trace.json",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

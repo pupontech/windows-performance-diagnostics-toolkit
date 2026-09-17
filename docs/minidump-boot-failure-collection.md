@@ -1,7 +1,9 @@
 # Minidump + Boot-Failure Evidence Collection — Design Spec
 
-Status: implemented in v0.6.0 (this document is the contract for the change)
-Scope: two new consent-gated, read-only Collect-mode stages; Plan-mode advertising; schema + manifest sections; launcher options; tests.
+Status: collection stages implemented in v0.6.0; bounded analysis added in the
+unreleased crash/servicing findings milestone.
+Scope: two consent-gated, read-only Collect-mode stages; Plan-mode advertising;
+schema + manifest sections; launcher options; bounded findings analysis; tests.
 
 ## 1. Safety contract (unchanged, extended)
 
@@ -31,6 +33,7 @@ Only when the corresponding `-Collect*` switch is set:
 
 - `plannedActions += 'collect-minidumps-after-explicit-consent'`
 - `plannedActions += 'collect-boot-failure-evidence-after-explicit-consent'`
+- `plannedActions += 'analyze-servicing-logs-after-explicit-consent'`
 - `planManifest.minidumps = { sourcePath, maxTotalBytes, memoryDumpRecordedNotCopied }`
   (`maxTotalBytes` = 512 MB, `memoryDumpRecordedNotCopied` = true)
 - `planManifest.bootFailureLogs = { maxBytesPerFile (100 MB), sources: [srt-trail, boot-log,
@@ -95,16 +98,43 @@ per-source result objects).
 
 Stage error stage-names: `minidump-collection`, `boot-failure-log-collection`.
 
-### 4.3 Placement
+### 4.3 Bounded analysis
 
-Both stages run after crash-analysis, before WPR capture (they are fast file copies and extend
-the crash evidence the WPR window would otherwise miss).
+After the copy stages, `Get-CrashAnalysis` joins the bounded System event view
+to copied minidumps and LiveKernelReports. A dump whose source mtime is older
+than the event lookback is retained with
+`eventCorrelationStatus: "outside-event-lookback"`; a source mtime after the
+lookback end is treated the same way. Nearby BugCheck 1001 events may provide a
+correlated code only when the source mtime is inside the event interval. A
+filename date is a fallback hint when source mtime is unavailable; it cannot
+override an in-window source timestamp. Minidump and LiveKernelReports rows are
+deduplicated by explicit problem signatures. Filename dates/classes are hints
+only and the dump binary is not decoded.
+
+`Get-ServicingLogAnalysis` reads at most the configured per-file byte bound,
+then parses that bounded window in chunks and writes normalized signatures,
+counts and line ranges to `servicing-log-analysis.json`. A growing source cannot
+extend the read past the bound, and a file or parent directory that is a
+reparse point is refused. The analysis has no raw log lines. The shared tail
+registers the artifact, forwards both analysis objects to `Evaluate-Findings`,
+and renders `crash-evidence` / `servicing-failure` findings plus explicit
+partial/unavailable/failed coverage findings. It does not run DISM/SFC or
+perform repair.
+
+### 4.4 Placement
+
+The copy stages run after the shared performance capture window. Crash/servicing
+analysis runs after the copies have established their final artifact paths, before
+manifest/report generation. These are read-only file operations and do not extend
+the performance capture window.
 
 ## 5. Schema changes (`schema/diagnostic-report.schema.json`)
 
 Add two optional top-level properties `minidumps` and `bootFailureLogs` (objects,
 `additionalProperties: false`, union of Plan-scope and Collect-scope fields so one schema covers
-both modes). `plannedActions` items are unenumerated (no change). `safety` unchanged.
+both modes). Widen `crashAnalysis` with artifact rows/signature summaries and add the optional
+`servicingAnalysis` object for bounded log-scan results. `plannedActions` items are unenumerated
+(no change). `safety` unchanged.
 
 ## 6. Launcher changes
 

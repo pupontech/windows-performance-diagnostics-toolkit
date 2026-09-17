@@ -1,0 +1,99 @@
+{
+  "id": "commit-pressure",
+  "title": "Commit charge pressure at 93 percent",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T13:00:00Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 19971597927,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:05Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 19971597927,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:10Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 19971597927,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:15Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 19971597927,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:20Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 19971597927,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:25Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 19971597927,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        }
+      ],
+      "rules": [
+        {
+          "id": "memory-commit-pressure",
+          "category": "memory-pressure",
+          "title": "Commit charge pressure",
+          "summary": "Commit charge stayed at or above the configured ratio.",
+          "metric": "CommitPercent",
+          "comparator": "ge",
+          "threshold": 90,
+          "minimumSamples": 5,
+          "minimumDurationSeconds": 5,
+          "sourceArtifact": "performance-samples.csv",
+          "severity": {
+            "default": "medium",
+            "escalations": [
+              {
+                "severity": "high",
+                "when": "commit charge is at or above 95 percent and the paging rule also qualifies in the same window"
+              }
+            ]
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": []
+          },
+          "uncertainty": "A commit ratio does not identify the process holding the charge.",
+          "nextSteps": [
+            "Collect per-process memory evidence over the same window."
+          ],
+          "suggestedWprProfile": "CPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

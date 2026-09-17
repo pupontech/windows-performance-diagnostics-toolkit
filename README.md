@@ -4,7 +4,7 @@
 
 **Version:** 1.0.0
 
-**Status:** Slowdown diagnosis toolkit with symptom context, in-window telemetry (PID+StartTime interval CPU percentage, paired raw-disk latency/throughput/queue, memory committed/limit and paging, volume free space), findings engine with sustained-pressure rules and coverage warnings, standalone offline HTML report, and read-only case verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM. The new raw-disk/in-window telemetry and findings/report paths are covered by fixture tests and a hosted Windows smoke run; an **owner-live Windows client run is still required** before any remediation planning (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+**Status:** Slowdown diagnosis toolkit with symptom context, in-window telemetry (PID+StartTime interval CPU percentage, paired raw-disk latency/throughput/queue, memory committed/limit and paging, volume free space), bounded crash/servicing evidence analysis (BugCheck, Kernel-Power, minidump, LiveKernelReports, CBS/DISM/setup signatures), findings engine with sustained-pressure rules and coverage warnings, standalone offline HTML report, and read-only case verification. Collection requires explicit consent; the toolkit performs no repair, upload, policy change, or remediation, and never enables WinRM. The new raw-disk/in-window telemetry and findings/report paths are covered by fixture tests and a hosted Windows smoke run; an **owner-live Windows client run is still required** before any remediation planning (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
 [![CI](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/pupontech/windows-performance-diagnostics-toolkit/actions/workflows/ci.yml)
 
@@ -138,6 +138,14 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
 - **Storage relevance.** Each drive letter is mapped to its backing physical
   disk and to the pagefile host, so low free space on an unrelated archive or
   backup volume is not read as a performance cause.
+- **Crash and servicing evidence.** The bounded System event view is no longer
+  the crash-analysis boundary: copied minidumps and LiveKernelReports remain
+  visible when they predate the 24-hour event lookback. Nearby BugCheck 1001
+  events can supply a correlated code, while dump filename dates and
+  LiveKernelReports filename classes are labelled as evidence hints only. When
+  boot-failure logs are consented, a bounded byte-window scan aggregates CBS,
+  DISM, setup, and boot-log error signatures (for example recurring
+  `CBS_E_INVALID_PACKAGE`) into `servicing-log-analysis.json` and findings.
 - **Bounded WPR.** The trace runs in **memory mode** — the documented bounded
   circular buffer; Microsoft documents `-filemode` as "an unbounded file, which
   can grow in size until it fills the disk". The window auto-sizes to outlast the
@@ -196,7 +204,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -OutputDirectory C:\Temp\WPD-Case-001
 ```
 
-The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and a manifest with SHA-256 hashes. With `-ZipOutput` it also packages this run's certified evidence (artifacts + manifest) into a timestamped case zip next to the output folder — stale files from reused folders are never included. `-Mode Verify -InputDirectory <case>` validates an existing Collect manifest, its listed artifacts, and any recorded case ZIP without modifying the case. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, or remediate anything. In local mode it never transfers artifacts off the machine; in remote mode (`-RemoteComputer`) the pull-back to this machine is consent-gated and hash-verified. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
+The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and, when boot-failure logs are collected, the bounded `servicing-log-analysis.json` evidence summary. `findings.json` includes crash and servicing findings alongside telemetry findings, and the manifest records the structured `crashAnalysis` block. With `-ZipOutput` it also packages this run's certified evidence (artifacts + manifest) into a timestamped case zip next to the output folder - stale files from reused folders are never included. `-Mode Verify -InputDirectory <case>` validates an existing Collect manifest, its listed artifacts, and any recorded case ZIP without modifying the case. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, or remediate anything. In local mode it never transfers artifacts off the machine; in remote mode (`-RemoteComputer`) the pull-back to this machine is consent-gated and hash-verified. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
 
 ## Deployment bundle
 
@@ -222,6 +230,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 - ✅ WPA-oriented analysis guidance (`docs/wpa-analysis-guide.md`)
 - ✅ Symptom context and collection presets (`-SymptomContext`, `-Preset`)
 - ✅ Findings engine with sustained-pressure rules and coverage warnings
+- [x] Bounded crash/servicing analysis findings for BugCheck, dump, LiveKernelReports, CBS/DISM/setup evidence
 - ✅ Standalone offline HTML report (`report.html`) with XSS-safe encoding
 - 🔜 Baseline comparison and application diagnostics
 - 🔜 Windows lab test matrix execution before any live remediation capability

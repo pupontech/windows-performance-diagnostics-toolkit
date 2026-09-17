@@ -1,0 +1,831 @@
+{
+  "artifact": "diagnostic-scenario-fixtures",
+  "description": "Synthetic input fixtures for the diagnostic scenario matrix.",
+  "scenarios": [
+    {
+      "id": "healthy-window",
+      "title": "Healthy window: no rule qualifies",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 0,
+        "outcome": "ROOT CAUSE NOT IDENTIFIED",
+        "status": "success",
+        "coverage.coverage": "complete",
+        "coverage.sufficient": true,
+        "evidence.valid": true,
+        "evidence.checkedCount": 0,
+        "technicianSummary": {
+          "contains": "no rule fired"
+        },
+        "sections": {
+          "includes": [
+            "coverage",
+            "findings"
+          ]
+        },
+        "htmlHasNoRemediationNotice": true,
+        "htmlContainsHealthyToken": false
+      },
+      "note": "A window where nothing qualifies must produce no finding and no health verdict."
+    },
+    {
+      "id": "cpu-saturation",
+      "title": "CPU saturation: 12 samples at 95 percent",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "cpu-pressure",
+        "findings.0.ruleId": "cpu-pressure-sustained",
+        "findings.0.severity": "medium",
+        "findings.0.confidence": "High",
+        "findings.0.peak": 95,
+        "findings.0.count": 12,
+        "findings.0.durationSeconds": 60,
+        "findings.0.evidenceCount": 1,
+        "findings.0.windowStart": {
+          "regex": "^2026-09-10T12:00:00"
+        },
+        "findings.0.windowEnd": {
+          "regex": "^2026-09-10T12:00:55"
+        },
+        "findings.0.ruleCondition": {
+          "contains": "AverageCpuLoadPercent ge 80"
+        },
+        "evidence.valid": true,
+        "evidence.checkedCount": 1,
+        "evidence.unregisteredArtifacts": {
+          "count": 0
+        },
+        "outcome": "FINDINGS IDENTIFIED",
+        "coverage.coverage": "complete",
+        "sections": {
+          "includes": [
+            "coverage",
+            "findings"
+          ]
+        },
+        "htmlContainsHealthyToken": false
+      },
+      "note": "The 95 percent peak is below the escalation rule's 30-sample window, so severity stays medium."
+    },
+    {
+      "id": "cpu-saturation-escalated",
+      "title": "CPU saturation escalated: 30 samples at 97 percent",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.severity": "high",
+        "findings.0.count": 30,
+        "findings.0.durationSeconds": 150,
+        "findings.0.severityReason": {
+          "contains": "at or above 95 percent"
+        },
+        "evidence.valid": true
+      },
+      "note": "30 consecutive samples at or above 95 percent must escalate to high."
+    },
+    {
+      "id": "cpu-spike-too-short",
+      "title": "CPU spike shorter than the rule minimum",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 0,
+        "outcome": "ROOT CAUSE NOT IDENTIFIED",
+        "coverage.coverage": {
+          "oneOf": [
+            "complete",
+            "partial"
+          ]
+        }
+      },
+      "note": "Three samples at 97 percent is below minimumSamples 5, so no finding is emitted."
+    },
+    {
+      "id": "commit-pressure",
+      "title": "Commit charge pressure at 93 percent",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "memory-pressure",
+        "findings.0.severity": "medium",
+        "findings.0.peak": {
+          "gte": 90
+        },
+        "findings.0.count": 6,
+        "findings.0.durationSeconds": 30,
+        "findings.0.ruleCondition": {
+          "contains": "CommitPercent ge 90"
+        },
+        "evidence.valid": true,
+        "outcome": "FINDINGS IDENTIFIED"
+      },
+      "note": "Commit percent is derived from CommittedBytes/CommitLimitBytes and must reach the rule."
+    },
+    {
+      "id": "true-paging-with-pressure",
+      "title": "True paging with commit pressure",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "memory-paging",
+        "findings.0.severity": "high",
+        "findings.0.confidence": "High",
+        "findings.0.peak": 250,
+        "findings.0.count": 6,
+        "findings.0.evidenceCount": 1,
+        "evidence.valid": true,
+        "outcome": "FINDINGS IDENTIFIED"
+      },
+      "note": "A paging run plus a qualifying commit channel is a memory-paging finding. Severity and confidence land at the escalated level because the rule states its escalation and High conditions in prose without a numeric gate, so the engine applies them unconditionally."
+    },
+    {
+      "id": "paging-without-pressure",
+      "title": "High Pages/sec without a RAM shortage",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "coverage",
+        "findings.0.severity": "informational",
+        "findings.0.confidence": "Low",
+        "findings.0.title": {
+          "contains": "without measured memory pressure"
+        },
+        "findings.0.ruleCondition": {
+          "contains": "no independent pressure channel"
+        },
+        "outcome": "ROOT CAUSE NOT IDENTIFIED",
+        "evidence.valid": true
+      },
+      "note": "A high paging rate alone must stay a coverage record, never a memory-paging finding."
+    },
+    {
+      "id": "user-mode-leak",
+      "title": "User-mode working-set growth",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "memory-leak",
+        "findings.0.severity": "high",
+        "findings.0.confidence": "High",
+        "findings.0.count": 12,
+        "findings.0.peak": 66,
+        "evidence.valid": true,
+        "findings.0.windowStart": {
+          "regex": "^2026-09-10T14:00:00"
+        }
+      },
+      "note": "A monotonic per-process growth run in the process-memory series is a leak finding."
+    },
+    {
+      "id": "kernel-pool-growth",
+      "title": "Kernel pool growth",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "memory-leak",
+        "findings.0.severity": "high",
+        "findings.0.count": 12,
+        "findings.0.peak": 38,
+        "evidence.valid": true
+      },
+      "note": "Pool growth is read from the kernel-pool series and needs the memory-headroom channel."
+    },
+    {
+      "id": "disk-read-latency",
+      "title": "Sustained disk read latency",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "disk-latency",
+        "findings.0.severity": "medium",
+        "findings.0.count": 6,
+        "findings.0.durationSeconds": 30,
+        "findings.0.peak": {
+          "gte": 0.03
+        },
+        "evidence.valid": true
+      },
+      "note": "The disk series is selected by the metric, not by the sample series."
+    },
+    {
+      "id": "network-retransmit-pressure",
+      "title": "TCP retransmissions with connection failures",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "network-errors",
+        "findings.0.severity": "medium",
+        "findings.0.confidence": "Medium",
+        "findings.0.count": 12,
+        "findings.0.evidenceCount": 1,
+        "evidence.valid": true
+      },
+      "note": "The failure channel raises the default Low confidence to Medium. Only one evidence record reaches the finding: the correlation record is generated and indexed but Invoke-WpdReportRuleAnalysis passes the correlation array with a + expression that does not append it to the finding evidence."
+    },
+    {
+      "id": "ui-hang-low-cpu",
+      "title": "UI hang with low CPU",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "ui-responsiveness",
+        "findings.0.severity": "high",
+        "findings.0.ruleId": "ui-hang-events",
+        "findings.0.confidence": {
+          "oneOf": [
+            "Medium",
+            "High"
+          ]
+        },
+        "evidence.valid": true,
+        "coverage.coverage": {
+          "oneOf": [
+            "complete",
+            "partial"
+          ]
+        }
+      },
+      "note": "A hang at 15 percent CPU must produce a responsiveness finding, never a CPU finding."
+    },
+    {
+      "id": "slow-boot-degradation",
+      "title": "Slow boot with disk latency in the same window",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "boot-degradation",
+        "findings.0.severity": "low",
+        "findings.0.confidence": "Medium",
+        "findings.0.peak": 185,
+        "evidence.valid": true
+      },
+      "note": "Coarse boot evidence stays low severity and low confidence."
+    },
+    {
+      "id": "gpu-saturation",
+      "title": "GPU engine saturation with low CPU",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "gpu-saturation",
+        "findings.0.severity": "medium",
+        "findings.0.confidence": "High",
+        "findings.0.count": 10,
+        "evidence.valid": true
+      },
+      "note": "GPU saturation with the low-CPU channel is a finding; the correlation is recorded."
+    },
+    {
+      "id": "single-core-queue-coverage",
+      "title": "Queue pressure on one core without total CPU pressure",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "coverage",
+        "findings.0.severity": "informational",
+        "findings.0.confidence": "Low",
+        "findings.0.title": {
+          "contains": "Required corroborating evidence was unavailable"
+        },
+        "outcome": "ROOT CAUSE NOT IDENTIFIED"
+      },
+      "note": "A queue without the corroborating channel is coverage, not a CPU-pressure finding."
+    },
+    {
+      "id": "kernel-dpc-interrupt-share",
+      "title": "DPC and interrupt CPU share",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "findingCount": 1,
+        "findings.0.category": "cpu-pressure",
+        "findings.0.severity": "medium",
+        "findings.0.count": 12,
+        "evidence.valid": true
+      },
+      "note": "Kernel-side DPC/ISR share is a cpu-pressure finding at medium severity."
+    },
+    {
+      "id": "baseline-p99-regression",
+      "title": "Incident percentiles against a baseline",
+      "driver": {
+        "kind": "report"
+      },
+      "expect": {
+        "baselineComparisonCount": 1,
+        "baselineComparisons.0.status": "measured",
+        "baselineComparisons.0.baselineDurationSeconds": 10,
+        "baselineComparisons.0.incidentDurationSeconds": 69,
+        "baselineComparisons.0.baselineP99": 1,
+        "baselineComparisons.0.p50": 60,
+        "baselineComparisons.0.p95": 60,
+        "baselineComparisons.0.p99": 60,
+        "baselineComparisons.0.deltaP99": 59,
+        "sections": {
+          "includes": [
+            "baseline-comparison"
+          ]
+        }
+      },
+      "note": "Duration-weighted percentiles are compared between the baseline and the incident window."
+    },
+    {
+      "id": "single-core-saturation",
+      "title": "One logical processor saturated, machine mostly idle",
+      "driver": {
+        "kind": "cpu"
+      },
+      "expect": {
+        "status": "measured",
+        "perCoreCount": 4,
+        "cpuGroupCount": 1,
+        "perCore": {
+          "anyElement": {
+            "path": "cpuTimePercent",
+            "value": 100
+          }
+        },
+        "utilityMayExceed100": true,
+        "averageCpuTimePercent": {
+          "lte": 40
+        }
+      },
+      "note": "Per-core detail must survive the aggregate: one core at 100 percent is not a 100 percent machine."
+    },
+    {
+      "id": "kernel-cpu-share",
+      "title": "Kernel time dominates on every core",
+      "driver": {
+        "kind": "cpu"
+      },
+      "expect": {
+        "status": "measured",
+        "perCoreCount": 2,
+        "perCore": {
+          "anyElement": {
+            "path": "kernelTimePercent",
+            "value": {
+              "gte": 63
+            }
+          }
+        },
+        "averageCpuTimePercent": {
+          "gte": 60
+        }
+      },
+      "note": "The kernel/user split is preserved per core instead of being collapsed.",
+      "knownDefect": "src/Wpd.Telemetry.psm1 Get-CpuSummary line ~621 evaluates ($perCore | Where-Object { $_.UtilityPercent -gt 100 }).Count under Set-StrictMode -Version Latest; when no core exceeds 100 percent utility the filtered result is empty and reading .Count on it throws 'The property Count cannot be found on this object'. Source is not editable on this card, so the scenario is recorded as a known defect instead of asserting the crash."
+    },
+    {
+      "id": "dpc-isr-share",
+      "title": "DPC and interrupt share below the long-execution threshold",
+      "driver": {
+        "kind": "dpc"
+      },
+      "expect": {
+        "status": "measured",
+        "dpcTimePercent": 8,
+        "interruptTimePercent": 4,
+        "longExecutionStatus": "evaluated",
+        "longExecutionThresholdMicroseconds": 1000,
+        "longExecutionCount": 0
+      },
+      "note": "A 300 microsecond DPC is below the 1000 microsecond threshold and must not be listed."
+    },
+    {
+      "id": "long-dpc-execution",
+      "title": "DPCs above the long-execution threshold",
+      "driver": {
+        "kind": "dpc"
+      },
+      "expect": {
+        "status": "measured",
+        "longExecutionStatus": "evaluated",
+        "longExecutionCount": 2,
+        "longExecutions": {
+          "count": 2
+        }
+      },
+      "note": "Both DPCs are above the threshold and each keeps its provider and routine."
+    },
+    {
+      "id": "paging-telemetry-coverage",
+      "title": "Memory telemetry withholds a paging conclusion",
+      "driver": {
+        "kind": "memory"
+      },
+      "expect": {
+        "status": "measured",
+        "pagingFinding.status": "coverage",
+        "pagingFinding.message": {
+          "contains": "without measured memory pressure"
+        }
+      },
+      "note": "The telemetry layer must refuse a paging conclusion from the paging rate alone."
+    },
+    {
+      "id": "disk-counter-reset",
+      "title": "Disk raw counter reset between samples",
+      "driver": {
+        "kind": "disk-deltas"
+      },
+      "expect": {
+        "result.0.name": "0 C:",
+        "result.0.readLatencySeconds": {
+          "present": false
+        },
+        "result.0.coverageReason": {
+          "includes": [
+            "counter-reset"
+          ]
+        }
+      },
+      "note": "A counter that goes backwards is a reset, reported as coverage instead of a latency value."
+    },
+    {
+      "id": "corrupted-perflib",
+      "title": "Perflib counters are corrupted",
+      "driver": {
+        "kind": "perflib"
+      },
+      "expect": {
+        "status": "corrupted-suspected",
+        "observedCount": 3,
+        "corruptedCount": 1,
+        "invalidCount": 1,
+        "reason": "provider-reported-counter-error"
+      },
+      "note": "A provider error is corrupted-suspected and never softened to partial or healthy."
+    },
+    {
+      "id": "perflib-all-observed",
+      "title": "Perflib counters all observed",
+      "driver": {
+        "kind": "perflib"
+      },
+      "expect": {
+        "status": "healthy",
+        "observedCount": 3,
+        "missingCount": 0,
+        "invalidCount": 0,
+        "corruptedCount": 0
+      },
+      "allowHealthyPaths": [
+        "status",
+        "reason"
+      ],
+      "note": "Counter-set health is the only place the word healthy is legitimate."
+    },
+    {
+      "id": "gpu-adapter-reset",
+      "title": "GPU adapter reset with no engine counters",
+      "driver": {
+        "kind": "gpu"
+      },
+      "expect": {
+        "status": "available",
+        "available": true,
+        "adapterCount": 1,
+        "engineCount": 0,
+        "memoryCount": 0,
+        "maxEngineUtilization": {
+          "present": false
+        },
+        "temperatureAvailable": false,
+        "temperatureReason": {
+          "contains": "not-exposed"
+        },
+        "clocksAvailable": false,
+        "clocksReason": {
+          "contains": "not-exposed"
+        }
+      },
+      "note": "An adapter row with no engine counters must not invent a utilization value."
+    },
+    {
+      "id": "gpu-unavailable-counters",
+      "title": "No GPU counters at all",
+      "driver": {
+        "kind": "gpu"
+      },
+      "expect": {
+        "status": "unavailable",
+        "available": false,
+        "adapterCount": 0,
+        "engineCount": 0,
+        "maxEngineUtilization": {
+          "present": false
+        }
+      },
+      "note": "Absent GPU counters are unavailable, never healthy."
+    },
+    {
+      "id": "whea-uncorrected-recurrence",
+      "title": "WHEA uncorrected recurrence on one component",
+      "driver": {
+        "kind": "whea"
+      },
+      "expect": {
+        "recordCount": 3,
+        "correctedCount": 2,
+        "uncorrectedCount": 1,
+        "severity": "uncorrected-present",
+        "recurringComponentCount": 1,
+        "uncorrectedComponents": {
+          "includes": [
+            "PCI Express Root Port A"
+          ]
+        },
+        "absenceIsNotHealth": true,
+        "causationDisclaimed": true,
+        "components.0.recurrence": "recurring",
+        "components.0.classification": "mixed"
+      },
+      "note": "An uncorrected record is never softened and recurrence is grouped per component."
+    },
+    {
+      "id": "storage-controller-warning-recurrence",
+      "title": "StorPort controller warnings repeating inside the incident window",
+      "driver": {
+        "kind": "repetitive-events"
+      },
+      "expect": {
+        "result.0.classification": "repetitive",
+        "result.0.count": 3,
+        "result.0.inWindowCount": 3,
+        "result.0.outOfWindowCount": 0,
+        "result.0.placement": "in-window",
+        "result.0.coverage": "complete",
+        "result.0.provider": "Microsoft-Windows-StorPort",
+        "result.0.interpretation": {
+          "contains": "repeated 3 time"
+        }
+      },
+      "note": "A repeating storage controller warning is correlated with the incident window, not with a cause."
+    },
+    {
+      "id": "wait-chain-dependency",
+      "title": "Two threads waiting on each other",
+      "driver": {
+        "kind": "waitchain"
+      },
+      "expect": {
+        "status": "success",
+        "coverage": "complete",
+        "pointInTime": true,
+        "samplingMode": "point-in-time",
+        "chains": {
+          "count": 1
+        },
+        "cycles": {
+          "count": 1
+        },
+        "cycles.0.kind": "wait-cycle",
+        "cycles.0.status": "cycle-detected",
+        "cycles.0.threadIds": {
+          "count": 2
+        },
+        "automaticRemediation": false,
+        "recommendations": {
+          "count": 0
+        }
+      },
+      "note": "A wait cycle is reported as point-in-time evidence with no remediation."
+    },
+    {
+      "id": "unsupported-smart",
+      "title": "Disk exposes no reliability counters",
+      "driver": {
+        "kind": "storage-reliability"
+      },
+      "expect": {
+        "kind": "storage-reliability",
+        "deviceId": "nvme0",
+        "exposed": false,
+        "note": "reliability-counter-not-exposed",
+        "wear": {
+          "present": false
+        },
+        "temperatureCelsius": {
+          "present": false
+        },
+        "readErrorsUncorrected": {
+          "present": false
+        },
+        "powerOnHours": {
+          "present": false
+        }
+      },
+      "note": "A disk without reliability counters is not exposed, and no value is invented."
+    },
+    {
+      "id": "non-admin-capability",
+      "title": "Elevated-only capability on an unelevated run",
+      "driver": {
+        "kind": "inventory"
+      },
+      "expect": {
+        "providerCallCount": 0,
+        "result.status": "unavailable",
+        "result.coverage": "unavailable",
+        "result.reasons": {
+          "includes": [
+            "requires-administrator"
+          ]
+        }
+      },
+      "note": "The capability is unavailable with a stated reason and the provider is never called."
+    },
+    {
+      "id": "defender-scan-impact",
+      "title": "Defender scan impact without consent",
+      "driver": {
+        "kind": "defender"
+      },
+      "expect": {
+        "consentGiven": false,
+        "automaticRemediation": false,
+        "defenderExclusionProposed": false,
+        "healthClaim": "none",
+        "neverHealthy": true
+      },
+      "note": "Without consent nothing is queried and no exclusion is proposed."
+    },
+    {
+      "id": "defender-module-missing",
+      "title": "Defender analyzer module missing with consent",
+      "driver": {
+        "kind": "defender"
+      },
+      "expect": {
+        "consentGiven": true,
+        "automaticRemediation": false,
+        "defenderExclusionProposed": false,
+        "defenderStatus": {
+          "oneOf": [
+            "unavailable",
+            "not-collected",
+            "unsupported"
+          ]
+        },
+        "healthClaim": "none"
+      },
+      "note": "A missing Defender module is unavailable, never a failure and never a clean result."
+    },
+    {
+      "id": "missing-wpa-tooling",
+      "title": "Windows Performance Toolkit is not installed",
+      "driver": {
+        "kind": "tool"
+      },
+      "expect": {
+        "result.0.tool": "wpr",
+        "result.0.status": "not-present",
+        "result.0.found": false,
+        "result.1.tool": "wpa",
+        "result.1.status": "not-present",
+        "result.2.tool": "wpaexporter",
+        "result.2.status": "not-present",
+        "result.0.reason": {
+          "contains": "was not found"
+        }
+      },
+      "note": "Missing tooling is not-present with a reason; the run continues."
+    },
+    {
+      "id": "symbols-unavailable",
+      "title": "Managed symbols absent beside the trace",
+      "driver": {
+        "kind": "symbols"
+      },
+      "expect": {
+        "symbolsPresent": false,
+        "state": "unavailable",
+        "useSymbolsSwitch": false,
+        "downloadAllowed": false,
+        "reason": {
+          "contains": "symbol-dependent analysis"
+        },
+        "managedSymbolCachePath": {
+          "contains": "NGenPdbs_Cache"
+        }
+      },
+      "note": "Absent symbols make symbol-dependent analysis unavailable rather than assumed."
+    },
+    {
+      "id": "interrupted-wpr-session",
+      "title": "WPR stop exits non-zero after an interruption",
+      "driver": {
+        "kind": "trace-validation"
+      },
+      "expect": {
+        "exists": true,
+        "empty": false,
+        "oversized": false,
+        "kept": true,
+        "stopSucceeded": false,
+        "status": "partial",
+        "healthy": false,
+        "warnings.0": {
+          "contains": "code 5"
+        }
+      },
+      "note": "A truncated or unmmerged trace is partial with its real exit code, never healthy."
+    },
+    {
+      "id": "abandoned-wpr-session",
+      "title": "A toolkit-owned WPR recording is still running",
+      "driver": {
+        "kind": "abandoned-session"
+      },
+      "expect": {
+        "state": "in-progress",
+        "abandoned": true,
+        "ownerProven": true,
+        "foreign": false,
+        "cleanupRequired": true,
+        "droppedEvents": 2,
+        "loggingMode": "Memory",
+        "cleanupCommand": {
+          "contains": "wpr"
+        },
+        "stopSaveCommand": {
+          "contains": "wpr"
+        }
+      },
+      "note": "A session this toolkit started is abandoned and can be stopped or cancelled."
+    },
+    {
+      "id": "foreign-wpr-session",
+      "title": "Another product's WPR recording is running",
+      "driver": {
+        "kind": "abandoned-session"
+      },
+      "expect": {
+        "state": "in-progress",
+        "abandoned": false,
+        "ownerProven": false,
+        "foreign": true,
+        "cleanupRequired": false,
+        "cleanupCommand": {
+          "present": false
+        }
+      },
+      "note": "A foreign recording is reported and never cancelled."
+    },
+    {
+      "id": "insufficient-disk-space",
+      "title": "Capture refused because the target volume is too small",
+      "driver": {
+        "kind": "storage-bound"
+      },
+      "expect": {
+        "status": "insufficient-space",
+        "ready": false,
+        "bounded": true,
+        "storagePolicy": "circular-memory",
+        "traceBudgetMB": 512,
+        "freeSpaceBytes": 104857600,
+        "requiredBytes": 805306368,
+        "deficitBytes": {
+          "gt": 0
+        },
+        "reason": {
+          "contains": "free space"
+        }
+      },
+      "note": "The capture is refused before it starts and the shortfall is stated in bytes."
+    }
+  ]
+}

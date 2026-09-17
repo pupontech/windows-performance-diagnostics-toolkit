@@ -1,0 +1,12 @@
+{
+  "id": "defender-module-missing",
+  "title": "Defender analyzer module missing with consent",
+  "driver": {
+    "kind": "defender",
+    "args": {
+      "consent": true,
+      "moduleAvailable": false
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

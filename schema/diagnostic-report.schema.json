@@ -617,6 +617,24 @@
     "crashAnalysis": {
       "type": "object",
       "properties": {
+        "eventLookbackStartUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "eventLookbackEndUtc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "eventCorrelationWindowMinutes": {
+          "type": "integer",
+          "minimum": 0
+        },
         "bugchecks": {
           "type": "array",
           "items": {
@@ -658,6 +676,304 @@
                 "format": "date-time"
               },
               "Message": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "minidumps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "Name": {
+                "type": "string"
+              },
+              "SizeBytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "SourceLastWriteTimeUtc": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              },
+              "filenameDate": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "bugcheckCode": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "bugcheckTimeUtc": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              },
+              "eventCorrelationStatus": {
+                "type": "string",
+                "enum": [
+                  "matched-bugcheck",
+                  "no-matching-bugcheck",
+                  "outside-event-lookback",
+                  "ambiguous-bugcheck"
+                ]
+              },
+              "problemSignature": {
+                "type": "string"
+              },
+              "signatureSource": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "minidumpSignatures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "problemSignature": {
+                "type": "string"
+              },
+              "signatureSource": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "liveKernelReports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "Name": {
+                "type": "string"
+              },
+              "FullPath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "SizeBytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "LastWriteTimeUtc": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              },
+              "Directory": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "filenameDate": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "problemSignature": {
+                "type": "string"
+              },
+              "signatureSource": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "liveKernelSignatures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "problemSignature": {
+                "type": "string"
+              },
+              "signatureSource": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "servicingAnalysis": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Bounded aggregate signatures from copied CBS, DISM, setup and boot logs. Raw lines remain only in their copied log artifacts.",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "completed",
+            "partial",
+            "failed"
+          ]
+        },
+        "maxScanBytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "logCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "scannedLogCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failedLogCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncatedLogCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unavailableLogCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "artifact": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "found": {
+                "type": "boolean"
+              },
+              "copied": {
+                "type": "boolean"
+              },
+              "sizeBytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "scanStatus": {
+                "type": "string",
+                "enum": [
+                  "not-copied",
+                  "invalid-metadata",
+                  "missing",
+                  "oversized",
+                  "reparse-point",
+                  "hardlink",
+                  "identity-unavailable",
+                  "completed",
+                  "failed"
+                ]
+              },
+              "lineCount": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "matchedLineCount": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "bytesScanned": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "scanTruncated": {
+                "type": "boolean"
+              },
+              "signatures": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "signature": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "firstLineNumber": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "lastLineNumber": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "error": {
                 "type": [
                   "string",
                   "null"

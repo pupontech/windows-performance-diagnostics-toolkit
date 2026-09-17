@@ -1,0 +1,110 @@
+{
+  "id": "disk-read-latency",
+  "title": "Sustained disk read latency",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T13:00:00Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:05Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        }
+      ],
+      "diskSeries": [
+        {
+          "TimestampUtc": "2026-09-10T15:00:00Z",
+          "Name": "0 C:",
+          "ReadLatencySeconds": 0.03,
+          "QueueLength": 3
+        },
+        {
+          "TimestampUtc": "2026-09-10T15:00:05Z",
+          "Name": "0 C:",
+          "ReadLatencySeconds": 0.031,
+          "QueueLength": 3
+        },
+        {
+          "TimestampUtc": "2026-09-10T15:00:10Z",
+          "Name": "0 C:",
+          "ReadLatencySeconds": 0.029,
+          "QueueLength": 3
+        },
+        {
+          "TimestampUtc": "2026-09-10T15:00:15Z",
+          "Name": "0 C:",
+          "ReadLatencySeconds": 0.032,
+          "QueueLength": 3
+        },
+        {
+          "TimestampUtc": "2026-09-10T15:00:20Z",
+          "Name": "0 C:",
+          "ReadLatencySeconds": 0.03,
+          "QueueLength": 3
+        },
+        {
+          "TimestampUtc": "2026-09-10T15:00:25Z",
+          "Name": "0 C:",
+          "ReadLatencySeconds": 0.031,
+          "QueueLength": 3
+        }
+      ],
+      "rules": [
+        {
+          "id": "disk-read-latency-sustained",
+          "category": "disk-latency",
+          "title": "Sustained read latency",
+          "summary": "Read latency stayed at or above the configured threshold.",
+          "metric": "ReadLatencySeconds",
+          "comparator": "ge",
+          "threshold": 0.02,
+          "minimumSamples": 5,
+          "minimumDurationSeconds": 5,
+          "sourceArtifact": "disk-samples.json",
+          "severity": {
+            "default": "medium",
+            "escalations": [
+              {
+                "severity": "high",
+                "when": "read latency is at or above 50 ms across at least 30 consecutive intervals"
+              }
+            ]
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": []
+          },
+          "uncertainty": "Latency is per disk; it does not identify the issuing process.",
+          "nextSteps": [
+            "Collect a disk I/O trace over the same window."
+          ],
+          "suggestedWprProfile": "DiskIO"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "disk-samples.json",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

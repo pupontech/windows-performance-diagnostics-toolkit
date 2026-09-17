@@ -1,0 +1,14 @@
+{
+  "id": "interrupted-wpr-session",
+  "title": "WPR stop exits non-zero after an interruption",
+  "driver": {
+    "kind": "trace-validation",
+    "args": {
+      "etlPath": "C:\\case\\trace.etl",
+      "sizeBytes": 4096,
+      "startExitCode": 0,
+      "stopExitCode": 5
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

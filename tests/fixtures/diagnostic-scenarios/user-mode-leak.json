@@ -1,0 +1,194 @@
+{
+  "id": "user-mode-leak",
+  "title": "User-mode working-set growth",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T13:00:00Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:05Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        }
+      ],
+      "processSamples": [
+        {
+          "TimestampUtc": "2026-09-10T14:00:00Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 22,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:05Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 26,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:10Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 30,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:15Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 34,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:20Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 38,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:25Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 42,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:30Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 46,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:35Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 50,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:40Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 54,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:45Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 58,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:50Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 62,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:55Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "WorkingSetGrowthPercent": 66,
+          "AvailableMemoryMB": 1024
+        }
+      ],
+      "rules": [
+        {
+          "id": "memory-leak-user-growth",
+          "category": "memory-leak",
+          "title": "Sustained per-process working-set growth",
+          "summary": "One process grew monotonically across the measured window.",
+          "metric": "WorkingSetGrowthPercent",
+          "comparator": "ge",
+          "threshold": 20,
+          "minimumSamples": 10,
+          "minimumDurationSeconds": 10,
+          "sourceArtifact": "process-memory-samples.csv",
+          "severity": {
+            "default": "medium",
+            "escalations": [
+              {
+                "severity": "high",
+                "when": "the process identity is stable across the whole window and the growth continues after the workload is idle"
+              }
+            ]
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": [
+              {
+                "level": "High",
+                "when": "the same PID and StartTime pair grows monotonically across at least 30 samples with no identity change"
+              },
+              {
+                "level": "Low",
+                "when": "the window is shorter than 30 samples or the process identity changes during the window"
+              }
+            ]
+          },
+          "correlationRequirements": [
+            {
+              "metric": "AvailableMemoryMB",
+              "comparator": "le",
+              "threshold": 2048,
+              "kind": "required-any-of",
+              "note": "Growth matters when it consumes the machine headroom"
+            }
+          ],
+          "trend": {
+            "direction": "increasing",
+            "minimumDeltaPercent": 20,
+            "minimumSamples": 10,
+            "monotonicWindow": 10
+          },
+          "uncertainty": "Growth alone can be a cache warming up.",
+          "nextSteps": [
+            "Collect a heap or handle trace for the process."
+          ],
+          "suggestedWprProfile": "CPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "process-memory-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

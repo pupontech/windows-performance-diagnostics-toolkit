@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "src" / "Invoke-WindowsPerformanceDiagnostics.ps1"
@@ -76,6 +78,43 @@ def test_plan_mode_writes_a_local_only_read_only_manifest(tmp_path):
     assert manifest["safety"]["requiresExplicitCollectionConsent"] is True
     assert "repair" not in manifest["plannedActions"]
     assert "registry-change" not in manifest["plannedActions"]
+
+
+def test_plan_mode_rejects_unc_output_paths(tmp_path):
+    """The local-only safety contract must reject network-share output paths
+    before writing even in Plan mode."""
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-OutputDirectory",
+        r"\\server\share\wpd-case",
+    )
+
+    assert result.returncode != 0
+    assert "network-share" in result.stderr.lower()
+
+
+def test_plan_mode_rejects_output_under_a_reparse_parent(tmp_path):
+    """A normal-looking case path beneath a junction/symlink parent must not
+    be used as an alternate output root."""
+    target = tmp_path / "real-target"
+    target.mkdir()
+    parent = tmp_path / "link-parent"
+    try:
+        parent.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"directory symlink creation unavailable: {error}")
+
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-OutputDirectory",
+        str(parent / "case-output"),
+    )
+
+    assert result.returncode != 0
+    assert "reparse point" in result.stderr.lower()
+    assert not (target / "case-output").exists()
 
 
 def test_collect_mode_refuses_to_collect_without_explicit_consent(tmp_path):
@@ -435,6 +474,7 @@ def test_plan_mode_with_boot_failure_logs_lists_action_and_scope(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
 
     assert "collect-boot-failure-evidence-after-explicit-consent" in manifest["plannedActions"]
+    assert "analyze-servicing-logs-after-explicit-consent" in manifest["plannedActions"]
     assert manifest["bootFailureLogs"]["maxBytesPerFile"] == 104857600  # 100 MB
     assert manifest["bootFailureLogs"]["sources"] == [
         "srt-trail",
@@ -544,7 +584,7 @@ def test_new_case_package_zips_only_named_files(tmp_path):
     command = (
         f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
         f"New-CasePackage -Directory '{src.as_posix()}' "
-        f"-RelativeNames @('performance-samples.csv','network-state.json','minidumps/082826-12345-01.dmp') "
+        f"-RelativeNames @('performance-samples.csv','network-state.json','minidumps\\082826-12345-01.dmp') "
         f"-DestinationDirectory '{out.as_posix()}' -LeafName 'wpd-test'"
     )
     result = subprocess.run(
@@ -567,6 +607,32 @@ def test_new_case_package_zips_only_named_files(tmp_path):
         ], names
         assert "STALE.etl" not in names
         assert zf.read("minidumps/082826-12345-01.dmp") == b"MZDUMP"
+
+
+def test_new_case_package_rejects_traversal_entries(tmp_path):
+    src = tmp_path / "case"
+    src.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must-not-be-packaged", encoding="utf-8")
+    out = tmp_path / "packages"
+    out.mkdir()
+
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory '{(tmp_path / 'plan').as_posix()}'; "
+        f"New-CasePackage -Directory '{src.as_posix()}' "
+        f"-RelativeNames @('../outside.txt') "
+        f"-DestinationDirectory '{out.as_posix()}' -LeafName 'wpd-test'"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert outside.read_text(encoding="utf-8") == "must-not-be-packaged"
+    assert not list(out.glob("wpd-test-*.zip"))
 
 
 def test_plan_mode_with_remote_lists_action_and_remote_safety_block(tmp_path):

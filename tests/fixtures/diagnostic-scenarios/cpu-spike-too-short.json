@@ -1,0 +1,81 @@
+{
+  "id": "cpu-spike-too-short",
+  "title": "CPU spike shorter than the rule minimum",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T12:00:00Z",
+          "AverageCpuLoadPercent": 95,
+          "ProcessorQueueLength": 0.5,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480
+        },
+        {
+          "TimestampUtc": "2026-09-10T12:00:05Z",
+          "AverageCpuLoadPercent": 96,
+          "ProcessorQueueLength": 0.5,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480
+        },
+        {
+          "TimestampUtc": "2026-09-10T12:00:10Z",
+          "AverageCpuLoadPercent": 97,
+          "ProcessorQueueLength": 0.5,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480
+        }
+      ],
+      "rules": [
+        {
+          "id": "cpu-pressure-sustained",
+          "category": "cpu-pressure",
+          "title": "Sustained CPU pressure",
+          "summary": "The measured CPU series stayed at or above the configured threshold.",
+          "metric": "AverageCpuLoadPercent",
+          "comparator": "ge",
+          "threshold": 80,
+          "minimumSamples": 5,
+          "minimumDurationSeconds": 5,
+          "sourceArtifact": "performance-samples.csv",
+          "severity": {
+            "default": "medium",
+            "escalations": [
+              {
+                "severity": "high",
+                "when": "the qualifying run is at or above 95 percent and the sampling window contains at least 30 consecutive samples"
+              }
+            ]
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": [
+              {
+                "level": "High",
+                "when": "the run is at least 10 consecutive samples, no sample in the run is null, and the independent per-process CPU series names a top consumer inside the same window"
+              },
+              {
+                "level": "Low",
+                "when": "fewer than 5 finite CPU readings exist in the window, or the CPU source is the averaged fallback view rather than the utility counter"
+              }
+            ]
+          },
+          "uncertainty": "A counter threshold is not causation.",
+          "nextSteps": [
+            "Collect a CPU trace over the cited window."
+          ],
+          "suggestedWprProfile": "CPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

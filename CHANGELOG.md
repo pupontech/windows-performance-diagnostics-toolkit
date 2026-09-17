@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+Crash and servicing evidence follow-up to the 1.0.0 incident-capture release.
+
+- **Crash findings now consume collected artifacts.** `Get-CrashAnalysis` keeps
+  copied minidumps visible even when their incident date is outside the bounded
+  24-hour System event query. Nearby BugCheck 1001 events can provide a
+  correlated code; minidump filename dates and LiveKernelReports filename
+  classes are retained as explicit hints, not root-cause claims. Repeated dump
+  evidence is grouped by a problem signature.
+- **Bounded servicing-log analysis.** Copied CBS, DISM, setup and boot logs are
+  read only through a bounded byte window and reduced to normalized error
+  signatures, counts and line ranges. Raw lines remain in their original
+  `bootfailure\` artifacts. Recurring signatures such as
+  `CBS_E_INVALID_PACKAGE` become `servicing-failure` findings and appear in
+  `servicing-log-analysis.json`.
+- **Evidence-boundary hardening.** Reparse-point and multi-link files or parent
+  directories are refused before analysis; a source that grows during a read
+  cannot exceed `maxScanBytes`, and capped prefixes are reported as partial
+  evidence. Source dump timestamps govern crash lookback membership, with
+  filename dates used only as fallback hints. Missing, partial and failed
+  servicing analysis now produce distinct coverage findings instead of silently
+  disappearing.
+- **Findings/report wiring.** The shared collection tail writes and hashes the
+  servicing analysis artifact, passes crash and servicing evidence into
+  `Evaluate-Findings`, and renders the results under an explicit crash/servicing
+  evidence heading. The first slice intentionally does not decode dump binaries
+  or claim complete CBS/DISM grammar coverage.
+
 ## 1.0.0 — 2026-09-10
 
 Incident-capture release: every telemetry source now shares one capture window,

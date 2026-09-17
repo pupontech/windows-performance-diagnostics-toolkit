@@ -1,0 +1,120 @@
+{
+  "id": "single-core-queue-coverage",
+  "title": "Queue pressure on one core without total CPU pressure",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T20:00:00Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:05Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:10Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:15Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:20Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:25Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:30Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:35Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:40Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:45Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:50Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        },
+        {
+          "TimestampUtc": "2026-09-10T20:00:55Z",
+          "ProcessorQueueLength": 3.5,
+          "AverageCpuLoadPercent": 15
+        }
+      ],
+      "rules": [
+        {
+          "id": "cpu-scheduling-queue-pressure",
+          "category": "cpu-pressure",
+          "title": "Processor queue pressure",
+          "summary": "The processor queue stayed at or above the configured depth.",
+          "metric": "ProcessorQueueLength",
+          "comparator": "ge",
+          "threshold": 2,
+          "minimumSamples": 10,
+          "minimumDurationSeconds": 10,
+          "sourceArtifact": "performance-samples.csv",
+          "severity": {
+            "default": "low",
+            "escalations": [
+              {
+                "severity": "medium",
+                "when": "the queue run coincides with a sustained CPU or DPC and interrupt run in the same window"
+              }
+            ]
+          },
+          "confidence": {
+            "default": "Low",
+            "conditions": []
+          },
+          "correlationRequirements": [
+            {
+              "metric": "AverageCpuLoadPercent",
+              "comparator": "ge",
+              "threshold": 70,
+              "kind": "required-any-of",
+              "note": "A queue can form while total CPU is low"
+            }
+          ],
+          "uncertainty": "A queue of two is a documented starting point, not a saturation proof.",
+          "nextSteps": [
+            "Collect a CPU trace to see the scheduler state."
+          ],
+          "suggestedWprProfile": "CPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

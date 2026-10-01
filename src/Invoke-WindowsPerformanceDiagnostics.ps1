@@ -8286,8 +8286,10 @@ if ($script:WpdTieredEngaged) {
     if ($reportHandoff.status -eq 'written') {
         [void]$collectedArtifacts.Add('case/technician-report.html')
         $collectionManifest.artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
-        Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
     }
+    # Persist unavailable/error handoffs too. Otherwise the on-disk case loses
+    # the coverage reason whenever the optional report module cannot write.
+    Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
 }
 
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"

@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -53,12 +54,17 @@ foreach ($name in @({names})) {{
 Set-StrictMode -Version Latest
 {body}
 """
-    result = subprocess.run(
-        [POWERSHELL_EXE, "-NoLogo", "-NoProfile", "-Command", harness],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
+    # Windows CreateProcess rejects oversized -Command argv (WinError 206).
+    # Use a real script file so embedded preset JSON does not consume argv space.
+    with tempfile.TemporaryDirectory(prefix="wpd-tiered-harness-") as directory:
+        script_path = Path(directory) / "harness.ps1"
+        script_path.write_text(harness, encoding="utf-8")
+        result = subprocess.run(
+            [POWERSHELL_EXE, "-NoLogo", "-NoProfile", "-File", str(script_path)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
     assert result.returncode == 0, f"pwsh failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     return result.stdout
 

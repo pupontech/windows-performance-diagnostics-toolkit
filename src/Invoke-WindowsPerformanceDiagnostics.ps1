@@ -800,7 +800,8 @@ function Invoke-CasePackageVerification {
             foreach ($innerArtifact in $innerArtifacts) {
                 $innerName = [string](Get-CaseJsonProperty -InputObject $innerArtifact -Name 'Name')
                 if (-not [string]::IsNullOrWhiteSpace($innerName)) {
-                    $innerByName[$innerName.ToUpperInvariant()] = $innerArtifact
+                    $normalizedInnerName = Get-ValidatedRemoteArtifactName -Name $innerName
+                    $innerByName[$normalizedInnerName.ToUpperInvariant()] = $innerArtifact
                 }
             }
             foreach ($outerName in $outerArtifactsByName.Keys) {

@@ -101,7 +101,7 @@ jobs:
           $engines = @((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'), 'pwsh')
           foreach ($engine in $engines) {
             $case = Join-Path $env:RUNNER_TEMP ('wpd-tiered-' + [guid]::NewGuid().ToString('N'))
-            & $engine -NoProfile -File src/Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -Preset general -DurationSeconds 2 -ConfirmLocalCollection -OutputDirectory $case -ZipOutput
+            & $engine -NoProfile -File src/Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -Preset general -DurationSeconds 5 -ConfirmLocalCollection -OutputDirectory $case -ZipOutput
             if ($LASTEXITCODE -ne 0) { throw "Tiered collection failed under $engine" }
             $manifestPath = Join-Path $case 'diagnostic-manifest.json'
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json

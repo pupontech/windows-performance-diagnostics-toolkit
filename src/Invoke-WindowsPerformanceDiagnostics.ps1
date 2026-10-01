@@ -46,8 +46,57 @@ param(
 
     [string]$SymptomContext,
 
-    [ValidateSet('baseline', 'cpu-heavy', 'memory-pressure', 'storage-io', 'network-io', 'boot-slowdown', 'application-freeze')]
+    # Functional presets: the 13 canonical names from config/diagnostic-presets.json
+    # plus the 3 deprecated aliases that existing manifests and remote forwarding
+    # still use (baseline -> general, network-io -> network,
+    # application-freeze -> ui-hang). The alias map lives in the configuration
+    # file, not here, and the manifest records both the requested and the
+    # effective name.
+    [ValidateSet(
+        'general', 'cpu-heavy', 'memory-pressure', 'memory-leak', 'storage-io',
+        'network', 'gpu', 'ui-hang', 'ui-stutter', 'boot-slowdown', 'audio-glitch',
+        'power', 'intermittent',
+        'baseline', 'network-io', 'application-freeze'
+    )]
     [string]$Preset,
+
+    # ---- Tiered architecture (v2) --------------------------------------
+    # Tier 0 static inventory is collected once per run and served from a session
+    # cache; Tier 1 counters sample at or above the 1 s floor; Tier 2 is the WPR
+    # recording; Tier 3 is opt-in escalation. None of these switches changes a
+    # default: a run without a preset behaves exactly as v1.0 did.
+    [switch]$Repro,
+
+    [switch]$FlightRecorder,
+
+    [ValidateSet('Standard', 'Redacted', 'Full')]
+    [string]$PrivacyLevel = 'Standard',
+
+    [switch]$ConfirmFullPrivacy,
+
+    # 0 = take the preset's Tier 1 cadence; any explicit value must be >= 1.
+    [ValidateRange(0, 3600)]
+    [int]$Tier1IntervalSeconds = 0,
+
+    [switch]$RefreshInventory,
+
+    # WPR file mode records to an unbounded file, so it is opt-in and never a
+    # default; -AcceptUnboundedFileMode also accepts the free-space risk.
+    [switch]$AllowWprFileMode,
+
+    [switch]$AcceptUnboundedFileMode,
+
+    [switch]$CaptureWpaTables,
+
+    [switch]$CollectWaitChains,
+
+    [switch]$CollectPoolEscalation,
+
+    [switch]$CollectSearchContext,
+
+    [switch]$CollectMinifilters,
+
+    [switch]$ConfirmEscalationCollection,
 
     # ---- Incident capture mode (v1.0) -----------------------------------
     # Everything below shares ONE capture window: WPR, process/commit samples,
@@ -88,7 +137,7 @@ $ErrorActionPreference = 'Stop'
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
 # keeps the two in sync so drift fails CI.
-$script:ScriptVersion = '1.0.0'
+$script:ScriptVersion = '2.0.0'
 try {
     $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
 }
@@ -4787,7 +4836,7 @@ function ConvertTo-FindingsHtml {
         [void]$sb.AppendLine("<h2>$(ConvertTo-HtmlEncoded $supportingHeading)</h2>")
         [void]$sb.AppendLine(('<p class="no-external">{0}</p>' -f (ConvertTo-HtmlEncoded $supportingLead)))
         foreach ($finding in $otherFindings) {
-            [void]$sb.AppendLine("<div class='finding pressure'>")
+            [void]$sb.AppendLine("<div class='finding info'>")
             [void]$sb.AppendLine("<h3>$(ConvertTo-HtmlEncoded $finding.category)</h3>")
             [void]$sb.AppendLine('<table>')
             [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
@@ -4824,7 +4873,7 @@ function ConvertTo-FindingsHtml {
         # 'we could not measure this'.
         [void]$sb.AppendLine('<div class="finding info">')
         [void]$sb.AppendLine('<h3>No Sustained Pressure Detected</h3>')
-        [void]$sb.AppendLine('<p>The collected window was measured and no pressure rule was breached for a sustained period. This does not prove the system is healthy - a short or intermittent slowdown can fall outside the sampled window. did not trigger any pressure rules. Consider re-running with a longer duration or different WPR profile.</p>')
+        [void]$sb.AppendLine('<p>The collected window was measured and no pressure rule was breached for a sustained period. This does not prove the system is healthy - a short or intermittent slowdown can fall outside the sampled window. Consider re-running with a longer duration or different WPR profile.</p>')
         [void]$sb.AppendLine('</div>')
     }
 
@@ -4958,6 +5007,1217 @@ function Write-CollectionOutputs {
 
     Write-JsonFile -InputObject $CollectionManifest -Path (Join-Path -Path $OutputDirectory -ChildPath 'diagnostic-manifest.json')
     return $CollectionManifest
+}
+
+# =============================================================================
+# Tiered architecture integration (v2)
+# =============================================================================
+# The v2 surface is composed from the modules that ship beside this script
+# (<script root>\Wpd.*.psm1). The modules own domain logic (Tier 0 inventory,
+# Tier 1 telemetry, ETW/WPR, events, escalation, findings/report); this entry
+# point owns mode dispatch, consent, safe cleanup and the manifest contract.
+# Nothing in this section writes an artifact, so Plan mode calls the SAME
+# resolvers and describes the real preset, cadence, capture mode and escalation
+# set without collecting anything. Every module call is guarded: an absent
+# module is recorded as unavailable and never aborts the run, and no value is
+# ever invented when a module is missing (an unknown preset, profile or module
+# is reported unsupported, never silently substituted).
+
+function Get-WpdIntegrationProperty {
+    param(
+        [AllowNull()][object]$InputObject,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($null -eq $InputObject) { return $null }
+    $dictionary = $InputObject -as [System.Collections.IDictionary]
+    if ($null -ne $dictionary) {
+        if ($dictionary.Contains($Name)) { return $dictionary[$Name] }
+        foreach ($key in @($dictionary.Keys)) {
+            if ([string]::Equals([string]$key, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $dictionary[$key]
+            }
+        }
+    }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-WpdIntegrationNumber {
+    <# First finite numeric property value, or $null. Never coerces a string or a
+       non-finite value into a measurement. #>
+    param(
+        [AllowNull()][object]$InputObject,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+    foreach ($name in @($Names)) {
+        $value = Get-WpdIntegrationProperty -InputObject $InputObject -Name $name
+        if ($null -eq $value) { continue }
+        if ($value -is [bool]) { continue }
+        try {
+            $number = [double]$value
+        }
+        catch {
+            continue
+        }
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { continue }
+        return $number
+    }
+    return $null
+}
+
+function Get-WpdModuleCommandName {
+    <# Resolves a tiered-module command to the name that is actually callable here.
+       Import-WpdModuleSurface uses PowerShell's -Prefix WpdSurface, which inserts
+       the prefix after the verb (Get-WpdSurfaceWpdEtwPresetProfile), so that
+       prefixed name is tried first and the plain name second (which also lets a
+       caller that imported the modules itself drive the integration functions).
+       $null means the command is not available at all. #>
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $prefix = 'WpdSurface'
+    $dash = $Name.IndexOf('-')
+    $prefixedName = if ($dash -gt 0) {
+        $Name.Substring(0, $dash + 1) + $prefix + $Name.Substring($dash + 1)
+    }
+    else {
+        $prefix + $Name
+    }
+    if ($null -ne (Get-Command -Name $prefixedName -CommandType Function -ErrorAction SilentlyContinue)) { return $prefixedName }
+    if ($null -ne (Get-Command -Name $Name -CommandType Function -ErrorAction SilentlyContinue)) { return $Name }
+    return $null
+}
+
+function Test-WpdModuleCommand {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return ($null -ne (Get-WpdModuleCommandName -Name $Name))
+}
+
+function Invoke-WpdModuleCall {
+    <# Calls a tiered-module command through its callable name. An unavailable
+       command is a stated failure, never a silent no-op. #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()][hashtable]$Arguments
+    )
+    $commandName = Get-WpdModuleCommandName -Name $Name
+    if ($null -eq $commandName) {
+        throw ("The tiered module command '{0}' is not available." -f $Name)
+    }
+    if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
+        return & $commandName
+    }
+    return & $commandName @Arguments
+}
+
+function Import-WpdModuleSurface {
+    <# Imports the tiered modules from the script root. Returns a record stating
+       which modules loaded and why any did not. It never throws: a missing or
+       broken module is a stated coverage gap, not a failed run. #>
+    param(
+        [AllowNull()][string[]]$Name = @('Wpd.Collectors', 'Wpd.Common', 'Wpd.Inventory', 'Wpd.Telemetry', 'Wpd.Etw', 'Wpd.Events', 'Wpd.Escalation', 'Wpd.Report')
+    )
+    $loaded = New-Object System.Collections.ArrayList
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($moduleName in @($Name)) {
+        if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+            [void]$missing.Add([pscustomobject]@{ module = $moduleName; reason = 'script-root-unavailable' })
+            continue
+        }
+        $modulePath = Join-Path -Path $PSScriptRoot -ChildPath ($moduleName + '.psm1')
+        if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
+            [void]$missing.Add([pscustomobject]@{ module = $moduleName; reason = 'module-file-not-present' })
+            continue
+        }
+        try {
+            # Import into the session-global scope with a private command prefix.
+            # A Local or Script import made inside this function disappears when
+            # the function returns, leaving the surface marked loaded but making
+            # its commands unreachable to the resolvers. The prefix avoids
+            # shadowing legacy helpers while Get-WpdModuleCommandName can call the
+            # actual module-owned command through its verb-prefixed WpdSurface
+            # name.
+            $importedModule = Import-Module -Name $modulePath -PassThru -Scope Global -Prefix WpdSurface -DisableNameChecking -ErrorAction Stop -WarningAction SilentlyContinue
+            [void]$loaded.Add($moduleName)
+        }
+        catch {
+            [void]$missing.Add([pscustomobject]@{ module = $moduleName; reason = $_.Exception.Message })
+        }
+    }
+    $status = 'partial'
+    if ($missing.Count -eq 0) { $status = 'complete' }
+    if ($loaded.Count -eq 0) { $status = 'unavailable' }
+    return [pscustomobject]@{
+        status = $status
+        loaded = @($loaded)
+        missing = @($missing)
+        moduleRoot = $PSScriptRoot
+    }
+}
+
+function Get-WpdPresetConfigurationPath {
+    <# The preset and rule documents live in <script root>\..\config, with a
+       beside-the-script fallback for a staged standalone copy. #>
+    param([AllowNull()][string]$Root = $PSScriptRoot)
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
+    $candidates = @(
+        [System.IO.Path]::Combine($Root, '..', 'config', 'diagnostic-presets.json'),
+        [System.IO.Path]::Combine($Root, 'config', 'diagnostic-presets.json')
+    )
+    foreach ($candidate in $candidates) {
+        $full = $candidate
+        try { $full = [System.IO.Path]::GetFullPath($candidate) } catch { continue }
+        if (Test-Path -LiteralPath $full -PathType Leaf) { return $full }
+    }
+    return $null
+}
+
+function Get-WpdPresetDocument {
+    param([AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        return (Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Resolve-WpdPresetSelection {
+    <# Resolves the requested preset to its canonical name and its functional
+       contract (Tier 1 counters, expected duration, analysis modules, event
+       channels, escalation options, trace budget, privacy level). The alias map
+       and the enforcement both come from config/diagnostic-presets.json, never
+       from code. An unknown name is reported as unknown-preset with the canonical
+       list; it is never mapped onto a different preset. #>
+    param(
+        [AllowNull()][string]$Preset,
+        [AllowNull()][object]$PresetDocument,
+        [AllowNull()][string]$ConfigurationPath
+    )
+
+    $document = $PresetDocument
+    if ($null -eq $document -and -not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
+        $document = Get-WpdPresetDocument -Path $ConfigurationPath
+    }
+
+    $canonical = @()
+    $aliases = @{}
+    $privacyDefault = 'Standard'
+    $samplingFloorSeconds = 1
+    if ($null -ne $document) {
+        $canonicalValue = Get-WpdIntegrationProperty -InputObject $document -Name 'canonicalPresets'
+        if ($null -ne $canonicalValue) { $canonical = @($canonicalValue) }
+        $aliasValue = Get-WpdIntegrationProperty -InputObject $document -Name 'aliases'
+        if ($null -ne $aliasValue) {
+            foreach ($property in @($aliasValue.PSObject.Properties)) {
+                $aliases[$property.Name] = [string]$property.Value
+            }
+        }
+        $privacyValue = Get-WpdIntegrationProperty -InputObject $document -Name 'privacyDefault'
+        if (-not [string]::IsNullOrWhiteSpace([string]$privacyValue)) { $privacyDefault = [string]$privacyValue }
+        $floorValue = Get-WpdIntegrationProperty -InputObject $document -Name 'samplingFloorSeconds'
+        if ($null -ne $floorValue) { $samplingFloorSeconds = [int]$floorValue }
+    }
+
+    $requested = $null
+    if (-not [string]::IsNullOrWhiteSpace($Preset)) { $requested = $Preset.Trim() }
+
+    $record = [ordered]@{
+        status = 'not-requested'
+        requested = $requested
+        effective = $null
+        isAlias = $false
+        source = if ($null -ne $document) { 'config/diagnostic-presets.json' } else { 'unavailable' }
+        canonicalNames = @($canonical)
+        privacyDefault = $privacyDefault
+        samplingFloorSeconds = $samplingFloorSeconds
+        tier1Counters = @()
+        tier1SampleIntervalSeconds = $null
+        expectedDurationSeconds = $null
+        analysisModules = @()
+        eventChannels = @()
+        escalationOptions = @()
+        traceSizeBudget = $null
+        privacyLevel = $null
+        automaticRemediation = $false
+        displayName = $null
+        symptomSummary = $null
+        reasons = @()
+    }
+
+    if ($null -eq $requested) { return [pscustomobject]$record }
+
+    $effective = $requested
+    $isAlias = $false
+    if ($aliases.ContainsKey($requested)) {
+        $effective = [string]$aliases[$requested]
+        $isAlias = $true
+    }
+
+    $presetValue = $null
+    if ($null -ne $document) {
+        $presets = Get-WpdIntegrationProperty -InputObject $document -Name 'presets'
+        $presetValue = Get-WpdIntegrationProperty -InputObject $presets -Name $effective
+    }
+
+    if ($null -eq $presetValue) {
+        $record.status = 'unknown-preset'
+        $record.effective = $null
+        $record.isAlias = $false
+        $record.reasons = @('unknown-preset:' + $requested)
+        return [pscustomobject]$record
+    }
+
+    $tier2 = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'tier2'
+    $remediation = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'remediation'
+    $record.status = 'resolved'
+    $record.effective = $effective
+    $record.isAlias = $isAlias
+    $record.tier1Counters = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'tier1Counters')
+    $record.tier1SampleIntervalSeconds = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'tier1SampleIntervalSeconds'
+    $record.expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'expectedDurationSeconds'
+    $record.analysisModules = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'analysisModules')
+    $record.eventChannels = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'eventChannels')
+    $record.escalationOptions = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'escalationOptions')
+    $record.traceSizeBudget = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'traceSizeBudget'
+    $record.privacyLevel = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'privacyLevel'
+    $record.displayName = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'displayName'
+    $record.symptomSummary = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'symptomSummary'
+    $automaticRemediation = Get-WpdIntegrationProperty -InputObject $remediation -Name 'automaticRemediation'
+    $record.automaticRemediation = [bool]$automaticRemediation
+    $record.tier2WprProfiles = @(Get-WpdIntegrationProperty -InputObject $tier2 -Name 'wprProfiles')
+    $record.tier2WprDetail = Get-WpdIntegrationProperty -InputObject $tier2 -Name 'wprDetail'
+    $record.tier2WprMode = Get-WpdIntegrationProperty -InputObject $tier2 -Name 'wprMode'
+    if ($isAlias) { $record.reasons = @('alias-resolved:' + $requested + '->' + $effective) }
+    return [pscustomobject]$record
+}
+
+function Resolve-WpdPresetCapturePolicy {
+    <# The WPR profile/detail/mode/budget policy for a resolved preset. The Etw
+       module owns the preset-to-profile table, so it is used when present; the
+       configuration fallback accepts a profile only when the entry point already
+       accepts that name. An unverified profile name is reported as unsupported
+       and is never silently substituted. #>
+    param(
+        [AllowNull()][object]$Selection,
+        [switch]$AllowFileMode
+    )
+
+    $selectionStatus = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'status')
+    $effective = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'effective')
+    $record = [ordered]@{
+        status = 'not-requested'
+        preset = $effective
+        profile = $null
+        qualifier = $null
+        profileSpec = $null
+        mode = $null
+        unbounded = $false
+        bufferSemantics = $null
+        traceBudgetMB = $null
+        maxDurationSeconds = $null
+        expectedDurationSeconds = $null
+        analysisTables = @()
+        source = 'unavailable'
+        reasons = @()
+    }
+
+    if ($selectionStatus -ne 'resolved' -or [string]::IsNullOrWhiteSpace($effective)) {
+        $record.status = if ($selectionStatus -eq 'not-requested') { 'not-requested' } else { 'unavailable' }
+        if ($selectionStatus -eq 'unknown-preset') { $record.reasons = @('unknown-preset') }
+        return [pscustomobject]$record
+    }
+
+    if (Test-WpdModuleCommand -Name 'Get-WpdEtwPresetProfile') {
+        try {
+            $policyArguments = @{ Preset = $effective }
+            if ($AllowFileMode) { $policyArguments['AllowFileMode'] = $true }
+            $policy = Invoke-WpdModuleCall -Name 'Get-WpdEtwPresetProfile' -Arguments $policyArguments
+            $record.status = 'resolved'
+            $record.source = 'Wpd.Etw'
+            $record.profile = $policy.Profile
+            $record.qualifier = if (-not [string]::IsNullOrWhiteSpace([string]$Selection.tier2WprDetail)) { [string]$Selection.tier2WprDetail } else { $policy.Qualifier }
+            $record.profileSpec = if (-not [string]::IsNullOrWhiteSpace([string]$record.qualifier)) { '{0}.{1}' -f $record.profile, $record.qualifier } else { $policy.ProfileSpec }
+            $record.mode = $policy.Mode
+            $record.unbounded = [bool]$policy.Unbounded
+            $record.bufferSemantics = $policy.BufferSemantics
+            $configuredBudget = Get-WpdIntegrationProperty -InputObject $Selection.traceSizeBudget -Name 'budgetMiB'
+            $record.traceBudgetMB = if ($null -ne $configuredBudget) { $configuredBudget } else { $policy.TraceBudgetMB }
+            $record.maxDurationSeconds = $policy.MaxDurationSeconds
+            $record.expectedDurationSeconds = if ($null -ne $Selection.expectedDurationSeconds) { $Selection.expectedDurationSeconds } else { $policy.ExpectedDurationSeconds }
+            $record.analysisTables = @($policy.AnalysisTables)
+            $record.reasons = @('wpr-policy-from-module', 'budget-and-expected-duration-from-config')
+            return [pscustomobject]$record
+        }
+        catch {
+            $record.status = 'unavailable'
+            $record.reasons = @('preset-capture-policy-error:' + $_.Exception.Message)
+            return [pscustomobject]$record
+        }
+    }
+
+    # Fallback: the preset document is the only policy source available.
+    $profiles = @(Get-WpdIntegrationProperty -InputObject $Selection -Name 'tier2WprProfiles')
+    $detail = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'tier2WprDetail')
+    $mode = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'tier2WprMode')
+    $budget = Get-WpdIntegrationProperty -InputObject $Selection -Name 'traceSizeBudget'
+    $acceptedProfiles = @('GeneralProfile', 'CPU', 'DiskIO', 'FileIO', 'Network', 'Power', 'GPU', 'Registry')
+    if ($profiles.Count -eq 0) {
+        $record.status = 'unavailable'
+        $record.reasons = @('preset-profile-not-declared')
+        return [pscustomobject]$record
+    }
+    $profileName = [string]$profiles[0]
+    if ($acceptedProfiles -notcontains $profileName) {
+        $record.status = 'unsupported-profile-name'
+        $record.reasons = @('profile-not-accepted-by-entry-point:' + $profileName)
+        return [pscustomobject]$record
+    }
+    $record.status = 'resolved'
+    $record.source = 'config/diagnostic-presets.json'
+    $record.profile = $profileName
+    $record.qualifier = $detail
+    $record.profileSpec = ('{0}.{1}' -f $profileName, $detail)
+    $record.mode = if ([string]::IsNullOrWhiteSpace($mode)) { 'memory' } else { $mode }
+    $record.unbounded = ($record.mode -eq 'file')
+    $record.bufferSemantics = if ($record.unbounded) { 'unbounded-file' } else { 'circular-memory' }
+    $record.traceBudgetMB = Get-WpdIntegrationProperty -InputObject $budget -Name 'budgetMiB'
+    $record.maxDurationSeconds = Get-WpdIntegrationProperty -InputObject $Selection -Name 'expectedDurationSeconds'
+    $record.expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $Selection -Name 'expectedDurationSeconds'
+    $record.reasons = @('preset-capture-policy-from-config')
+    return [pscustomobject]$record
+}
+
+function Resolve-WpdTier1Interval {
+    <# Tier 1 cadence: an explicit request wins, otherwise the preset's interval,
+       otherwise the 1 s floor. A requested interval below the floor is refused
+       with a stated reason - it is never clamped silently. #>
+    param(
+        [AllowNull()][object]$RequestedSeconds,
+        [AllowNull()][object]$PresetSeconds,
+        [AllowNull()][object]$SamplingFloorSeconds = 1
+    )
+
+    $floor = 1
+    if ($null -ne $SamplingFloorSeconds) { $floor = [int]$SamplingFloorSeconds }
+    if ($floor -lt 1) { $floor = 1 }
+
+    $record = [ordered]@{
+        status = 'resolved'
+        intervalSeconds = $floor
+        source = 'sampling-floor'
+        floorSeconds = $floor
+        reasons = @()
+    }
+
+    $requested = $RequestedSeconds
+    if ($null -ne $requested -and [string]::IsNullOrWhiteSpace([string]$requested)) { $requested = $null }
+    if ($null -ne $requested) {
+        $requestedValue = [double]$requested
+        if ($requestedValue -lt $floor) {
+            $record.status = 'refused-sub-second'
+            $record.intervalSeconds = $null
+            $record.source = 'requested'
+            $record.reasons = @('interval-below-floor:' + $floor)
+            return [pscustomobject]$record
+        }
+        $record.intervalSeconds = [int]$requestedValue
+        $record.source = 'requested'
+        return [pscustomobject]$record
+    }
+
+    if ($null -ne $PresetSeconds) {
+        $presetValue = [double]$PresetSeconds
+        if ($presetValue -lt $floor) {
+            $record.status = 'refused-sub-second'
+            $record.intervalSeconds = $null
+            $record.source = 'preset'
+            $record.reasons = @('preset-interval-below-floor:' + $floor)
+            return [pscustomobject]$record
+        }
+        $record.intervalSeconds = [int]$presetValue
+        $record.source = 'preset'
+    }
+    return [pscustomobject]$record
+}
+
+function Resolve-WpdCaptureMode {
+    <# Repro and Flight Recorder are mutually exclusive. Both selected is a stated
+       conflict, not a silent preference for one of them. #>
+    param(
+        [switch]$Repro,
+        [switch]$FlightRecorder,
+        [AllowNull()][string]$Preset,
+        [switch]$AcceptUnboundedFileMode
+    )
+
+    $record = [ordered]@{
+        status = 'not-requested'
+        captureMode = $null
+        strategy = $null
+        reasons = @()
+    }
+    if ($Repro -and $FlightRecorder) {
+        $record.status = 'conflicting-modes'
+        $record.reasons = @('repro-and-flight-recorder-are-mutually-exclusive')
+        return [pscustomobject]$record
+    }
+    if (-not $Repro -and -not $FlightRecorder) { return [pscustomobject]$record }
+
+    $mode = if ($FlightRecorder) { 'FlightRecorder' } else { 'Repro' }
+    $record.status = 'resolved'
+    $record.captureMode = $mode
+
+    if (Test-WpdModuleCommand -Name 'Get-WpdCaptureStrategy') {
+        try {
+            $strategyArguments = @{ CaptureMode = $mode; Preset = $Preset }
+            if ($AcceptUnboundedFileMode) { $strategyArguments['AcceptUnboundedFileMode'] = $true }
+            $strategy = Invoke-WpdModuleCall -Name 'Get-WpdCaptureStrategy' -Arguments $strategyArguments
+            $record.strategy = $strategy
+            return [pscustomobject]$record
+        }
+        catch {
+            $record.reasons = @('capture-strategy-error:' + $_.Exception.Message)
+            return [pscustomobject]$record
+        }
+    }
+
+    $record.strategy = [pscustomobject]@{
+        CaptureMode = $mode
+        BufferSemantics = 'circular-memory'
+        Unbounded = $false
+        Source = 'entry-point-default'
+        Note = 'The collector module is not loaded, so the strategy is the documented memory-mode default: bounded circular buffer, no unbounded file recording.'
+    }
+    return [pscustomobject]$record
+}
+
+function Get-WpdTier0InventorySnapshot {
+    <# Tier 0 inventory is collected at most once per run and served from a
+       session cache keyed by preset/privacy/host, because re-querying static
+       classes inside the sampling loop is the defect this replaces. -Refresh is
+       the explicit escape hatch. With no provider and no collector module the
+       snapshot is 'unavailable' with a reason - never a fabricated inventory. #>
+    param(
+        [AllowNull()][string]$CacheKey = 'tier0|default',
+        [AllowNull()][string]$Preset = 'general',
+        [AllowNull()][string]$PrivacyLevel = 'Standard',
+        [AllowNull()][object]$Provider,
+        [switch]$Refresh
+    )
+
+    if ($null -eq (Get-Variable -Scope Script -Name WpdTier0Cache -ErrorAction SilentlyContinue)) {
+        $script:WpdTier0Cache = @{}
+    }
+    if ([string]::IsNullOrWhiteSpace($CacheKey)) { $CacheKey = 'tier0|default' }
+
+    if ($Refresh -and $script:WpdTier0Cache.ContainsKey($CacheKey)) {
+        $script:WpdTier0Cache.Remove($CacheKey)
+    }
+    if ($script:WpdTier0Cache.ContainsKey($CacheKey)) {
+        $cached = $script:WpdTier0Cache[$CacheKey]
+        return [pscustomobject]@{
+            status = $cached.status
+            coverage = $cached.coverage
+            cached = $true
+            queries = $cached.queries
+            capabilities = @($cached.capabilities)
+            records = @($cached.records)
+            reasons = @($cached.reasons)
+            source = $cached.source
+            cacheKey = $CacheKey
+        }
+    }
+
+    $result = $null
+    $source = 'unavailable'
+    if ($null -ne $Provider) {
+        try {
+            $result = & $Provider
+            $source = 'injected-provider'
+        }
+        catch {
+            $result = $null
+            $source = 'provider-error:' + $_.Exception.Message
+        }
+    }
+    elseif (Test-WpdModuleCommand -Name 'Invoke-WpdTier0Collection') {
+        try {
+            $result = Invoke-WpdModuleCall -Name 'Invoke-WpdTier0Collection' -Arguments @{
+                CacheKey = $CacheKey
+                Preset = $Preset
+                PrivacyLevel = $PrivacyLevel
+            }
+            $source = 'Wpd.Collectors'
+        }
+        catch {
+            $result = $null
+            $source = 'collector-error:' + $_.Exception.Message
+        }
+    }
+
+    if ($null -eq $result) {
+        $snapshot = [pscustomobject]@{
+            status = 'unavailable'
+            coverage = 'unavailable'
+            cached = $false
+            queries = 0
+            capabilities = @()
+            records = @()
+            reasons = @('tier0-inventory-unavailable:' + $source)
+            source = $source
+            cacheKey = $CacheKey
+        }
+        $script:WpdTier0Cache[$CacheKey] = $snapshot
+        return $snapshot
+    }
+
+    $statusValue = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'status')
+    if ([string]::IsNullOrWhiteSpace($statusValue)) { $statusValue = 'partial' }
+    $coverageValue = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'coverage')
+    if ([string]::IsNullOrWhiteSpace($coverageValue)) { $coverageValue = 'partial' }
+    $recordsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'records'
+    if ($null -eq $recordsValue) { $recordsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'items' }
+    $reasonsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'reasons'
+    if ($null -eq $reasonsValue) { $reasonsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'reason' }
+
+    $snapshot = [pscustomobject]@{
+        status = $statusValue
+        coverage = $coverageValue
+        cached = $false
+        queries = 1
+        capabilities = @(Get-WpdIntegrationProperty -InputObject $result -Name 'capabilities')
+        records = @($recordsValue)
+        reasons = @($reasonsValue)
+        source = $source
+        cacheKey = $CacheKey
+    }
+    $script:WpdTier0Cache[$CacheKey] = $snapshot
+    return $snapshot
+}
+
+function Get-WpdTier1SampleRow {
+    <# Pure Tier 1 sample transform: performance-COUNTER rows in, one sample row
+       out. It queries nothing, so it is exerciseable off Windows and, crucially,
+       so the sampling loop never re-queries a Tier 0 class
+       (Win32_OperatingSystem / Win32_Processor / Win32_LogicalDisk / Win32_Volume).
+       A missing counter row yields $null plus an explicit unavailable reason -
+       never zero, never a static value presented as a live measurement. #>
+    param(
+        [AllowNull()][object[]]$ProcessorCounterRows = @(),
+        [AllowNull()][object[]]$MemoryCounterRows = @(),
+        [AllowNull()][object[]]$LogicalDiskCounterRows = @(),
+        [AllowNull()][object[]]$SystemCounterRows = @()
+    )
+
+    $processorRows = @($ProcessorCounterRows)
+    $memoryRows = @($MemoryCounterRows)
+    $diskRows = @($LogicalDiskCounterRows)
+    $systemRows = @($SystemCounterRows)
+    $reasons = New-Object System.Collections.ArrayList
+
+    $perCore = @()
+    $totalCpu = $null
+    $totalUtility = $null
+    $totalUser = $null
+    $totalKernel = $null
+    $totalDpc = $null
+    $totalInterrupt = $null
+    $coreCount = 0
+
+    foreach ($row in $processorRows) {
+        $rowName = [string](Get-WpdIntegrationProperty -InputObject $row -Name 'Name')
+        $isTotal = ($rowName -eq '_Total' -or $rowName -like '*_Total')
+        $entry = [pscustomobject]@{
+            Name = $rowName
+            ProcessorNumber = if ($isTotal) { $null } else { $rowName }
+            IsTotal = $isTotal
+            CpuTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('CpuTimePercent', 'PercentProcessorTime', 'CpuTime', 'ProcessorTimePercent')
+            UtilityPercent = Get-WpdIntegrationNumber -InputObject $row -Names @('UtilityPercent', 'ProcessorUtilityPercent', 'ProcessorUtility', 'PercentProcessorUtility')
+            UserTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('UserTimePercent', 'PercentUserTime', 'UserPercent')
+            KernelTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('KernelTimePercent', 'PercentPrivilegedTime', 'PrivilegedTimePercent', 'KernelPercent')
+            DpcTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('DpcTimePercent', 'PercentDPCTime', 'PercentDpcTime')
+            InterruptTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('InterruptTimePercent', 'PercentInterruptTime')
+            DpcsQueuedPerSec = Get-WpdIntegrationNumber -InputObject $row -Names @('DpcsQueuedPerSec', 'DpcQueuedPerSec', 'DpcsQueued')
+            InterruptsPerSec = Get-WpdIntegrationNumber -InputObject $row -Names @('InterruptsPerSec', 'InterruptRate', 'Interrupts')
+        }
+        if ($isTotal) {
+            if ($null -eq $totalCpu) { $totalCpu = $entry.CpuTimePercent }
+            if ($null -eq $totalUtility) { $totalUtility = $entry.UtilityPercent }
+            if ($null -eq $totalUser) { $totalUser = $entry.UserTimePercent }
+            if ($null -eq $totalKernel) { $totalKernel = $entry.KernelTimePercent }
+            if ($null -eq $totalDpc) { $totalDpc = $entry.DpcTimePercent }
+            if ($null -eq $totalInterrupt) { $totalInterrupt = $entry.InterruptTimePercent }
+        }
+        else {
+            $coreCount++
+            $perCore += $entry
+        }
+    }
+
+    $cpuAverages = @()
+    foreach ($entry in $perCore) {
+        if ($null -ne $entry.CpuTimePercent) { $cpuAverages += $entry.CpuTimePercent }
+    }
+    if ($null -eq $totalCpu -and $cpuAverages.Count -gt 0) {
+        $totalCpu = [Math]::Round((($cpuAverages | Measure-Object -Average).Average), 2)
+    }
+    if ($null -eq $totalCpu) {
+        [void]$reasons.Add('cpu-counter-rows-unavailable')
+    }
+
+    $processorQueueLength = $null
+    $contextSwitchesPerSec = $null
+    foreach ($row in $systemRows) {
+        if ($null -eq $processorQueueLength) {
+            $processorQueueLength = Get-WpdIntegrationNumber -InputObject $row -Names @('ProcessorQueueLength', 'QueueLength', 'Queue')
+        }
+        if ($null -eq $contextSwitchesPerSec) {
+            $contextSwitchesPerSec = Get-WpdIntegrationNumber -InputObject $row -Names @('ContextSwitchesPerSec', 'ContextSwitchRate', 'ContextSwitches')
+        }
+    }
+
+    $availableBytes = $null
+    $commitPercent = $null
+    foreach ($row in $memoryRows) {
+        if ($null -eq $availableBytes) {
+            $availableBytes = Get-WpdIntegrationNumber -InputObject $row -Names @('AvailableBytes', 'AvailableMemoryBytes')
+        }
+        if ($null -eq $commitPercent) {
+            $commitPercent = Get-WpdIntegrationNumber -InputObject $row -Names @('CommitPercent', 'PercentCommittedBytesInUse', 'CommittedBytesInUsePercent')
+        }
+    }
+    $availableMemoryMegabytes = $null
+    if ($null -ne $availableBytes) {
+        $availableMemoryMegabytes = [Math]::Round(([double]$availableBytes / 1MB), 2)
+    }
+    else {
+        [void]$reasons.Add('memory-counter-rows-unavailable')
+    }
+
+    $logicalDisks = @()
+    $totalFreeBytes = $null
+    foreach ($row in $diskRows) {
+        # _Total already aggregates the volume rows; counting it again doubles
+        # the free-space total and presents an aggregate as a real volume.
+        $diskName = [string](Get-WpdIntegrationProperty -InputObject $row -Name 'Name')
+        if ($diskName -eq '_Total') { continue }
+        $freeMegabytes = Get-WpdIntegrationNumber -InputObject $row -Names @('FreeMegabytes', 'FreeMB', 'FreeMegaBytes')
+        $freeBytes = $null
+        if ($null -ne $freeMegabytes) { $freeBytes = [double]$freeMegabytes * 1MB }
+        $logicalDisks += [pscustomobject]@{
+            Name = [string](Get-WpdIntegrationProperty -InputObject $row -Name 'Name')
+            FreeBytes = $freeBytes
+            PercentFreeSpace = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentFreeSpace', 'PercentFree')
+            PercentFreePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentFreeSpace', 'PercentFree')
+            PercentDiskReadTime = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentDiskReadTime')
+            PercentDiskWriteTime = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentDiskWriteTime')
+        }
+        if ($null -ne $freeBytes) {
+            if ($null -eq $totalFreeBytes) { $totalFreeBytes = 0.0 }
+            $totalFreeBytes = $totalFreeBytes + $freeBytes
+        }
+    }
+    $totalFreeGB = $null
+    if ($null -ne $totalFreeBytes) { $totalFreeGB = [Math]::Round(([double]$totalFreeBytes / 1GB), 2) }
+    else { [void]$reasons.Add('logical-disk-counter-rows-unavailable') }
+
+    $coverage = [ordered]@{
+        cpu = if ($null -ne $totalCpu) { 'complete' } else { 'unavailable' }
+        scheduler = if ($null -ne $processorQueueLength -or $null -ne $contextSwitchesPerSec) { 'partial' } else { 'unavailable' }
+        dpcIsr = if ($null -ne $totalDpc -or $null -ne $totalInterrupt) { 'partial' } else { 'unavailable' }
+        memory = if ($null -ne $availableBytes) { 'complete' } else { 'unavailable' }
+        storage = if ($logicalDisks.Count -gt 0) { 'partial' } else { 'unavailable' }
+    }
+
+    return [pscustomobject]@{
+        AverageCpuLoadPercent = $totalCpu
+        CpuTimePercent = $totalCpu
+        CpuUtilityPercent = $totalUtility
+        CpuUserPercent = $totalUser
+        CpuKernelPercent = $totalKernel
+        DpcPercent = $totalDpc
+        InterruptPercent = $totalInterrupt
+        ProcessorQueueLength = $processorQueueLength
+        ContextSwitchesPerSec = $contextSwitchesPerSec
+        LogicalProcessorCount = $coreCount
+        PerCore = @($perCore)
+        AvailableBytes = $availableBytes
+        AvailableMemoryMB = $availableMemoryMegabytes
+        CommitPercent = $commitPercent
+        TotalLogicalDiskFreeGB = $totalFreeGB
+        LogicalDisks = @($logicalDisks)
+        Coverage = $coverage
+        CoverageStates = @($coverage.Keys)
+        UnavailableReasons = @($reasons)
+        CounterSources = [ordered]@{
+            processors = 'Win32_PerfFormattedData_PerfOS_Processor'
+            memory = 'Win32_PerfFormattedData_PerfOS_Memory'
+            logicalDisks = 'Win32_PerfFormattedData_PerfDisk_LogicalDisk'
+            system = 'Win32_PerfFormattedData_PerfOS_System'
+        }
+    }
+}
+
+function New-WpdIncidentMarkerPlan {
+    <# The incident marker set and the argv for each wpr -marker call. Marker
+       names are this toolkit's contract; the argv comes from the Etw module so no
+       undocumented switch can be introduced here. #>
+    param(
+        [AllowNull()][string[]]$MarkerName = @('CAPTURE_START', 'REPRO_START', 'INCIDENT_START', 'INCIDENT_PEAK', 'INCIDENT_END', 'CAPTURE_STOP'),
+        [AllowNull()][string]$WprExePath = 'wpr.exe'
+    )
+
+    $entries = @()
+    foreach ($name in @($MarkerName)) {
+        $commandRecord = $null
+        $status = 'unavailable'
+        $reason = 'etw-module-not-loaded'
+        if (Test-WpdModuleCommand -Name 'New-WpdEtwWprMarkerCommand') {
+            try {
+                $commandRecord = Invoke-WpdModuleCall -Name 'New-WpdEtwWprMarkerCommand' -Arguments @{ MarkerName = $name; ToolPath = $WprExePath }
+                $status = 'resolved'
+                $reason = $null
+            }
+            catch {
+                $status = 'unavailable'
+                $reason = 'marker-command-error:' + $_.Exception.Message
+            }
+        }
+        $entries += [pscustomobject]@{
+            marker = $name
+            status = $status
+            reason = $reason
+            tool = if ($null -ne $commandRecord) { $commandRecord.Tool } else { 'wpr' }
+            arguments = if ($null -ne $commandRecord) { @($commandRecord.Arguments) } else { @() }
+            usesDocumentedMarkerSwitch = ($null -ne $commandRecord)
+        }
+    }
+
+    return [pscustomobject]@{
+        mechanism = 'wpr -marker'
+        markerCount = @($entries).Count
+        markers = @($entries)
+        allCommandsResolved = (@($entries | Where-Object { $_.status -ne 'resolved' }).Count -eq 0)
+        note = 'Markers are placed inside the same capture window as the counters so the trace and the series share one time model.'
+    }
+}
+
+function New-WpdEscalationSelectionBlock {
+    <# Tier 3 is opt-in twice: a switch selects the adapters and consent enables
+       them. Without consent the block states the required consent and returns no
+       adapters, and nothing is executed. An absent tool is reported unsupported
+       by the module, never as healthy and never as a failed run. #>
+    param(
+        [AllowNull()][string[]]$RequestedAdapter = @(),
+        [switch]$Consent,
+        [AllowNull()][string]$PrivacyLevel = 'Standard'
+    )
+
+    $requested = @($RequestedAdapter | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $record = [ordered]@{
+        status = 'not-requested'
+        requested = @($requested)
+        consentRequired = ($requested.Count -gt 0)
+        consentGiven = [bool]$Consent
+        privacyLevel = $PrivacyLevel
+        automaticRemediation = $false
+        adapters = @()
+        reasons = @()
+        source = 'unavailable'
+    }
+    if ($requested.Count -eq 0) { return [pscustomobject]$record }
+
+    if (-not $Consent) {
+        $record.status = 'consent-required'
+        $record.reasons = @('tier3-escalations-require-explicit-consent')
+        return [pscustomobject]$record
+    }
+
+    if (Test-WpdModuleCommand -Name 'Get-WpdEscalationPlan') {
+        try {
+            $plan = Invoke-WpdModuleCall -Name 'Get-WpdEscalationPlan'
+            $descriptorsProperty = Get-WpdIntegrationProperty -InputObject $plan -Name 'Descriptors'
+            if ($null -ne $descriptorsProperty) {
+                $descriptors = @($descriptorsProperty)
+            }
+            else {
+                # Wpd.Escalation returns its descriptor collection directly;
+                # tolerate a wrapper object as well so the integration contract
+                # does not depend on one serialization shape.
+                $descriptors = @($plan)
+            }
+            $selected = @($descriptors | Where-Object {
+                $descriptorId = Get-WpdIntegrationProperty -InputObject $_ -Name 'Id'
+                if ($null -eq $descriptorId) { $descriptorId = Get-WpdIntegrationProperty -InputObject $_ -Name 'id' }
+                $requested -contains [string]$descriptorId
+            })
+            $record.status = 'planned'
+            $record.source = 'Wpd.Escalation'
+            $record.adapters = @($selected)
+            if (@($selected).Count -ne $requested.Count) {
+                $record.reasons = @('some-requested-adapters-are-not-declared-by-the-escalation-module')
+            }
+            return [pscustomobject]$record
+        }
+        catch {
+            $record.status = 'unavailable'
+            $record.reasons = @('escalation-plan-error:' + $_.Exception.Message)
+            return [pscustomobject]$record
+        }
+    }
+
+    $record.status = 'planned'
+    $record.source = 'entry-point-request-list'
+    $record.adapters = @($requested | ForEach-Object { [pscustomobject]@{ Id = $_; Status = 'not-collected'; AbsentToolBehavior = 'report-unsupported' } })
+    $record.reasons = @('escalation-module-not-loaded:descriptors-not-resolved')
+    return [pscustomobject]$record
+}
+
+function New-WpdTieredPlanBlock {
+    <# The Plan-mode description of the tiered architecture. It states what WOULD
+       be collected and in which tier, and it collects nothing - Plan mode still
+       writes only diagnostic-plan.json. Every projected state is
+       not-collected/planned, never healthy. #>
+    param(
+        [AllowNull()][object]$Modules,
+        [AllowNull()][object]$PresetSelection,
+        [AllowNull()][object]$CapturePolicy,
+        [AllowNull()][object]$Tier1Interval,
+        [AllowNull()][object]$CaptureMode,
+        [AllowNull()][object]$EscalationBlock,
+        [AllowNull()][string]$PrivacyLevel = 'Standard',
+        [AllowNull()][object]$Tier = @(0, 1, 2)
+    )
+
+    $tiers = @(
+        [pscustomobject]@{ tier = 0; name = 'static-inventory'; collectedOnce = $true; cached = $true; projectedState = 'not-collected'; note = 'Collected once per run and served from the Tier 0 session cache; never re-queried inside the sampling loop.' }
+        [pscustomobject]@{ tier = 1; name = 'interval-counters'; collectedOnce = $false; cached = $false; projectedState = 'not-collected'; intervalSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'intervalSeconds'; floorSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'floorSeconds'; note = 'Performance counters at or above the 1 s floor; a sub-second request is refused rather than clamped.' }
+        [pscustomobject]@{ tier = 2; name = 'etw-wpr-recording'; collectedOnce = $false; cached = $false; projectedState = 'not-collected'; captureMode = Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'captureMode'; note = 'One WPR recording sharing the counter window; memory mode unless file mode is explicitly opted into.' }
+        [pscustomobject]@{ tier = 3; name = 'optional-escalation'; collectedOnce = $false; cached = $false; projectedState = 'not-collected'; consentRequired = $true; note = 'Off unless its switch and consent are both supplied; an absent tool is reported unsupported.' }
+    )
+
+    $selectedTiers = @($Tier | ForEach-Object { [int]$_ })
+    $block = [ordered]@{
+        schemaSurface = '1.3'
+        model = 'planner-collector-verifier with four collection tiers'
+        collectedTiers = @($selectedTiers)
+        tiers = @($tiers)
+        moduleSurface = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $Modules -Name 'status'
+            loaded = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'loaded')
+            missing = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'missing')
+        }
+        preset = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'status'
+            requested = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'requested'
+            effective = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'effective'
+            isAlias = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'isAlias'
+            displayName = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'displayName'
+            tier1Counters = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'tier1Counters')
+            tier1SampleIntervalSeconds = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'tier1SampleIntervalSeconds'
+            expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'expectedDurationSeconds'
+            analysisModules = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'analysisModules')
+            eventChannels = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'eventChannels')
+            escalationOptions = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'escalationOptions')
+            traceSizeBudget = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'traceSizeBudget'
+            privacyLevel = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'privacyLevel'
+            automaticRemediation = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'automaticRemediation'
+            source = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'source'
+            canonicalNames = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'canonicalNames')
+            reasons = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'reasons')
+        }
+        capturePolicy = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'status'
+            profile = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'profile'
+            profileSpec = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'profileSpec'
+            qualifier = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'qualifier'
+            mode = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'mode'
+            unbounded = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'unbounded'
+            bufferSemantics = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'bufferSemantics'
+            traceBudgetMB = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'traceBudgetMB'
+            maxDurationSeconds = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'maxDurationSeconds'
+            expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'expectedDurationSeconds'
+            analysisTables = @(Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'analysisTables')
+            source = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'source'
+            reasons = @(Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'reasons')
+        }
+        captureMode = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'status'
+            mode = Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'captureMode'
+            reasons = @(Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'reasons')
+        }
+        tier1Cadence = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'status'
+            intervalSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'intervalSeconds'
+            floorSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'floorSeconds'
+            source = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'source'
+            reasons = @(Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'reasons')
+        }
+        privacy = [ordered]@{
+            level = $PrivacyLevel
+            defaultLevel = 'Standard'
+            optDown = ($PrivacyLevel -ne 'Standard')
+            secretsCollected = $false
+        }
+        escalation = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'status'
+            requested = @(Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'requested')
+            consentRequired = Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'consentRequired'
+            consentGiven = Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'consentGiven'
+            automaticRemediation = $false
+            reasons = @(Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'reasons')
+        }
+        coveragePlan = [ordered]@{
+            states = @('complete', 'partial', 'unavailable', 'not-collected', 'unsupported')
+            noDataIsNeverHealth = $true
+            fields = @('collector', 'tier', 'status', 'coverage', 'recordCount', 'startedUtc', 'completedUtc', 'durationMs', 'reasons')
+        }
+        dataQualityPlan = [ordered]@{
+            fields = @('collector', 'metric', 'sampleCount', 'expectedSampleCount', 'coverage', 'intervals', 'gaps', 'reasons')
+            noDataIsNeverHealth = $true
+        }
+        evidenceIndexPlan = [ordered]@{
+            fields = @('id', 'artifact', 'path', 'metric', 'value', 'windowStart', 'windowEnd', 'sha256')
+            everyConclusionNeedsEvidence = $true
+        }
+        healthClaim = 'none'
+        neverHealthy = $true
+    }
+    return $block
+}
+
+function New-WpdTieredCollectBlock {
+    <# The Collect-mode counterpart: real per-tier envelopes in, one manifest
+       block out. Missing tiers stay not-collected; a tier whose collector failed
+       stays unavailable with its reason. No status is ever healthy. #>
+    param(
+        [AllowNull()][object]$Modules,
+        [AllowNull()][object]$Tier0,
+        [AllowNull()][object]$Tier2,
+        [AllowNull()][object]$Tier3,
+        [AllowNull()][object]$PresetSelection,
+        [AllowNull()][object]$CapturePolicy,
+        [AllowNull()][object]$Tier1Interval,
+        [AllowNull()][object]$CoverageRecords = @(),
+        [AllowNull()][object]$DataQualityRecords = @(),
+        [AllowNull()][object]$EvidenceIndex = $null
+    )
+
+    $tier0Status = [string](Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'status')
+    $tier0Coverage = [string](Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'coverage')
+    $tier2Status = [string](Get-WpdIntegrationProperty -InputObject $Tier2 -Name 'status')
+    $tier2Coverage = [string](Get-WpdIntegrationProperty -InputObject $Tier2 -Name 'coverage')
+    $tier3Status = [string](Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'status')
+    $tier3Coverage = [string](Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'coverage')
+
+    $block = [ordered]@{
+        schemaSurface = '1.3'
+        model = 'planner-collector-verifier with four collection tiers'
+        moduleSurface = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $Modules -Name 'status'
+            loaded = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'loaded')
+            missing = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'missing')
+        }
+        tier0 = [ordered]@{
+            status = $tier0Status
+            coverage = $tier0Coverage
+            cached = Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'cached'
+            queries = Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'queries'
+            capabilityCount = @(Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'capabilities').Count
+            reason = @(Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'reasons')
+        }
+        tier1 = [ordered]@{
+            intervalSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'intervalSeconds'
+            floorSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'floorSeconds'
+            cadenceStatus = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'status'
+            counters = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'tier1Counters')
+        }
+        tier2 = [ordered]@{
+            status = $tier2Status
+            coverage = $tier2Coverage
+            profile = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'profileSpec'
+            bufferSemantics = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'bufferSemantics'
+        }
+        tier3 = [ordered]@{
+            status = $tier3Status
+            coverage = $tier3Coverage
+            consentRequired = $true
+            automaticRemediation = $false
+        }
+        coverage = @($CoverageRecords)
+        dataQuality = @($DataQualityRecords)
+        evidenceIndex = $EvidenceIndex
+        healthClaim = 'none'
+        neverHealthy = $true
+    }
+    return $block
+}
+
+function Write-WpdTechnicianReportHandoff {
+    <# Findings -> technician report artifact. When the report module is not
+       loaded the handoff is unavailable with a reason and no file is written, so
+       a missing module can never be mistaken for a generated report. #>
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [AllowNull()][object[]]$Findings = @(),
+        [AllowNull()][object]$EvidenceIndex,
+        [AllowNull()][object[]]$Artifacts = @(),
+        [AllowNull()][object[]]$DataQuality = @(),
+        [AllowNull()][object[]]$Timeline = @(),
+        [AllowNull()][object[]]$ProcessSamples = @(),
+        [AllowNull()][object]$Incident,
+        [AllowNull()][object]$Manifest,
+        [AllowNull()][object[]]$Samples = @(),
+        [AllowNull()][object[]]$DiskSeries = @(),
+        [AllowNull()][object[]]$EventRows = @(),
+        [AllowNull()][string]$RelativePath = 'case\technician-report.html'
+    )
+
+    $record = [ordered]@{
+        status = 'unavailable'
+        artifact = $RelativePath.Replace([char]92, '/')
+        reason = 'report-module-not-loaded'
+        findingCount = @($Findings).Count
+    }
+    if (-not (Test-WpdModuleCommand -Name 'New-WpdTechnicianReport') -or -not (Test-WpdModuleCommand -Name 'Write-WpdReportHtml')) {
+        return [pscustomobject]$record
+    }
+
+    try {
+        $report = Invoke-WpdModuleCall -Name 'New-WpdTechnicianReport' -Arguments @{
+            Findings = @($Findings)
+            EvidenceIndex = $EvidenceIndex
+            Artifacts = @($Artifacts)
+            DataQuality = @($DataQuality)
+            Timeline = @($Timeline)
+            ProcessSamples = @($ProcessSamples)
+            Incident = $Incident
+            Manifest = $Manifest
+            Samples = @($Samples)
+            DiskSeries = @($DiskSeries)
+            EventRows = @($EventRows)
+        }
+        $target = Join-Path -Path $OutputDirectory -ChildPath $RelativePath
+        $parent = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        $null = Invoke-WpdModuleCall -Name 'Write-WpdReportHtml' -Arguments @{
+            Path = $target
+            Report = $report
+        }
+        $record.status = 'written'
+        $record.reason = $null
+        $record.outcome = $report.Outcome
+        return [pscustomobject]$record
+    }
+    catch {
+        $record.status = 'unavailable'
+        $record.reason = 'report-generation-error:' + $_.Exception.Message
+        return [pscustomobject]$record
+    }
+}
+
+# ---- End of the tiered integration surface ---------------------------------
+
+# ---- Tiered run resolution (Plan and Collect share these resolvers) ---------
+# The requested preset, the capture policy, the Tier 1 cadence and the capture
+# mode are resolved before either mode dispatches, so a Plan manifest describes
+# exactly what Collect would do. Resolution reads configuration and modules only
+# - it creates no directory and writes no artifact.
+$script:WpdModuleSurface = Import-WpdModuleSurface
+$script:WpdPresetPath = Get-WpdPresetConfigurationPath
+$script:WpdPresetDocument = Get-WpdPresetDocument -Path $script:WpdPresetPath
+$script:WpdPresetSelection = Resolve-WpdPresetSelection -Preset $Preset -PresetDocument $script:WpdPresetDocument
+$script:WpdCapturePolicy = Resolve-WpdPresetCapturePolicy -Selection $script:WpdPresetSelection -AllowFileMode:$AllowWprFileMode
+
+$script:WpdRequestedTier1Seconds = $null
+if ($Tier1IntervalSeconds -gt 0) { $script:WpdRequestedTier1Seconds = $Tier1IntervalSeconds }
+$script:WpdTier1Interval = Resolve-WpdTier1Interval `
+    -RequestedSeconds $script:WpdRequestedTier1Seconds `
+    -PresetSeconds $script:WpdPresetSelection.tier1SampleIntervalSeconds `
+    -SamplingFloorSeconds $script:WpdPresetSelection.samplingFloorSeconds
+
+$script:WpdCaptureMode = Resolve-WpdCaptureMode `
+    -Repro:$Repro `
+    -FlightRecorder:$FlightRecorder `
+    -Preset $script:WpdPresetSelection.effective `
+    -AcceptUnboundedFileMode:$AcceptUnboundedFileMode
+
+$script:WpdRequestedEscalationAdapter = @()
+if ($CollectWaitChains) { $script:WpdRequestedEscalationAdapter += 'wait-chain-traversal' }
+if ($CollectPoolEscalation) { $script:WpdRequestedEscalationAdapter += 'poolmon-tag-attribution' }
+if ($CollectSearchContext) { $script:WpdRequestedEscalationAdapter += 'search-service-context' }
+if ($CollectMinifilters) { $script:WpdRequestedEscalationAdapter += 'minifilter-enumeration' }
+
+$script:WpdEffectivePrivacyLevel = $PrivacyLevel
+if ($null -ne $script:WpdPresetSelection.privacyLevel -and $PrivacyLevel -eq 'Standard') {
+    # Redacted is a stricter level than the preset's own default, so a preset may
+    # raise privacy but never lower it.
+    $script:WpdEffectivePrivacyLevel = [string]$script:WpdPresetSelection.privacyLevel
+}
+$script:WpdFullPrivacyConsentMissing = ($script:WpdEffectivePrivacyLevel -eq 'Full' -and -not $ConfirmFullPrivacy)
+
+$script:WpdEscalationBlock = New-WpdEscalationSelectionBlock `
+    -RequestedAdapter $script:WpdRequestedEscalationAdapter `
+    -Consent:$ConfirmEscalationCollection `
+    -PrivacyLevel $script:WpdEffectivePrivacyLevel
+
+# The tiered layer is engaged when the operator asked for a preset, a capture
+# mode or a cadence, or asked for an escalation. A plain v1 run stays v1.
+$script:WpdTieredEngaged = (
+    (-not [string]::IsNullOrWhiteSpace($Preset)) -or
+    $Repro -or $FlightRecorder -or
+    ($Tier1IntervalSeconds -gt 0) -or
+    ($script:WpdRequestedEscalationAdapter.Count -gt 0)
+)
+$script:WpdTieredReason = @()
+if (-not [string]::IsNullOrWhiteSpace($Preset)) { $script:WpdTieredReason += 'preset-selected' }
+if ($Repro) { $script:WpdTieredReason += 'repro-mode' }
+if ($FlightRecorder) { $script:WpdTieredReason += 'flight-recorder-mode' }
+if ($Tier1IntervalSeconds -gt 0) { $script:WpdTieredReason += 'explicit-tier1-interval' }
+if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { $script:WpdTieredReason += 'escalation-selected' }
+
+$script:WpdTieredTiers = @(0, 1)
+if ($CaptureWpr -or $script:WpdCaptureMode.status -eq 'resolved') { $script:WpdTieredTiers += 2 }
+if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { $script:WpdTieredTiers += 3 }
+
+if ($script:WpdRequestedEscalationAdapter.Count -gt 0 -and -not $ConfirmEscalationCollection) {
+    throw ('Tier 3 escalation adapters ({0}) require -ConfirmEscalationCollection. No diagnostic data was collected.' -f ($script:WpdRequestedEscalationAdapter -join ', '))
+}
+if ($script:WpdFullPrivacyConsentMissing) {
+    throw 'Privacy level Full requires -ConfirmFullPrivacy. No diagnostic data was collected.'
+}
+
+# Fail closed on an unusable tiered request rather than silently degrading it.
+if ($script:WpdCaptureMode.status -eq 'conflicting-modes') {
+    throw 'Repro and Flight Recorder modes are mutually exclusive. No diagnostic data was collected.'
+}
+if ($script:WpdPresetSelection.status -eq 'unknown-preset') {
+    throw ("Unknown preset '{0}'. Known presets: {1}" -f $Preset, (@($script:WpdPresetSelection.canonicalNames) -join ', '))
+}
+if ($script:WpdTier1Interval.status -eq 'refused-sub-second') {
+    throw ('Tier 1 interval {0} s is below the documented {1} s floor. Performance counters are not designed for sub-second collection; no diagnostic data was collected.' -f $Tier1IntervalSeconds, $script:WpdTier1Interval.floorSeconds)
+}
+# A profile this entry point does not accept is refused for a collecting run; in
+# Plan mode it is described (status unsupported-profile-name) so the operator can
+# see the problem instead of getting no plan at all.
+if ($script:WpdCapturePolicy.status -eq 'unsupported-profile-name' -and $Mode -ne 'Plan') {
+    throw ('Preset ''{0}'' selects WPR profile ''{1}'', which this entry point does not accept. Confirm the profile with "wpr -profiles" and pass -WprProfile explicitly; the profile was not substituted.' -f $Preset, (@($script:WpdCapturePolicy.reasons) -join '; '))
+}
+if ($script:WpdTieredEngaged -and $script:WpdPresetSelection.status -eq 'resolved' -and $script:WpdCapturePolicy.status -eq 'unsupported' -and $Mode -ne 'Plan') {
+    throw ('Preset ''{0}'' has no usable WPR capture policy ({1}). No diagnostic data was collected.' -f $Preset, (@($script:WpdCapturePolicy.reasons) -join '; '))
+}
+
+# The preset drives the recording profile and the Tier 1 cadence when the
+# operator did not override them explicitly. An explicit switch always wins.
+if (-not $PSBoundParameters.ContainsKey('WprProfile') -and $script:WpdCapturePolicy.status -eq 'resolved' -and -not [string]::IsNullOrWhiteSpace([string]$script:WpdCapturePolicy.profile)) {
+    $WprProfile = [string]$script:WpdCapturePolicy.profile
+}
+if (-not $PSBoundParameters.ContainsKey('SampleIntervalSeconds') -and $null -ne $script:WpdTier1Interval.intervalSeconds) {
+    $SampleIntervalSeconds = [int]$script:WpdTier1Interval.intervalSeconds
 }
 
 if (Test-CasePathIsNetworkShare -Path $OutputDirectory) {
@@ -5115,6 +6375,46 @@ if ($SymptomContext -or $Preset) {
     if ($SymptomContext) { $symptomBlock.reported = $SymptomContext }
     if ($Preset) { $symptomBlock.preset = $Preset }
     $planManifest.symptom = $symptomBlock
+}
+
+# The tiered architecture is described in every plan (it is the architecture the
+# tool implements, not a mode), while the preset/capture/escalation detail is
+# added when the operator selected it. Plan mode still writes exactly one
+# artifact - diagnostic-plan.json - and creates no collector output.
+$planManifest.tiers = New-WpdTieredPlanBlock `
+    -Modules $script:WpdModuleSurface `
+    -PresetSelection $script:WpdPresetSelection `
+    -CapturePolicy $script:WpdCapturePolicy `
+    -Tier1Interval $script:WpdTier1Interval `
+    -CaptureMode $script:WpdCaptureMode `
+    -EscalationBlock $script:WpdEscalationBlock `
+    -PrivacyLevel $script:WpdEffectivePrivacyLevel `
+    -Tier $script:WpdTieredTiers
+
+if ($script:WpdFullPrivacyConsentMissing) {
+    $planManifest.tiers.privacy.consentMissing = $true
+    $planManifest.tiers.privacy.consentSwitch = '-ConfirmFullPrivacy'
+    $planManifest.tiers.privacy.reason = 'Full privacy requires -ConfirmFullPrivacy; Redacted was applied instead.'
+}
+
+if ($script:WpdTieredEngaged) {
+    $planManifest.plannedActions += 'collect-tier0-static-inventory-once-per-run'
+    $planManifest.plannedActions += 'sample-tier1-performance-counters-at-or-above-the-floor'
+    $planManifest.plannedActions += 'mark-the-incident-with-wpr-marker-inside-the-capture-window'
+    $planManifest.plannedActions += 'write-coverage-data-quality-and-evidence-index-blocks'
+    if ($script:WpdCaptureMode.status -eq 'resolved') {
+        if ($script:WpdCaptureMode.captureMode -eq 'FlightRecorder') {
+            $planManifest.plannedActions += 'run-the-flight-recorder-circular-capture'
+        }
+        else {
+            $planManifest.plannedActions += 'run-the-repro-bounded-capture'
+        }
+    }
+    if ($script:WpdTieredTiers -contains 3) {
+        $planManifest.plannedActions += 'collect-optional-tier3-escalations-after-explicit-consent'
+    }
+    $planManifest.tieredReason = @($script:WpdTieredReason)
+    $planManifest.schemaVersion = '1.3'
 }
 
 if ($Mode -eq 'Plan') {
@@ -5438,6 +6738,47 @@ if ($RemoteComputer) {
 }
 
 $collectedArtifacts = New-Object System.Collections.ArrayList
+
+# ---- Tier 0: static inventory, collected once per run ------------------------
+# Every static class the sampling loop used to re-query is collected here and
+# served from the Tier 0 session cache for the rest of the run. The snapshot is
+# written as its own artifact so coverage can cite it, and an unavailable
+# snapshot stays unavailable with a reason instead of a fabricated inventory.
+$script:WpdTier0Snapshot = $null
+$script:WpdTier0Artifact = 'inventory/tier0-inventory.json'
+$script:WpdPerCoreCpuSeries = New-Object System.Collections.ArrayList
+if ($script:WpdTieredEngaged) {
+    $tier0CacheKey = ('tier0|{0}|{1}|{2}' -f $script:WpdPresetSelection.effective, $script:WpdEffectivePrivacyLevel, $env:COMPUTERNAME)
+    $script:WpdTier0Snapshot = Get-WpdTier0InventorySnapshot `
+        -CacheKey $tier0CacheKey `
+        -Preset $script:WpdPresetSelection.effective `
+        -PrivacyLevel $script:WpdEffectivePrivacyLevel `
+        -Refresh:$RefreshInventory
+    try {
+        $inventoryDirectory = Join-Path -Path $resolvedOutputDirectory -ChildPath 'inventory'
+        if (-not (Test-Path -LiteralPath $inventoryDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $inventoryDirectory | Out-Null
+        }
+        Write-JsonFile -InputObject ([ordered]@{
+                status = $script:WpdTier0Snapshot.status
+                coverage = $script:WpdTier0Snapshot.coverage
+                preset = $script:WpdPresetSelection.effective
+                privacyLevel = $script:WpdEffectivePrivacyLevel
+                cached = $script:WpdTier0Snapshot.cached
+                source = $script:WpdTier0Snapshot.source
+                capabilities = @($script:WpdTier0Snapshot.capabilities)
+                records = @($script:WpdTier0Snapshot.records)
+                reasons = @($script:WpdTier0Snapshot.reasons)
+                collectedOncePerRun = $true
+                healthClaim = 'none'
+            }) -Path (Join-Path -Path $inventoryDirectory -ChildPath 'tier0-inventory.json')
+        [void]$collectedArtifacts.Add($script:WpdTier0Artifact)
+    }
+    catch {
+        Add-CollectionError -Stage 'tier0-inventory-export' -ErrorRecord $_
+    }
+}
+
 $startedAtUtc = Get-UtcTimestamp
 $systemSummary = [ordered]@{}
 try {
@@ -5578,14 +6919,37 @@ $captureComplete = $false
 # the operator marks the slowdown (whichever comes first once a marker exists).
 while (-not $captureComplete) {
     try {
-        $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
-        $processors = Get-CimInstance -ClassName Win32_Processor
-        $logicalDisks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 3"
+        # Tier 1 samples read performance-COUNTER classes only. Static inventory
+        # (operating system, processor identity, volumes) was collected once into
+        # the Tier 0 snapshot above; re-querying those classes here is the defect
+        # this loop no longer has. The row transform is pure, so a missing counter
+        # yields $null plus a stated reason rather than a zero or a cached value
+        # presented as a live measurement.
+        $tier1Row = Get-WpdTier1SampleRow `
+            -ProcessorCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_Processor' -ErrorAction SilentlyContinue) `
+            -MemoryCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_Memory' -ErrorAction SilentlyContinue) `
+            -LogicalDiskCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfDisk_LogicalDisk' -ErrorAction SilentlyContinue) `
+            -SystemCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_System' -ErrorAction SilentlyContinue)
         $sampleTimestamp = Get-UtcTimestamp
-        $cpuLoads = @($processors | ForEach-Object { Get-SafeObjectProperty -InputObject $_ -Name 'LoadPercentage' } | Where-Object { $null -ne $_ })
-        $averageCpuLoad = $null
-        if ($cpuLoads.Count -gt 0) {
-            $averageCpuLoad = [Math]::Round((($cpuLoads | Measure-Object -Average).Average), 2)
+        $averageCpuLoad = $tier1Row.AverageCpuLoadPercent
+        foreach ($tier1Reason in @($tier1Row.UnavailableReasons)) {
+            Add-CollectionErrorText -Stage 'tier1-counter-sample' -Message $tier1Reason
+        }
+        if ($script:WpdPerCoreCpuSeries -is [System.Collections.ArrayList]) {
+            [void]$script:WpdPerCoreCpuSeries.Add([pscustomobject]@{
+                    TimestampUtc = $sampleTimestamp
+                    LogicalProcessorCount = $tier1Row.LogicalProcessorCount
+                    AverageCpuTimePercent = $tier1Row.CpuTimePercent
+                    AverageUtilityPercent = $tier1Row.CpuUtilityPercent
+                    AverageUserTimePercent = $tier1Row.CpuUserPercent
+                    AverageKernelTimePercent = $tier1Row.CpuKernelPercent
+                    AverageDpcPercent = $tier1Row.DpcPercent
+                    AverageInterruptPercent = $tier1Row.InterruptPercent
+                    ProcessorQueueLength = $tier1Row.ProcessorQueueLength
+                    ContextSwitchesPerSec = $tier1Row.ContextSwitchesPerSec
+                    PerCore = @($tier1Row.PerCore)
+                    Coverage = $tier1Row.Coverage
+                })
         }
 
         $memMetrics = Get-MemoryMetrics
@@ -5688,15 +7052,17 @@ while (-not $captureComplete) {
             $previousDiskRaw = $null
         }
 
+        # Initialized to unavailable and then filled from the Tier 1 counter row,
+        # so a missing counter row can never inherit the previous sample's value.
         $availableMemoryMB = $null
-        if ($null -ne $operatingSystem.FreePhysicalMemory) {
-            $availableMemoryMB = [Math]::Round(([double]$operatingSystem.FreePhysicalMemory / 1024), 2)
-        }
         $totalLogicalDiskFreeGB = $null
-        $freeSpaceMeasure = $logicalDisks | Where-Object { $null -ne (Get-SafeObjectProperty -InputObject $_ -Name 'FreeSpace') } | Measure-Object -Property FreeSpace -Sum
-        if ($null -ne $freeSpaceMeasure -and $freeSpaceMeasure.Count -gt 0) {
-            $totalLogicalDiskFreeGB = [Math]::Round(([double]$freeSpaceMeasure.Sum / 1GB), 2)
-        }
+
+        # Available memory and volume free space come from the Tier 1 counter row
+        # (Memory / LogicalDisk counter classes), not from a re-queried Tier 0
+        # class. A missing counter row leaves the value unknown and the reason is
+        # recorded above.
+        $availableMemoryMB = $tier1Row.AvailableMemoryMB
+        $totalLogicalDiskFreeGB = $tier1Row.TotalLogicalDiskFreeGB
 
         $topPrivateBytes = $null
         $topPrivateProcess = $null
@@ -5714,6 +7080,16 @@ while (-not $captureComplete) {
         [void]$samples.Add([pscustomobject]@{
             TimestampUtc = $sampleTimestamp
             AverageCpuLoadPercent = $averageCpuLoad
+            CpuUtilityPercent = $tier1Row.CpuUtilityPercent
+            CpuUserPercent = $tier1Row.CpuUserPercent
+            CpuKernelPercent = $tier1Row.CpuKernelPercent
+            DpcPercent = $tier1Row.DpcPercent
+            InterruptPercent = $tier1Row.InterruptPercent
+            ProcessorQueueLength = $tier1Row.ProcessorQueueLength
+            ContextSwitchesPerSec = $tier1Row.ContextSwitchesPerSec
+            LogicalProcessorCount = $tier1Row.LogicalProcessorCount
+            CommitPercent = $tier1Row.CommitPercent
+            Tier1Coverage = (@($tier1Row.CoverageStates) -join '+')
             AvailableMemoryMB = $availableMemoryMB
             TotalLogicalDiskFreeGB = $totalLogicalDiskFreeGB
             CommittedBytes = if ($memMetrics) { $memMetrics.committedBytes } else { $null }
@@ -6432,6 +7808,10 @@ catch {
 $manifestSchemaVersion = '1.0'
 if ($SymptomContext -or $Preset) { $manifestSchemaVersion = '1.1' }
 if ($PerformanceMode -or $MarkerMode) { $manifestSchemaVersion = '1.2' }
+# Schema 1.3 adds the tiered/evidence surface: the per-tier status block plus the
+# coverage, data-quality and evidence-index blocks. Older 1.0-1.2 manifests stay
+# valid and Verify accepts all four versions (the surface is additive only).
+if ($script:WpdTieredEngaged) { $manifestSchemaVersion = '1.3' }
 
 $collectionManifest = [ordered]@{
     schemaVersion = $manifestSchemaVersion
@@ -6707,6 +8087,146 @@ if ($SymptomContext -or $Preset) {
     if ($Preset) { $collectionManifest.symptom.preset = $Preset }
 }
 
+# ---- Tiered telemetry, coverage, data quality and evidence blocks ------------
+# The per-core/util/user/kernel/DPC/ISR series is written as its own artifact so
+# the CSV sample row stays flat, and the tiered block records one coverage record
+# per tier plus the data-quality and evidence-index surface. A tier that did not
+# run stays not-collected and a failed collector stays unavailable - no status is
+# ever healthy.
+if ($script:WpdTieredEngaged) {
+    try {
+        $telemetryDirectory = Join-Path -Path $resolvedOutputDirectory -ChildPath 'telemetry'
+        if (-not (Test-Path -LiteralPath $telemetryDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $telemetryDirectory | Out-Null
+        }
+        Write-JsonFile -InputObject @($script:WpdPerCoreCpuSeries) -Path (Join-Path -Path $telemetryDirectory -ChildPath 'per-core-cpu-samples.json')
+        [void]$collectedArtifacts.Add('telemetry/per-core-cpu-samples.json')
+    }
+    catch {
+        Add-CollectionError -Stage 'per-core-cpu-export' -ErrorRecord $_
+    }
+}
+
+if ($script:WpdTieredEngaged) {
+    $tier0CoverageRecord = if ($null -ne $script:WpdTier0Snapshot) { $script:WpdTier0Snapshot.coverage } else { 'not-collected' }
+    $tier0StatusRecord = if ($null -ne $script:WpdTier0Snapshot) { $script:WpdTier0Snapshot.status } else { 'not-collected' }
+    $tier0CapabilityCount = 0
+    $tier0Reasons = @()
+    if ($null -ne $script:WpdTier0Snapshot) {
+        $tier0CapabilityCount = @($script:WpdTier0Snapshot.capabilities).Count
+        $tier0Reasons = @($script:WpdTier0Snapshot.reasons)
+    }
+    # -CaptureWpr is the only path that creates $wprResult, so its status is read
+    # through the variable table instead of assuming the variable exists.
+    $tier2StatusRecord = 'not-collected'
+    $tier2CoverageRecord = 'not-collected'
+    if ($CaptureWpr) {
+        $wprResultVariable = Get-Variable -Name wprResult -Scope Script -ErrorAction SilentlyContinue
+        if ($null -ne $wprResultVariable -and $null -ne $wprResultVariable.Value) {
+            $tier2StatusRecord = [string]$wprResultVariable.Value['status']
+        }
+        else {
+            $tier2StatusRecord = 'unavailable'
+        }
+        $tier2CoverageRecord = if ($tier2StatusRecord -eq 'completed') { 'complete' } else { 'unavailable' }
+    }
+    $tier3StatusRecord = if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { $script:WpdEscalationBlock.status } else { 'not-collected' }
+    $tier3CoverageRecord = if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { 'partial' } else { 'not-collected' }
+    $tier1CoverageRecord = if (@($samples).Count -gt 0) { 'partial' } else { 'unavailable' }
+
+    $coverageRecords = @(
+        [pscustomobject]@{ collector = 'tier0-static-inventory'; tier = 0; status = $tier0StatusRecord; coverage = $tier0CoverageRecord; recordCount = $tier0CapabilityCount; reason = @($tier0Reasons) }
+        [pscustomobject]@{ collector = 'tier1-performance-counters'; tier = 1; status = if (@($samples).Count -gt 0) { 'success' } else { 'unavailable' }; coverage = $tier1CoverageRecord; recordCount = @($samples).Count; reason = @() }
+        [pscustomobject]@{ collector = 'tier2-wpr-recording'; tier = 2; status = $tier2StatusRecord; coverage = $tier2CoverageRecord; recordCount = if ($CaptureWpr) { 1 } else { 0 }; reason = @() }
+        [pscustomobject]@{ collector = 'tier3-optional-escalation'; tier = 3; status = $tier3StatusRecord; coverage = $tier3CoverageRecord; recordCount = @($script:WpdEscalationBlock.adapters).Count; reason = @($script:WpdEscalationBlock.reasons) }
+    )
+
+    $collectionErrorsData = @($script:collectionErrors)
+    $intervalValue = $script:WpdTier1Interval.intervalSeconds
+    $collectedSeconds = $null
+    if ($null -ne $startedAtUtc -and $null -ne $completedAtUtc) {
+        try {
+            $collectedSeconds = [Math]::Round(([datetime]$completedAtUtc - [datetime]$startedAtUtc).TotalSeconds, 2)
+        }
+        catch {
+            $collectedSeconds = $null
+        }
+    }
+    $expectedSampleCount = $null
+    if ($null -ne $intervalValue -and $null -ne $collectedSeconds -and [double]$intervalValue -gt 0) {
+        $expectedSampleCount = [int][Math]::Floor(([double]$collectedSeconds / [double]$intervalValue)) + 1
+    }
+    $sampleGapCount = $null
+    if ($null -ne $expectedSampleCount) { $sampleGapCount = [Math]::Max(0, $expectedSampleCount - @($samples).Count) }
+
+    $dataQualityRecords = @(
+        [pscustomobject]@{
+            collector = 'tier1-performance-counters'
+            metric = 'sample-cadence'
+            sampleCount = @($samples).Count
+            expectedSampleCount = $expectedSampleCount
+            intervalSeconds = $intervalValue
+            gaps = $sampleGapCount
+            coverage = $tier1CoverageRecord
+            collectionErrorCount = @($collectionErrorsData).Count
+            reasons = @()
+            noDataIsNeverHealth = $true
+        }
+        [pscustomobject]@{
+            collector = 'tier0-static-inventory'
+            metric = 'inventory-capabilities'
+            sampleCount = @($script:WpdTier0Snapshot.capabilities).Count
+            expectedSampleCount = $null
+            coverage = $tier0CoverageRecord
+            reasons = @($script:WpdTier0Snapshot.reasons)
+            noDataIsNeverHealth = $true
+        }
+    )
+
+    # The evidence index maps every artifact the run registered to its hash, so a
+    # conclusion can always cite a verified artifact. An artifact whose hash is
+    # absent is indexed as not-registered rather than assumed intact.
+    $evidenceIndexRecords = @()
+    $indexCounter = 0
+    foreach ($artifactEntry in @(Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts))) {
+        $indexCounter++
+        $evidenceIndexRecords += [pscustomobject]@{
+            id = ('evidence-{0:d3}' -f $indexCounter)
+            artifact = $artifactEntry.Name
+            path = $artifactEntry.Name
+            sha256 = $artifactEntry.Sha256
+            sizeBytes = $artifactEntry.SizeBytes
+            windowStart = $startedAtUtc
+            windowEnd = $completedAtUtc
+            registered = ($null -ne $artifactEntry.Sha256)
+        }
+    }
+
+    $collectionManifest.tiers = New-WpdTieredCollectBlock `
+        -Modules $script:WpdModuleSurface `
+        -Tier0 $script:WpdTier0Snapshot `
+        -Tier2 ([pscustomobject]@{ status = $tier2StatusRecord; coverage = $tier2CoverageRecord }) `
+        -Tier3 ([pscustomobject]@{ status = $tier3StatusRecord; coverage = $tier3CoverageRecord }) `
+        -PresetSelection $script:WpdPresetSelection `
+        -CapturePolicy $script:WpdCapturePolicy `
+        -Tier1Interval $script:WpdTier1Interval `
+        -CoverageRecords $coverageRecords `
+        -DataQualityRecords $dataQualityRecords `
+        -EvidenceIndex ([pscustomobject]@{ generatedAtUtc = Get-UtcTimestamp; recordCount = @($evidenceIndexRecords).Count; records = @($evidenceIndexRecords); everyConclusionNeedsEvidence = $true; healthClaim = 'none' })
+    $collectionManifest.coverage = @($coverageRecords)
+    $collectionManifest.dataQuality = @($dataQualityRecords)
+    $collectionManifest.evidenceIndex = $collectionManifest.tiers.evidenceIndex
+    $collectionManifest.privacy = [ordered]@{
+        level = $script:WpdEffectivePrivacyLevel
+        requestedLevel = $PrivacyLevel
+        secretsCollected = $false
+        redactionApplied = ($script:WpdEffectivePrivacyLevel -ne 'Standard')
+    }
+    if ($PerformanceMode -or $MarkerMode -or $script:WpdCaptureMode.status -eq 'resolved') {
+        $collectionManifest.incidentMarkers = New-WpdIncidentMarkerPlan
+    }
+}
+
 # Generate findings.json/report.html, hash ALL evidence into the manifest, then
 # package. Write-CollectionOutputs is the same function exercised by the
 # fixture-driven Collect-tail regression test.
@@ -6725,6 +8245,51 @@ $collectionManifest = Write-CollectionOutputs `
     -ServicingAnalysis $servicingAnalysis
 
 $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
+
+# ---- Report handoff ----------------------------------------------------------
+# The technician report is generated from the findings the shared tail wrote, so
+# it renders the same conclusions the manifest carries. A missing report module
+# leaves the handoff unavailable with a stated reason and creates no artifact.
+if ($script:WpdTieredEngaged) {
+    $handoffFindings = @()
+    try {
+        $findingsPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'findings.json'
+        if (Test-Path -LiteralPath $findingsPath -PathType Leaf) {
+            $handoffFindings = @(Get-Content -LiteralPath $findingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+        }
+        else {
+            Add-CollectionErrorText -Stage 'report-handoff' -Message 'findings.json is absent, so the technician report has no conclusions to render.'
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'report-handoff-findings' -ErrorRecord $_
+    }
+
+    $reportHandoff = Write-WpdTechnicianReportHandoff `
+        -OutputDirectory $resolvedOutputDirectory `
+        -Findings $handoffFindings `
+        -EvidenceIndex $collectionManifest.evidenceIndex `
+        -Artifacts @(Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)) `
+        -DataQuality @($coverageRecords) `
+        -Incident $collectionManifest.incident `
+        -Manifest $collectionManifest `
+        -Samples @($samples) `
+        -DiskSeries @($diskSeries) `
+        -EventRows @($incidentEvents)
+    $collectionManifest.reportHandoff = [ordered]@{
+        status = $reportHandoff.status
+        artifact = $reportHandoff.artifact
+        reason = $reportHandoff.reason
+        findingCount = $reportHandoff.findingCount
+        outcome = if ($null -ne (Get-Variable -Name reportHandoff -ErrorAction SilentlyContinue) -and $null -ne $reportHandoff.PSObject.Properties['outcome']) { $reportHandoff.outcome } else { $null }
+    }
+    if ($reportHandoff.status -eq 'written') {
+        [void]$collectedArtifacts.Add('case/technician-report.html')
+        $collectionManifest.artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
+        Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+    }
+}
+
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"
 
 if ($ZipOutput) {

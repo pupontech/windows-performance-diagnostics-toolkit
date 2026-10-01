@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Windows Performance Diagnostics Toolkit Report",
-  "description": "Schema for diagnostic-plan.json (Plan mode) and diagnostic-manifest.json (Collect mode) emitted by the Windows Performance Diagnostics Toolkit.",
+  "description": "Schema for diagnostic-plan.json (Plan mode) and diagnostic-manifest.json (Collect mode) emitted by the Windows Performance Diagnostics Toolkit. Schema 1.3 adds the optional v2 tier, coverage, data-quality, evidence-index, inventory, telemetry, incident, finding, escalation and technician-report surfaces without invalidating 1.0-1.2 manifests.",
   "type": "object",
   "required": [
     "schemaVersion",
@@ -16,7 +16,8 @@
       "enum": [
         "1.0",
         "1.1",
-        "1.2"
+        "1.2",
+        "1.3"
       ]
     },
     "toolName": {
@@ -90,6 +91,51 @@
         "type": "string"
       }
     },
+    "tiers": {
+      "$ref": "#/definitions/tierSurface"
+    },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/coverage"
+      }
+    },
+    "dataQuality": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/dataQuality"
+      }
+    },
+    "evidenceIndex": {
+      "$ref": "#/definitions/evidenceIndex"
+    },
+    "incidents": {
+      "$ref": "#/definitions/incidents"
+    },
+    "incidentMarkers": {
+      "$ref": "#/definitions/incidentMarkers"
+    },
+    "inventory": {
+      "$ref": "#/definitions/inventory"
+    },
+    "telemetry": {
+      "$ref": "#/definitions/telemetry"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/finding"
+      }
+    },
+    "escalation": {
+      "$ref": "#/definitions/escalation"
+    },
+    "privacy": {
+      "$ref": "#/definitions/privacy"
+    },
+    "reportHandoff": {
+      "$ref": "#/definitions/reportHandoff"
+    },
     "wpr": {
       "type": "object",
       "properties": {
@@ -109,7 +155,7 @@
         "durationSeconds": {
           "type": "integer",
           "minimum": 5,
-          "maximum": 300
+          "maximum": 600
         },
         "etlFilePath": {
           "type": [
@@ -1153,12 +1199,21 @@
         "preset": {
           "type": "string",
           "enum": [
+            "general",
             "baseline",
             "cpu-heavy",
             "memory-pressure",
+            "memory-leak",
             "storage-io",
+            "network",
             "network-io",
+            "gpu",
+            "ui-hang",
+            "ui-stutter",
             "boot-slowdown",
+            "audio-glitch",
+            "power",
+            "intermittent",
             "application-freeze"
           ],
           "description": "Optional collection preset chosen by the user."
@@ -1931,5 +1986,1888 @@
       }
     }
   },
-  "additionalProperties": true
+  "additionalProperties": true,
+  "definitions": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "success",
+        "complete",
+        "resolved",
+        "partial",
+        "unavailable",
+        "unsupported",
+        "not-collected",
+        "error",
+        "not-requested",
+        "no-data",
+        "no-events-observed",
+        "refused",
+        "consent-required",
+        "planned",
+        "refused-sub-second",
+        "conflicting-modes",
+        "unknown-preset",
+        "unsupported-profile-name",
+        "unsupported-tool",
+        "unsupported-profile",
+        "invalid-query",
+        "invalid",
+        "skipped",
+        "completed",
+        "running",
+        "failed",
+        "removed-oversized",
+        "written",
+        "finding",
+        "coverage",
+        "measured",
+        "not-needed",
+        "not-created",
+        "removed",
+        "not-present"
+      ]
+    },
+    "coverageState": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "unavailable",
+        "not-collected",
+        "unsupported",
+        "no-data"
+      ]
+    },
+    "timestamp": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "nullableNumber": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "nullableInteger": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "moduleSurface": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "loaded": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "missing": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "presetSelection": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "requested": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effective": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isAlias": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tier1Counters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tier1SampleIntervalSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "expectedDurationSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "analysisModules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "eventChannels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "escalationOptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "traceSizeBudget": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "budgetMiB": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "basis": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "overBudgetAction": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": true
+        },
+        "privacyLevel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Standard",
+            "Redacted",
+            "Full",
+            null
+          ]
+        },
+        "automaticRemediation": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonicalNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "capturePolicy": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "preset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "qualifier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profileSpec": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "memory",
+            "file",
+            null
+          ]
+        },
+        "unbounded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "bufferSemantics": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "circular-memory",
+            "unbounded-file",
+            null
+          ]
+        },
+        "traceBudgetMB": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "maxDurationSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "expectedDurationSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "analysisTables": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "captureMode": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Repro",
+            "FlightRecorder",
+            null
+          ]
+        },
+        "strategy": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "tierCadence": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "intervalSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "floorSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "privacy": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "Standard",
+            "Redacted",
+            "Full"
+          ]
+        },
+        "requestedLevel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Standard",
+            "Redacted",
+            "Full",
+            null
+          ]
+        },
+        "defaultLevel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "optDown": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "secretsCollected": {
+          "const": false
+        },
+        "redactionApplied": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "escalationSelection": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "requested": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "adapters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "consentRequired": {
+          "type": "boolean"
+        },
+        "consentGiven": {
+          "type": "boolean"
+        },
+        "automaticRemediation": {
+          "const": false
+        },
+        "privacyLevel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "coveragePlan": {
+      "type": "object",
+      "properties": {
+        "states": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/coverageState"
+          }
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "noDataIsNeverHealth": {
+          "const": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "dataQualityPlan": {
+      "type": "object",
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "noDataIsNeverHealth": {
+          "const": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "evidenceIndexPlan": {
+      "type": "object",
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "everyConclusionNeedsEvidence": {
+          "const": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "tierRow": {
+      "type": "object",
+      "properties": {
+        "tier": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "name": {
+          "type": "string"
+        },
+        "collectedOnce": {
+          "type": "boolean"
+        },
+        "cached": {
+          "type": "boolean"
+        },
+        "projectedState": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "consentRequired": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "tierSurface": {
+      "type": "object",
+      "properties": {
+        "schemaSurface": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "collectedTiers": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          }
+        },
+        "tiers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/tierRow"
+          }
+        },
+        "moduleSurface": {
+          "$ref": "#/definitions/moduleSurface"
+        },
+        "preset": {
+          "$ref": "#/definitions/presetSelection"
+        },
+        "capturePolicy": {
+          "$ref": "#/definitions/capturePolicy"
+        },
+        "captureMode": {
+          "$ref": "#/definitions/captureMode"
+        },
+        "tier1Cadence": {
+          "$ref": "#/definitions/tierCadence"
+        },
+        "privacy": {
+          "$ref": "#/definitions/privacy"
+        },
+        "escalation": {
+          "$ref": "#/definitions/escalationSelection"
+        },
+        "coveragePlan": {
+          "$ref": "#/definitions/coveragePlan"
+        },
+        "dataQualityPlan": {
+          "$ref": "#/definitions/dataQualityPlan"
+        },
+        "evidenceIndexPlan": {
+          "$ref": "#/definitions/evidenceIndexPlan"
+        },
+        "tier0": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "tier1": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "tier2": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "tier3": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/coverage"
+          }
+        },
+        "dataQuality": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/dataQuality"
+          }
+        },
+        "evidenceIndex": {
+          "$ref": "#/definitions/evidenceIndex"
+        },
+        "healthClaim": {
+          "const": "none"
+        },
+        "neverHealthy": {
+          "const": true
+        },
+        "tieredReason": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "coverage": {
+      "type": "object",
+      "properties": {
+        "collector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tier": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 3
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "coverage": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "recordCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "reason": {
+          "type": [
+            "array",
+            "string",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startedUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "completedUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "durationMs": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "cached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "noDataIsNeverHealth": {
+          "const": true
+        },
+        "evidenceIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "dataQuality": {
+      "type": "object",
+      "properties": {
+        "collector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metric": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "sampleCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "expectedSampleCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "intervalSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "durationSeconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "gaps": {
+          "type": [
+            "array",
+            "integer",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "gapCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "coverage": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "collectionErrorCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "noDataIsNeverHealth": {
+          "const": true
+        },
+        "intervals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "dataQualitySummary": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "coverage": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "recordCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "missingCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "noDataIsNeverHealth": {
+          "const": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "evidenceIndexRecord": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metric": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {},
+        "valueRange": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "windowStart": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "windowEnd": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "sizeBytes": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "registered": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "artifactRegistered": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hashed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "linkable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "quality": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "collector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "evidenceIndexArtifact": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sizeBytes": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "safePath": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hashed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "registered": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "evidenceIndex": {
+      "type": "object",
+      "properties": {
+        "generatedAtUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "recordCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/evidenceIndexRecord"
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/evidenceIndexArtifact"
+          }
+        },
+        "everyConclusionNeedsEvidence": {
+          "type": "boolean"
+        },
+        "healthClaim": {
+          "const": "none"
+        },
+        "coverage": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "complete",
+            "partial",
+            "unavailable",
+            "not-collected",
+            "unsupported",
+            "no-data",
+            null
+          ]
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "incident": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windowStart": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "windowEnd": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "markerUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "markerObservedAtUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "observed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "preSeconds": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "postSeconds": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "retainedSampleCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "droppedSampleCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "incidentMarker": {
+      "type": "object",
+      "properties": {
+        "marker": {
+          "type": "string"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "usesDocumentedMarkerSwitch": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "incidentMarkers": {
+      "type": "object",
+      "properties": {
+        "mechanism": {
+          "type": "string"
+        },
+        "markerCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "markers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/incidentMarker"
+          }
+        },
+        "allCommandsResolved": {
+          "type": "boolean"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "incidents": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/incident"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "records": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/incident"
+              }
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "status": {
+              "$ref": "#/definitions/status"
+            },
+            "coverage": {
+              "$ref": "#/definitions/coverageState"
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "inventoryCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capability": {},
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tier": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "coverage": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requiredElevation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "elevationReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "privacyLevel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startedUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "completedUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "durationMs": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "recordCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "items": {
+          "type": "array"
+        },
+        "warnings": {
+          "type": "array"
+        },
+        "errors": {
+          "type": "array"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cached": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "inventory": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "string"
+        },
+        "tier": {
+          "const": 0
+        },
+        "generatedUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "privacyLevel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cacheKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isWindows": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "isElevated": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "capabilityOrder": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/inventoryCapability"
+          }
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "recordCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "warnings": {
+          "type": "array"
+        },
+        "errors": {
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "coverage": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "cached": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "telemetryRecord": {
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "observedAtUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "coverage": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "sampleIndex": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "processId": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "identityKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {},
+        "metrics": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "gaps": {
+          "type": "array"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "telemetry": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/telemetryRecord"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tier": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/status"
+            },
+            "coverage": {
+              "$ref": "#/definitions/coverageState"
+            },
+            "records": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/telemetryRecord"
+              }
+            },
+            "samples": {
+              "type": "array"
+            },
+            "series": {
+              "type": "array"
+            },
+            "artifact": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "findingEvidence": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/definitions/evidenceIndexRecord"
+        }
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "categoryKnown": {
+          "type": "boolean"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "informational",
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "severityReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "High",
+            "Medium",
+            "Low"
+          ]
+        },
+        "confidenceReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "incident": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/incident"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/findingEvidence"
+          }
+        },
+        "correlations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "possibleCauses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "nextSteps": {
+          "type": "array"
+        },
+        "limitations": {
+          "type": "array"
+        },
+        "rule": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "validation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "findingStatus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceArtifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metric": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windowStart": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "windowEnd": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "measuredValues": {},
+        "symbolsAvailable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "ruleCondition": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uncertainty": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suggestedWprProfile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "escalationArtifact": {
+      "type": "object",
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "tier": {
+          "const": 3
+        },
+        "status": {
+          "$ref": "#/definitions/status"
+        },
+        "coverage": {
+          "$ref": "#/definitions/coverageState"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "consentRequired": {
+          "type": "boolean"
+        },
+        "consentGiven": {
+          "type": "boolean"
+        },
+        "automaticRemediation": {
+          "const": false
+        },
+        "recommendations": {
+          "type": "array"
+        },
+        "tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "artifactPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "artifactName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": {},
+        "items": {
+          "type": "array"
+        },
+        "warnings": {
+          "type": "array"
+        },
+        "errors": {
+          "type": "array"
+        },
+        "startedUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "completedUtc": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "durationMs": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "cleanup": {},
+        "privacyLevel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "escalation": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/escalationArtifact"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "$ref": "#/definitions/status"
+            },
+            "requested": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "adapters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "consentRequired": {
+              "type": "boolean"
+            },
+            "consentGiven": {
+              "type": "boolean"
+            },
+            "automaticRemediation": {
+              "const": false
+            },
+            "reasons": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "reportHandoff": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "written",
+            "unavailable",
+            "partial",
+            "success",
+            "error"
+          ]
+        },
+        "artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "findingCount": {
+          "$ref": "#/definitions/nullableInteger"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "FINDINGS IDENTIFIED",
+            "ROOT CAUSE NOT IDENTIFIED",
+            null
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "manifest": {
+      "type": "object",
+      "description": "The root Plan or Collect manifest contract. The root schema properties remain authoritative; this named definition makes the contract addressable to downstream validators.",
+      "required": [
+        "schemaVersion",
+        "toolName",
+        "toolVersion",
+        "mode",
+        "safety"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "type": "string",
+          "enum": [
+            "1.0",
+            "1.1",
+            "1.2",
+            "1.3"
+          ]
+        },
+        "toolName": {
+          "type": "string"
+        },
+        "toolVersion": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "Plan",
+            "Collect"
+          ]
+        },
+        "safety": {
+          "$ref": "#/properties/safety"
+        },
+        "tiers": {
+          "$ref": "#/definitions/tierSurface"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/coverage"
+          }
+        },
+        "dataQuality": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/dataQuality"
+          }
+        },
+        "evidenceIndex": {
+          "$ref": "#/definitions/evidenceIndex"
+        },
+        "incidents": {
+          "$ref": "#/definitions/incidents"
+        },
+        "inventory": {
+          "$ref": "#/definitions/inventory"
+        },
+        "telemetry": {
+          "$ref": "#/definitions/telemetry"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/finding"
+          }
+        },
+        "escalation": {
+          "$ref": "#/definitions/escalation"
+        },
+        "reportHandoff": {
+          "$ref": "#/definitions/reportHandoff"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
 }

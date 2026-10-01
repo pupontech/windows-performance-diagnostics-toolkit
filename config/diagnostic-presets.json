@@ -39,7 +39,7 @@
       "GeneralProfile",
       "CPU",
       "DiskIO",
-      "NetworkProfile"
+      "Network"
     ],
     "detailLevels": [
       "light",
@@ -227,12 +227,12 @@
       "symptomSummary": "Slow transfers, drops or resets reported while the machine is otherwise healthy.",
       "tier1Counters": ["network.retransmitPerSec", "network.connectionFailures", "network.connectionsReset", "cpu.loadPercent", "cpu.dpcPercent", "cpu.interruptsPerSec", "disk.readLatencySeconds"],
       "tier1SampleIntervalSeconds": 1,
-      "tier2": { "wprProfiles": ["NetworkProfile"], "wprDetail": "verbose", "wprMode": "memory" },
+      "tier2": { "wprProfiles": ["Network"], "wprDetail": "verbose", "wprMode": "memory" },
       "expectedDurationSeconds": 300,
       "analysisModules": ["counter-trends", "network-counters", "sustained-window", "coverage-report", "event-correlation", "wpa-exporter-network"],
       "eventChannels": ["System", "Application"],
       "escalationOptions": ["pktmon-packet-capture", "wpa-exporter-tables"],
-      "traceSizeBudget": { "budgetMiB": 3072, "mode": "memory", "basis": "Toolkit guard: free-space preflight plus a post-stop ETL size check for a NetworkProfile recording.", "overBudgetAction": "stop-and-keep-partial-trace-with-explicit-truncation-record" },
+      "traceSizeBudget": { "budgetMiB": 3072, "mode": "memory", "basis": "Toolkit guard: free-space preflight plus a post-stop ETL size check for a Network recording.", "overBudgetAction": "stop-and-keep-partial-trace-with-explicit-truncation-record" },
       "privacyLevel": "Redacted",
       "remediation": { "automaticRemediation": false, "operatorConfirmationRequired": true }
     },

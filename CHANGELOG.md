@@ -1,8 +1,29 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 — 2026-09-22
 
-Crash and servicing evidence follow-up to the 1.0.0 incident-capture release.
+Tiered evidence architecture and crash/servicing analysis release.
+
+- **Tiered diagnostic architecture.** Thirteen canonical presets plus three
+  compatibility aliases resolve through the checked-in preset contract. Tier 0
+  inventory is cached once per run, Tier 1 sampling enforces a one-second floor,
+  Tier 2 capture distinguishes bounded memory mode from explicitly accepted file
+  mode, and Tier 3 escalation remains selection- and consent-gated.
+- **Evidence-first schema 1.3.** Plan and Collect can emit additive coverage,
+  data-quality, evidence-index, incident, inventory, telemetry, finding,
+  escalation, privacy, and technician-handoff surfaces. Older schema 1.0-1.2
+  cases remain valid, and missing evidence is never presented as health.
+- **Capture policy and privacy controls.** Repro and Flight Recorder strategies
+  are mutually exclusive; Full privacy, unbounded WPR file mode, and optional
+  escalation collectors require explicit acceptance. Preset-selected WPR
+  profiles, cadence, duration, and trace budgets are recorded in the plan.
+- **Technician workflow and verification coverage.** Architecture, operator,
+  overhead, schema, source, and Windows live-test documentation now describe the
+  shipped tiered contract. Provider-neutral tests exercise preset resolution,
+  aliases, inventory caching, counter transforms, WPR policy, report handoff,
+  consent refusals, and schema compatibility.
+
+Crash and servicing evidence follow-up to the 1.0.0 incident-capture release:
 
 - **Crash findings now consume collected artifacts.** `Get-CrashAnalysis` keeps
   copied minidumps visible even when their incident date is outside the bounded

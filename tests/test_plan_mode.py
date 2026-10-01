@@ -2711,6 +2711,7 @@ $html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext
     claimsInsufficient   = [bool]($html -match 'Insufficient Evidence')
     statesNoPressure     = [bool]($html -match 'No Sustained Pressure Detected')
     retainsCaveat        = [bool]($html -match 'does not prove the system is healthy')
+    hasBrokenFragment    = [bool]($html -match '\. did not trigger any pressure rules')
 } | ConvertTo-Json
 """
     result = _run_ps(body.replace("__SCRIPT__", script))
@@ -2720,6 +2721,7 @@ $html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext
     assert output["statesNoPressure"] is True
     assert output["claimsInsufficient"] is False
     assert output["retainsCaveat"] is True
+    assert output["hasBrokenFragment"] is False
 
 
 def test_html_report_encodes_artifact_size_bytes():

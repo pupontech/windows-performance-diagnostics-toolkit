@@ -190,10 +190,15 @@ $rows = @($table | ForEach-Object {
         assert row["aliasOf"] is None, preset
         assert row["profile"] in DOCUMENTED_BUILT_IN_PROFILES, preset
         assert row["qualifier"] in ("light", "verbose"), preset
-        assert row["mode"] == "memory", preset
-        assert row["unbounded"] is False, preset
-        assert row["traceBudgetMB"] > 0, preset
-        assert row["maxDurationSeconds"] > 0, preset
+        expected_file_mode = preset in {"boot-slowdown", "intermittent"}
+        assert row["mode"] == ("file" if expected_file_mode else "memory"), preset
+        assert row["unbounded"] is expected_file_mode, preset
+        if preset == "boot-slowdown":
+            assert row["traceBudgetMB"] == 6144
+            assert row["maxDurationSeconds"] == 600
+        if preset == "intermittent":
+            assert row["traceBudgetMB"] == 8192
+            assert row["maxDurationSeconds"] == 3600
         assert len(row["analysisTables"]) > 0, preset
 
     joined = " ".join(str(row["profile"]) for row in rows)

@@ -156,8 +156,8 @@ $script:WpdEtwPresetTable = @(
         analysisTables = @('CPU Usage (Precise)', 'Wait Analysis', 'Processes', 'DPC/ISR')
     }
     [pscustomobject]@{
-        preset = 'boot-slowdown'; aliasOf = $null; profile = 'GeneralProfile'; qualifier = 'verbose'; mode = 'memory'; unbounded = $false
-        traceBudgetMB = 768; maxDurationSeconds = 300; expectedDurationSeconds = 120; detailLevel = 'detailed'
+        preset = 'boot-slowdown'; aliasOf = $null; profile = 'GeneralProfile'; qualifier = 'verbose'; mode = 'file'; unbounded = $true
+        traceBudgetMB = 6144; maxDurationSeconds = 600; expectedDurationSeconds = 600; detailLevel = 'detailed'
         tableBudget = 3; onOffScenario = 'Boot'
         analysisTables = @('Processes', 'File I/O', 'Disk Usage')
     }
@@ -174,8 +174,8 @@ $script:WpdEtwPresetTable = @(
         analysisTables = @('CPU Usage (Sampled)', 'Processes')
     }
     [pscustomobject]@{
-        preset = 'intermittent'; aliasOf = $null; profile = 'GeneralProfile'; qualifier = 'light'; mode = 'memory'; unbounded = $false
-        traceBudgetMB = 1024; maxDurationSeconds = 1800; expectedDurationSeconds = 900; detailLevel = 'standard'
+        preset = 'intermittent'; aliasOf = $null; profile = 'GeneralProfile'; qualifier = 'light'; mode = 'file'; unbounded = $true
+        traceBudgetMB = 8192; maxDurationSeconds = 3600; expectedDurationSeconds = 3600; detailLevel = 'standard'
         tableBudget = 4; onOffScenario = $null
         analysisTables = @('CPU Usage (Sampled)', 'CPU Usage (Precise)', 'Processes', 'Wait Analysis')
     }
@@ -247,7 +247,7 @@ function Get-WpdEtwPresetProfile {
     }
 
     $mode = 'memory'
-    $unbounded = [bool]$policy.unbounded
+    $unbounded = $false
     $fileModeRequested = $false
     if ($AllowFileMode) {
         $mode = 'file'

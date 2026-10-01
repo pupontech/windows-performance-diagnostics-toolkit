@@ -17,8 +17,8 @@ These are the limits the current code actually applies. Each line is checked by
 the code without changing this document fails the suite.
 
 - Tier 1 sampling floor: 1 s
-- Trace budget: 256 MB to 1024 MB
-- Maximum capture duration: 120 s to 1800 s
+- Trace budget: 256 MB to 8192 MB
+- Maximum capture duration: 120 s to 3600 s
 - Post-stop ETL size cap: 512 MB
 - Free-space headroom: max(256 MB, budget / 4)
 
@@ -40,14 +40,12 @@ Two rules make the budget honest:
    The preflight does not assume room, and it does not guess a volume from the
    current working directory.
 
-The per-preset numbers behind that 256 MB to 1024 MB range (memory mode, with
-`expectedDurationSeconds` between 60 s and 900 s) are the module's own preset
-contract. `config/diagnostic-presets.json` separately declares a case-level
-`traceSizeBudget` between 2048 MiB and 8192 MiB, with file mode for
-`boot-slowdown` and `intermittent`. That document is validated by
-`tests/test_rules_presets.py`, but no module in `src/` reads it yet, so the
-number enforced today is the module table above. Wiring the case-level budget
-into the preflight is entry-point integration work, not a measurement result.
+The per-preset numbers behind that 256 MB to 8192 MB range are the module's
+preset contract; the file-mode rows are explicitly opt-in. The entry-point tiered
+resolver also carries the case-level `traceSizeBudget` and expected duration from
+`config/diagnostic-presets.json` into the Plan/manifest policy, while direct module
+callers use the WPR module table. Both surfaces are validated by the respective
+module/config tests.
 
 ## 2. Measurable on Linux
 
@@ -124,10 +122,10 @@ code enforces so a future measurement can be compared against them.
   samples per family and a 900 s window expects 901.
 - Tier 1 coverage: any shortfall is reported as a gap and downgrades coverage
   to `partial`; the suite treats "3 expected, 3 observed, 1 gap" as partial.
-- Tier 2 trace: 256 MB to 1024 MB per recording in memory mode. Before the
-  recording starts, the target volume must have that budget plus
-  `max(256 MB, budget / 4)` of free space, and the post-stop ETL check has the
-  last word on size.
+- Tier 2 trace: 256 MB to 8192 MB per recording. File-mode presets are
+  explicitly opt-in; before the recording starts, the target volume must have
+  that budget plus `max(256 MB, budget / 4)` of free space, and the post-stop ETL
+  check has the last word on size.
 - Case folder: the sum of the traces requested in the run plus reports and
   logs. Only one recording is active at a time (one instance name), so the
   peak is one trace plus headroom, not the sum of the preset budgets.
@@ -153,7 +151,9 @@ make.
   own duration, which is measured by the caller's stopwatch. A probe-only
   record is therefore `partial`, not `complete`.
 - The case-level `traceSizeBudget` in `config/diagnostic-presets.json` is
-  declared and validated but not consumed by `src/` yet (see section 1).
+  declared, validated, and carried into the entry-point tiered Plan/manifest
+  policy. Direct Wpd.Etw callers still use the module table unless they supply
+  their own budget to preflight.
 
 ## 6. Where the checks live
 

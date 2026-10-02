@@ -1,0 +1,11 @@
+{
+  "id": "gpu-unavailable-counters",
+  "title": "No GPU counters at all",
+  "driver": {
+    "kind": "gpu",
+    "args": {
+      "rows": []
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

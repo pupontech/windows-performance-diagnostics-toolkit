@@ -1,17 +1,60 @@
 # Windows Live Test Matrix
 
-This project is verified in hosted CI for PowerShell parsing (5.1 + pwsh),
-fixture/behavioral tests, and a controlled Windows smoke collection. The
-raw-disk/in-window telemetry, findings/report paths, and the incident-capture
-surface still need an **owner-live Windows client run** (WPD-19..WPD-31 below);
-hosted runners only prove the code paths execute, not real device counter values.
-Run these tests on a disposable or approved Windows lab machine before using
-collection mode on a user endpoint.
+This project is verified in hosted CI for PowerShell parsing, fixture and
+behavioral tests, and controlled synthetic command seams. Hosted checks do not
+prove that a real Windows client has the required CIM classes, ETW tools,
+permissions, launcher behavior, or real device counter values.
 
-The incident-capture rows (WPD-24..WPD-31) are the ones that matter most after a
-speed report: they check that the WPR trace actually covers the counter window,
-that the trace is bounded, and that per-process commit, GPU, UDP, and
+The raw-disk/in-window telemetry, findings/report paths, and incident-capture
+surface still need an owner-live Windows run. Run these tests on a disposable or
+approved Windows lab machine before using collection mode on a user endpoint.
+
+The incident-capture rows below check that the WPR trace covers the counter
+window, that the trace is bounded, and that per-process commit, GPU, UDP, and
 drive-to-disk evidence are present rather than merely plausible.
+
+## Proof lanes
+
+| Lane | What it can prove | What it cannot prove |
+|------|-------------------|----------------------|
+| Hosted | Schema shape, provider-neutral transforms, cache and cadence rules, privacy filtering, safe paths, consent refusal, documented command construction, report escaping, and deterministic no-data semantics. | Windows PowerShell 5.1 execution, real CIM/performance counters, real WPR/WPA/Defender tools, UAC, launcher behavior, ETL contents, and real hardware. |
+| Owner-live | The same contract on Windows Server 2022 and Windows Server 2025, real providers and permissions, real WPR markers and ETL output, optional-tool behavior, UAC/launcher behavior, and a verified case. | It does not turn one machine's observations into a general health claim or prove a root cause without evidence. |
+
+Use `[ ]` for not run, `[P]` for hosted proof only, `[O]` for owner-live
+proof, and `[X]` for a failed case. Record UTC start time, Windows build,
+account elevation, exact command line with credentials removed, output directory,
+manifest SHA-256, and the observed status. A hosted pass must not be copied into
+the owner-live result.
+
+## v2 contract gates
+
+| ID | Hosted proof | Owner-live proof |
+|----|--------------|------------------|
+| V2-H01 | Parse every `src/*.ps1` and `src/*.psm1`; check ASCII, LF-only, and no BOM. | Run the same checks with Windows PowerShell 5.1 and execute a Plan. |
+| V2-H02 | Validate schema 1.0-1.3 and all new definitions: manifest, coverage, data quality, evidence index, incidents, inventory, telemetry, findings, and escalation. | Validate a real Plan and Collect manifest from Windows Server 2022 and 2025. |
+| V2-H03 | Resolve all 13 canonical preset names and aliases with injected/config data; assert no silent profile substitution. | Run all canonical names and aliases through Plan and confirm `requested`, `effective`, and `capturePolicy`. |
+| V2-H04 | Exercise Tier 0 cache, Tier 1 one-second floor, null counter values, explicit gaps, and data-quality records. | Confirm static inventory is queried once and real counter samples have timestamps and visible gaps. |
+| V2-H05 | Exercise Repro/Flight Recorder conflict and bounded-memory versus unbounded-file policy. | Confirm file-mode refusal without both opt-ins and a bounded accepted plan with both opt-ins. |
+| V2-H06 | Assert each documented WPR argv and all six marker names at the command seam. | Run one bounded WPR memory capture with `CAPTURE_START`, incident markers, and `CAPTURE_STOP` evidence. |
+| V2-H07 | Exercise failed stop, cancel cleanup, and abandoned-session ownership with a fake runner. | Confirm a real abandoned session is detected and only the toolkit-owned instance is cancelled. |
+| V2-H08 | Exercise Tier 3 consent refusal, privacy projection, and absent-tool outcomes. | Run admin and non-admin cases with WCT, PoolMon, ProcDump, Defender, Search, and minifilter availability recorded. |
+| V2-H09 | Render findings, evidence links, report handoff, and safe offline HTML from synthetic records. | Generate `case/technician-report.html`, check its manifest artifact entry, and run Verify. |
+| V2-H10 | Mutate a fixture artifact and assert Verify fails without changing the original case. | Tamper with a copied owner-live case and confirm SHA-256/package failure. |
+| V2-H11 | Assert no automatic remediation, upload, log clearing, reboot, or healthy result from no data. | Review the manifest and host audit for the same safety invariants. |
+
+## Owner-live prerequisites
+
+- Windows PowerShell 5.1 and approved Windows Server 2022 and 2025 hosts
+- A writable local case folder with enough space for the selected trace budget
+- Administrator access when a stage or provider requires it
+- WPR/WPA availability recorded with `wpr -profiles`; do not install or download
+  optional tools as part of this matrix
+- A pre-existing symptom or approved safe reproduction; do not force a crash,
+  reboot, suspend, or power loss to manufacture a case
+- A separate copy of the case for tamper testing
+
+Every owner-live run must preserve the plan and final manifest. Do not put
+credentials, tokens, or raw secrets in this file or a case summary.
 
 ## Preconditions
 
@@ -21,6 +64,15 @@ drive-to-disk evidence are present rather than merely plausible.
 - Verify the script hash against the release asset before testing
 
 ## Test cases
+
+Rows WPD-04 through WPD-07 (and WPD-08 through WPD-10) are executed by the
+harnesses under `tests/live/` on the owner's GitHub-hosted Windows runners, with
+their verdicts, assertions and evidence uploaded by the `wpd-live-gates` job in
+`.github/workflows/ci.yml`. That environment is a Windows **Server** SKU, so
+client-only behavior (interactive UAC prompts, Defender real-time protection on
+a Win10/11 client, MOTW recovery) still needs the owner spot check described
+below. Everything else below is an owner-live activity on a real Windows 10/11
+client:
 
 | ID | Action | Expected result | Evidence to preserve |
 |---|---|---|---|
@@ -54,7 +106,10 @@ drive-to-disk evidence are present rather than merely plausible.
 | WPD-28 | Reproduce UDP-port pressure (or inspect the warning source) and compare `network-state.json` with the live `netstat -ano` output | `network-state.json` is a small file (hundreds of KB at most, not hundreds of MB), `hostsFile.activeEntries` are plain strings, `udpEndpoints`/`udpEndpointCountByProcess` match `netstat -ano`, `dynamicUdpPortRanges` matches `netsh int ipv4 show dynamicport udp`, and `udp-samples.json` shows the per-process endpoint counts over the window. | `network-state.json`, `udp-samples.json`, live `netstat`/`netsh` output |
 | WPD-29 | Run an incident capture on a machine with a recent warning, then inspect `incident-events.json` | Events come from `System`/`Application` plus whichever WER/driver/PnP logs exist, each row carries `RawXml` and an `IncidentWindow` of `in-window` or `out-of-window`; events outside the window are still present (labelled) and the manifest `incidentEvents.inWindowEventCount`/`pulledEventCount` match the rows. Confirm at least one event whose message Windows cannot render still exposes readable `RawXml` EventData. | `incident-events.json`, manifest `incidentEvents`, Event Viewer comparison |
 | WPD-30 | On a machine with a separate archive/backup drive, inspect `storageMapping` and the report's Volumes row | Every drive letter names its backing physical disk; the drive hosting the pagefile is flagged `HostsPageFile` true; the report's Volume Relevance note makes clear that free space on a non-pagefile archive volume is not a performance cause. | Manifest `storageMapping`, `report.html` |
-| WPD-31 | Run `START-HERE.bat` → option 3 from a standard account | The incident-capture text explains the shared window and the Enter-to-mark behavior, a UAC prompt appears only for the collection step, a 120 s window runs with WPR, and the manifest records `performanceMode` in `scope` plus the marker block when Enter was pressed. | Menu screenshot, console output, manifest |
+| WPD-31 | Run `START-HERE.bat` -> option 3 from a standard account | The incident-capture text explains the shared window and the Enter-to-mark behavior, a UAC prompt appears only for the collection step, a 120 s window runs with WPR, and the manifest records `performanceMode` in `scope` plus the marker block when Enter was pressed. | Menu screenshot, console output, manifest |
+| WPD-32 | Run a collection with minidump consent on a machine whose newest dump predates the 24-hour event lookback | `crashAnalysis.minidumps` retains the dump with `eventCorrelationStatus: "outside-event-lookback"`; `findings.json` contains `minidumpEvidence` even when no current BugCheck event is pulled. A nearby BugCheck event, when present, supplies `bugcheckCode` and `matched-bugcheck`; no binary dump decoder is implied. | `diagnostic-manifest.json`, `findings.json`, `minidumps\` |
+| WPD-33 | Run a collection with boot-failure log consent on a machine with known CBS/DISM/setup errors | `servicing-log-analysis.json` is present and hash-registered; copied logs show `scanStatus: "completed"`; recurring signatures such as `CBS_E_INVALID_PACKAGE` have counts and line ranges; `findings.json` and `report.html` show a `servicing-failure` finding under the crash/servicing heading. | `servicing-log-analysis.json`, `findings.json`, `report.html`, copied `bootfailure\` logs |
+| WPD-34 | Place or encounter a copied servicing log over the configured analysis bound, then run the normal consented collection | The log is reported as `scanStatus: "oversized"`, no raw contents are duplicated into `servicing-log-analysis.json`, and the report states `servicingEvidencePartial` when another requested log was scanned or `servicingEvidenceUnavailable` when none was readable. Reparse-point and hardlink paths are refused rather than followed. | Analysis JSON, manifest, report, source-log size |
 
 ## Approved collection example
 

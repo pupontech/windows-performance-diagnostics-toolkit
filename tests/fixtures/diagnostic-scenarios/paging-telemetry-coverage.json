@@ -1,0 +1,25 @@
+{
+  "id": "paging-telemetry-coverage",
+  "title": "Memory telemetry withholds a paging conclusion",
+  "driver": {
+    "kind": "memory",
+    "args": {
+      "rows": [
+        {
+          "PagesInputPerSec": 300,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184,
+          "HardFaultsPerSec": 120
+        }
+      ],
+      "config": {
+        "PagingRateThresholdPerSec": 100,
+        "CommitPressurePercent": 90,
+        "AvailablePhysicalPercent": 10
+      }
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

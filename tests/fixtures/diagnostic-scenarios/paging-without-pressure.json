@@ -1,0 +1,124 @@
+{
+  "id": "paging-without-pressure",
+  "title": "High Pages/sec without a RAM shortage",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T13:00:00Z",
+          "PagesInputPerSec": 260,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:05Z",
+          "PagesInputPerSec": 260,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:10Z",
+          "PagesInputPerSec": 260,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:15Z",
+          "PagesInputPerSec": 260,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:20Z",
+          "PagesInputPerSec": 260,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:25Z",
+          "PagesInputPerSec": 260,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        }
+      ],
+      "rules": [
+        {
+          "id": "memory-paging-with-pressure",
+          "category": "memory-paging",
+          "title": "Paging with independent memory pressure",
+          "summary": "The paging rate and an independent memory-pressure channel were both elevated.",
+          "metric": "PagesInputPerSec",
+          "comparator": "gt",
+          "threshold": 100,
+          "minimumSamples": 5,
+          "minimumDurationSeconds": 5,
+          "sourceArtifact": "performance-samples.csv",
+          "severity": {
+            "default": "medium",
+            "escalations": [
+              {
+                "severity": "high",
+                "when": "the paging run overlaps a commit-pressure run and per-process growth evidence exists"
+              }
+            ]
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": [
+              {
+                "level": "High",
+                "when": "at least two independent pressure channels qualify in the same window and the sample series has no gaps"
+              },
+              {
+                "level": "Low",
+                "when": "a single pressure channel qualifies or the working-set series has gaps"
+              }
+            ]
+          },
+          "correlationRequirements": [
+            {
+              "metric": "CommitPercent",
+              "comparator": "ge",
+              "threshold": 90,
+              "kind": "required-any-of",
+              "note": "Independent pressure channel: commit charge ratio"
+            },
+            {
+              "metric": "AvailableMemoryMB",
+              "comparator": "le",
+              "threshold": 512,
+              "kind": "required-any-of",
+              "note": "Independent pressure channel: available physical memory"
+            }
+          ],
+          "uncertainty": "Pages Input/sec is a paging volume indicator, not an exact fault count.",
+          "nextSteps": [
+            "Collect commit, available-memory and process working-set evidence."
+          ],
+          "suggestedWprProfile": "CPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

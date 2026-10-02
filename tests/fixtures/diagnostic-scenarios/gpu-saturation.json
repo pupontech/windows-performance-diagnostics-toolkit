@@ -1,0 +1,114 @@
+{
+  "id": "gpu-saturation",
+  "title": "GPU engine saturation with low CPU",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T19:00:00Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:05Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:10Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:15Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:20Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:25Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:30Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:35Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:40Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        },
+        {
+          "TimestampUtc": "2026-09-10T19:00:45Z",
+          "GpuEngineUtilizationPercent": 96,
+          "AverageCpuLoadPercent": 18
+        }
+      ],
+      "rules": [
+        {
+          "id": "gpu-saturation",
+          "category": "gpu-saturation",
+          "title": "GPU engine saturation",
+          "summary": "GPU engine utilization stayed at or above the configured threshold.",
+          "metric": "GpuEngineUtilizationPercent",
+          "comparator": "ge",
+          "threshold": 90,
+          "minimumSamples": 10,
+          "minimumDurationSeconds": 10,
+          "sourceArtifact": "gpu-metrics.json",
+          "severity": {
+            "default": "medium",
+            "escalations": []
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": [
+              {
+                "level": "High",
+                "when": "GPU utilization is sustained, the per-process GPU memory series names a consumer, and no adapter reset event appears in the window"
+              },
+              {
+                "level": "Low",
+                "when": "GPU counters exist but no per-process attribution is available"
+              }
+            ]
+          },
+          "correlationRequirements": [
+            {
+              "metric": "AverageCpuLoadPercent",
+              "comparator": "lt",
+              "threshold": 50,
+              "kind": "required-any-of",
+              "note": "GPU-bound work usually shows high GPU utilization with low CPU"
+            }
+          ],
+          "uncertainty": "Engine saturation does not name the workload.",
+          "nextSteps": [
+            "Collect a GPU trace over the same window."
+          ],
+          "suggestedWprProfile": "GPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "gpu-metrics.json",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

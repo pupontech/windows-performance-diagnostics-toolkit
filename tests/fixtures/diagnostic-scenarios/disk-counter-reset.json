@@ -1,0 +1,31 @@
+{
+  "id": "disk-counter-reset",
+  "title": "Disk raw counter reset between samples",
+  "driver": {
+    "kind": "disk-deltas",
+    "args": {
+      "previous": [
+        {
+          "Name": "0 C:",
+          "AvgDiskSecPerRead": 5,
+          "AvgDiskSecPerRead_Base": 10,
+          "Frequency_PerfTime": 10000000,
+          "Timestamp_PerfTime": 1000,
+          "CurrentDiskQueueLength": 0
+        }
+      ],
+      "current": [
+        {
+          "Name": "0 C:",
+          "AvgDiskSecPerRead": 2,
+          "AvgDiskSecPerRead_Base": 4,
+          "Frequency_PerfTime": 10000000,
+          "Timestamp_PerfTime": 2000,
+          "CurrentDiskQueueLength": 0
+        }
+      ],
+      "timestampUtc": "2026-09-10T23:00:00Z"
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

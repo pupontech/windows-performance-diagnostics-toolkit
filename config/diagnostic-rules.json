@@ -1,0 +1,634 @@
+{
+  "artifact": "diagnostic-rules",
+  "schemaVersion": "1.3",
+  "description": "Central threshold configuration. No machine-specific number is a hard-coded pass/fail line in code: every threshold, minimum duration, minimum sample count, correlation requirement, severity escalation and confidence condition is declared here, and an emitted finding records the rule id and the threshold used.",
+  "samplingFloorSeconds": 1,
+  "samplingFloorBasis": "Performance counters are not designed to be collected more than once per second; minimumDurationSeconds can never be shorter than the sample requirement at this floor.",
+  "severities": ["informational", "low", "medium", "high"],
+  "confidenceLevels": ["High", "Medium", "Low"],
+  "confidencePolicy": "Confidence is the enum High, Medium or Low with stated conditions. It is never a numeric percentage and never a synthetic health score.",
+  "thresholdBasisVocabulary": {
+    "existing-toolkit-rule": "Threshold already shipped in the entry point's findings engine; moving it here changes the location, not the value.",
+    "microsoft-documented": "A number published by Microsoft or referenced in docs/authoritative-sources-*.md for the same metric.",
+    "owner-tunable-initial-value": "No published numeric threshold exists for this metric. The value is a starting point that requires owner sign-off before it is treated as an acceptance line."
+  },
+  "severityPolicy": "Severity describes how much the evidence affects the reported symptom; it is not a probability. 'informational' means the record exists to attribute or explain, not to warn.",
+  "categories": [
+    "cpu-pressure",
+    "memory-pressure",
+    "memory-paging",
+    "memory-leak",
+    "disk-pressure",
+    "disk-latency",
+    "disk-space",
+    "commit-attribution",
+    "network-errors",
+    "gpu-saturation",
+    "ui-responsiveness",
+    "boot-degradation",
+    "power-throttling",
+    "audio-glitch",
+    "crash-evidence",
+    "servicing-failure",
+    "evidence-coverage",
+    "coverage"
+  ],
+  "counters": [
+    { "id": "cpu.loadPercent", "field": "AverageCpuLoadPercent", "unit": "percent", "counterPath": "\\Processor Information(_Total)\\% Processor Time" },
+    { "id": "cpu.utilityPercent", "field": "ProcessorUtilityPercent", "unit": "percent", "counterPath": "\\Processor Information(_Total)\\% Processor Utility" },
+    { "id": "cpu.queueLength", "field": "ProcessorQueueLength", "unit": "count", "counterPath": "\\System\\Processor Queue Length" },
+    { "id": "cpu.dpcInterruptPercent", "field": "DpcInterruptTimePercent", "unit": "percent", "counterPath": "\\Processor Information(_Total)\\% DPC Time plus % Interrupt Time" },
+    { "id": "memory.commitPercent", "field": "CommitPercent", "unit": "percent", "counterPath": "\\Memory\\% Committed Bytes In Use" },
+    { "id": "memory.availableMB", "field": "AvailableMemoryMB", "unit": "megabytes", "counterPath": "\\Memory\\Available Bytes" },
+    { "id": "memory.pagesInputPerSec", "field": "PagesInputPerSec", "unit": "rate", "counterPath": "\\Memory\\Pages Input/sec" },
+    { "id": "pagefile.usagePercent", "field": "PageFileUsagePercent", "unit": "percent", "counterPath": "\\Paging File(_Total)\\% Usage" },
+    { "id": "process.workingSetGrowthPercent", "field": "WorkingSetGrowthPercent", "unit": "percent", "basis": "Derived from the PID plus StartTime per-process series" },
+    { "id": "pool.growthPercent", "field": "PoolGrowthPercent", "unit": "percent", "basis": "Derived from the kernel pool series" },
+    { "id": "disk.queueLength", "field": "CurrentQueueLength", "unit": "count", "counterPath": "\\PhysicalDisk(*)\\Current Disk Queue Length" },
+    { "id": "disk.readLatencySeconds", "field": "ReadLatencySeconds", "unit": "seconds", "counterPath": "\\PhysicalDisk(*)\\Avg. Disk sec/Read" },
+    { "id": "disk.writeLatencySeconds", "field": "WriteLatencySeconds", "unit": "seconds", "counterPath": "\\PhysicalDisk(*)\\Avg. Disk sec/Write" },
+    { "id": "disk.percentFree", "field": "PercentFree", "unit": "percent", "counterPath": "\\LogicalDisk(*)\\% Free Space" },
+    { "id": "network.retransmitPerSec", "field": "SegmentsRetransmittedPerSec", "unit": "rate", "counterPath": "\\TCPv4\\Segments Retransmitted/sec and \\TCPv6\\Segments Retransmitted/sec" },
+    { "id": "network.connectionFailures", "field": "ConnectionFailures", "unit": "count", "counterPath": "\\TCPv4\\Connection Failures" },
+    { "id": "network.connectionsReset", "field": "ConnectionsReset", "unit": "count", "counterPath": "\\TCPv4\\Connections Reset" },
+    { "id": "gpu.engineUtilizationPercent", "field": "GpuEngineUtilizationPercent", "unit": "percent", "counterPath": "\\GPU Engine(*)\\Utilization Percentage" },
+    { "id": "responsiveness.hangEvents", "field": "ApplicationHangEvents", "unit": "count", "basis": "Event-derived from the Application Hang provider in the Application log" },
+    { "id": "crash.bugcheckCount", "field": "BugcheckCount", "unit": "count", "basis": "Derived from the collected bugcheck events plus dump metadata" },
+    { "id": "servicing.errorSignatureCount", "field": "ServicingErrorSignatureCount", "unit": "count", "basis": "Derived from the copied CBS and servicing logs" },
+    { "id": "boot.timeToDesktopSeconds", "field": "TimeToDesktopSeconds", "unit": "seconds", "basis": "Derived from a boot or on/off transition recording; compared against a baseline, never against an absolute vendor claim" }
+  ],
+  "rules": [
+    {
+      "id": "cpu-pressure-sustained",
+      "category": "cpu-pressure",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "AverageCpuLoadPercent",
+      "comparator": "ge",
+      "threshold": 80,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 5,
+      "minimumDurationSeconds": 5,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "the qualifying run is at or above 95 percent and the sampling window contains at least 30 consecutive samples" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "the run is at least 10 consecutive samples, no sample in the run is null, and the independent per-process CPU series names a top consumer inside the same window" },
+          { "level": "Low", "when": "fewer than 5 finite CPU readings exist in the window, or the CPU source is the averaged fallback view rather than the utility counter" }
+        ]
+      },
+      "suggestedWprProfile": "CPU",
+      "uncertainty": "CPU load does not identify the responsible process; correlation is not causation.",
+      "nextSteps": "Collect a WPR CPU trace covering the cited window to identify the top CPU consumer."
+    },
+    {
+      "id": "cpu-utility-saturation",
+      "category": "cpu-pressure",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "ProcessorUtilityPercent",
+      "comparator": "ge",
+      "threshold": 90,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "the utility series is available for the whole run and the time-based CPU series agrees on the same window" },
+          { "level": "Low", "when": "the utility counter is unavailable and only the time-based fallback is present" }
+        ]
+      },
+      "suggestedWprProfile": "CPU",
+      "uncertainty": "Processor utility can legitimately exceed 100 percent on boost-capable systems; a value above 100 is documented behaviour and is not an error.",
+      "nextSteps": "Read utility and time-based CPU together, then attribute work with a CPU trace."
+    },
+    {
+      "id": "cpu-scheduling-queue-pressure",
+      "category": "cpu-pressure",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "ProcessorQueueLength",
+      "comparator": "ge",
+      "threshold": 2,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [ { "metric": "AverageCpuLoadPercent", "comparator": "ge", "threshold": 70, "kind": "required-any-of", "note": "A queue can form while total CPU is low (one saturated logical processor, a driver, or a lock); the correlation is recorded, not assumed." } ],
+      "severity": { "default": "low", "escalations": [ { "severity": "medium", "when": "the queue run coincides with a sustained CPU or DPC and interrupt run in the same window" } ] },
+      "confidence": {
+        "default": "Low",
+        "conditions": [
+          { "level": "Medium", "when": "the queue run and a CPU, DPC or interrupt condition overlap in the same window" },
+          { "level": "Low", "when": "the queue is elevated alone and no second channel corroborates a processor-side constraint" }
+        ]
+      },
+      "suggestedWprProfile": "CPU",
+      "uncertainty": "Processor queue length is a system counter; it does not identify a thread or a process.",
+      "nextSteps": "Collect a CPU trace and inspect scheduler and ReadyThread evidence for the cited window."
+    },
+    {
+      "id": "cpu-dpc-interrupt-share",
+      "category": "cpu-pressure",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "DpcInterruptTimePercent",
+      "comparator": "ge",
+      "threshold": 10,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "the DPC and interrupt share is sustained and a driver or device event appears in the same window" },
+          { "level": "Low", "when": "the share is a single spike rather than a sustained run" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "DPC and interrupt time points at kernel-mode work but not at a specific driver without trace evidence.",
+      "nextSteps": "Collect a trace and inspect DPC and ISR durations by module."
+    },
+    {
+      "id": "memory-commit-pressure",
+      "category": "memory-pressure",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "CommitPercent",
+      "comparator": "ge",
+      "threshold": 90,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 5,
+      "minimumDurationSeconds": 5,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "commit charge is at or above 95 percent and the paging rule also qualifies in the same window" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "commit charge and the per-process private bytes series agree on the same window" },
+          { "level": "Low", "when": "the commit limit is unavailable so the ratio cannot be computed for part of the window" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "High commit charge alone does not cause disk thrashing; paging depends on available physical memory and working set.",
+      "nextSteps": "Read the paging finding; when it also qualifies, collect a GeneralProfile trace covering the window."
+    },
+    {
+      "id": "memory-available-low",
+      "category": "memory-pressure",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "AvailableMemoryMB",
+      "comparator": "le",
+      "threshold": 512,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [ { "metric": "PagesInputPerSec", "comparator": "gt", "threshold": 100, "kind": "required-any-of", "note": "Low free memory is a state, not a symptom; paging activity is what makes it observable." } ],
+      "severity": { "default": "low", "escalations": [] },
+      "confidence": {
+        "default": "Low",
+        "conditions": [
+          { "level": "Medium", "when": "low available memory and elevated paging overlap in the same window" },
+          { "level": "Low", "when": "available memory is low without measurable paging activity" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "Low free memory is normal on a machine with a large file cache and is not by itself a defect.",
+      "nextSteps": "Use the commit and process rankings to see whether the memory is cache or charge."
+    },
+    {
+      "id": "memory-paging-with-pressure",
+      "category": "memory-paging",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "PagesInputPerSec",
+      "comparator": "gt",
+      "threshold": 100,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 5,
+      "minimumDurationSeconds": 5,
+      "correlationRequirements": [
+        { "metric": "CommitPercent", "comparator": "ge", "threshold": 90, "kind": "required-any-of", "note": "Independent pressure channel: commit charge ratio" },
+        { "metric": "AvailableMemoryMB", "comparator": "le", "threshold": 512, "kind": "required-any-of", "note": "Independent pressure channel: available physical memory" },
+        { "metric": "WorkingSetGrowthPercent", "comparator": "ge", "threshold": 10, "kind": "required-any-of", "note": "Independent pressure channel: working-set growth across the window" }
+      ],
+      "correlationPolicy": "At least one independent pressure channel must qualify in the same window. Elevated paging alone produces a coverage record, never a memory-paging finding: a machine with ample memory doing legitimate file I/O is not a paging fault.",
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "the paging run overlaps a commit-pressure run and per-process growth evidence exists" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "at least two independent pressure channels qualify in the same window and the sample series has no gaps" },
+          { "level": "Low", "when": "a single pressure channel qualifies or the working-set series has gaps" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "Pages Input/sec counts pages read to resolve hard faults; it is a paging volume indicator, not an exact fault count, and it does not identify the responsible process.",
+      "nextSteps": "Collect a GeneralProfile trace covering the cited window and inspect the largest working-set change."
+    },
+    {
+      "id": "memory-pagefile-pressure",
+      "category": "memory-pressure",
+      "sourceArtifact": "pagefile-metrics.json",
+      "metric": "PageFileUsagePercent",
+      "comparator": "ge",
+      "threshold": 90,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 5,
+      "minimumDurationSeconds": 5,
+      "correlationRequirements": [ { "metric": "CommitPercent", "comparator": "ge", "threshold": 80, "kind": "required-any-of", "note": "A pagefile near full is only relevant when commit charge is also high" } ],
+      "severity": { "default": "low", "escalations": [] },
+      "confidence": {
+        "default": "Low",
+        "conditions": [
+          { "level": "Medium", "when": "pagefile usage and commit charge both qualify in the same window" },
+          { "level": "Low", "when": "pagefile usage is elevated while commit charge stays moderate" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "A system-managed pagefile can grow after a spike; a high usage value at one instant does not prove sustained exhaustion.",
+      "nextSteps": "Check the pagefile hosts and growth state recorded with the volume mapping."
+    },
+    {
+      "id": "memory-leak-user-growth",
+      "category": "memory-leak",
+      "sourceArtifact": "process-memory-samples.csv",
+      "metric": "WorkingSetGrowthPercent",
+      "comparator": "ge",
+      "threshold": 20,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "trend": { "direction": "increasing", "minimumDeltaPercent": 20, "minimumSamples": 10, "monotonicWindow": 10 },
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [ { "metric": "AvailableMemoryMB", "comparator": "le", "threshold": 2048, "kind": "required-any-of", "note": "Growth matters when it consumes the machine's headroom; growth alone can be a cache warming up" } ],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "the process identity is stable across the whole window and the growth continues after the workload is idle" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "the same PID and StartTime pair grows monotonically across at least 30 samples with no identity change" },
+          { "level": "Low", "when": "the window is shorter than 30 samples or the process identity changes during the window" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "A growing working set is a mechanism, not a leak; only a monotonic growth without release is suspicious, and reuse of a process identity restarts the series.",
+      "nextSteps": "Capture a longer window and consider a consent-gated mini dump of the suspect process."
+    },
+    {
+      "id": "memory-leak-kernel-pool-growth",
+      "category": "memory-leak",
+      "sourceArtifact": "kernel-pool-samples.json",
+      "metric": "PoolGrowthPercent",
+      "comparator": "ge",
+      "threshold": 15,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "trend": { "direction": "increasing", "minimumDeltaPercent": 15, "minimumSamples": 10, "monotonicWindow": 10 },
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [ { "metric": "AvailableMemoryMB", "comparator": "le", "threshold": 2048, "kind": "required-any-of", "note": "Pool growth is only attributable when it consumes headroom" } ],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "non-paged pool growth is monotonic and the committed charge curve follows it" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "non-paged and paged pool both grow monotonically with the commit curve across the window" },
+          { "level": "Low", "when": "only the pool totals move and the commit curve is flat" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "Pool totals do not identify a driver; tag-level attribution requires an opt-in PoolMon escalation.",
+      "nextSteps": "Escalate to pool tag attribution with operator consent."
+    },
+    {
+      "id": "disk-queue-sustained",
+      "category": "disk-pressure",
+      "sourceArtifact": "disk-samples.json",
+      "metric": "CurrentQueueLength",
+      "comparator": "ge",
+      "threshold": 2,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 5,
+      "minimumDurationSeconds": 5,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "queue depth and read latency both qualify on the same disk in the same window" },
+          { "level": "Low", "when": "the queue qualifies but the paired raw latency counters are unavailable" }
+        ]
+      },
+      "suggestedWprProfile": "DiskIO",
+      "uncertainty": "Disk queue depth indicates I/O contention; process attribution requires a disk I/O trace.",
+      "nextSteps": "Collect a DiskIO trace covering the window to identify the process generating the I/O."
+    },
+    {
+      "id": "disk-read-latency-sustained",
+      "category": "disk-latency",
+      "sourceArtifact": "disk-samples.json",
+      "metric": "ReadLatencySeconds",
+      "comparator": "ge",
+      "threshold": 0.02,
+      "thresholdBasis": "existing-toolkit-rule",
+      "documentedReference": "A published analysis tool documents a 25 ms disk response-time reference as a conservative threshold; the toolkit keeps a 20 ms starting line for reads and records the reference alongside it.",
+      "minimumSamples": 5,
+      "minimumDurationSeconds": 5,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "read latency is at or above 50 ms across at least 30 consecutive intervals" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "latency and the operation base counters are both valid for every interval in the run" },
+          { "level": "Low", "when": "the operation base is missing for part of the run so the average covers fewer operations than the interval count suggests" }
+        ]
+      },
+      "suggestedWprProfile": "DiskIO",
+      "uncertainty": "Latency is derived from paired raw disk counters; it does not identify the requesting process, and interval counters average short stalls down.",
+      "nextSteps": "Collect a DiskIO trace covering the window."
+    },
+    {
+      "id": "disk-write-latency-sustained",
+      "category": "disk-latency",
+      "sourceArtifact": "disk-samples.json",
+      "metric": "WriteLatencySeconds",
+      "comparator": "ge",
+      "threshold": 0.02,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 5,
+      "minimumDurationSeconds": 5,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "write latency is at or above 50 ms across at least 30 consecutive intervals" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "write latency and write operation counters are valid for every interval in the run" },
+          { "level": "Low", "when": "the write operation base is missing for part of the run" }
+        ]
+      },
+      "suggestedWprProfile": "DiskIO",
+      "uncertainty": "Write latency on a busy volume can be a queueing effect rather than a device limit; it does not identify the writer.",
+      "nextSteps": "Collect a DiskIO trace covering the window and compare read and write behaviour."
+    },
+    {
+      "id": "disk-space-low",
+      "category": "disk-space",
+      "sourceArtifact": "volume-metrics.json",
+      "metric": "PercentFree",
+      "comparator": "lt",
+      "threshold": 10,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 1,
+      "minimumDurationSeconds": 1,
+      "correlationRequirements": [],
+      "severity": { "default": "low", "escalations": [] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "free space and capacity are both readable for the volume" },
+          { "level": "Low", "when": "only the ratio is available and the absolute free space is unknown" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "Low free space can degrade performance but does not alone cause slowness.",
+      "nextSteps": "Review large files and volume growth; no cleanup is performed automatically."
+    },
+    {
+      "id": "network-retransmission-pressure",
+      "category": "network-errors",
+      "sourceArtifact": "network-state.json",
+      "metric": "SegmentsRetransmittedPerSec",
+      "comparator": "gt",
+      "threshold": 0,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "documentedReference": "The counter list defines what is measured, not what value is acceptable; a non-zero retransmission rate alone does not establish a fault and must be read with the discard and error counters on the same interval.",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [
+        { "metric": "ConnectionFailures", "comparator": "gt", "threshold": 0, "kind": "required-any-of", "note": "Independent channel: connection failures on the same interval" },
+        { "metric": "ConnectionsReset", "comparator": "gt", "threshold": 0, "kind": "required-any-of", "note": "Independent channel: connection resets on the same interval" }
+      ],
+      "severity": { "default": "medium", "escalations": [] },
+      "confidence": {
+        "default": "Low",
+        "conditions": [
+          { "level": "Medium", "when": "retransmissions and a failure or reset counter both move on the same interval" },
+          { "level": "Low", "when": "retransmissions are non-zero without any failure or reset evidence" }
+        ]
+      },
+      "suggestedWprProfile": "NetworkProfile",
+      "uncertainty": "Retransmissions are normal at a low rate and can be caused by the peer or the path rather than this machine.",
+      "nextSteps": "Escalate to a packet capture with drop reasons when the rate is sustained."
+    },
+    {
+      "id": "gpu-saturation",
+      "category": "gpu-saturation",
+      "sourceArtifact": "gpu-metrics.json",
+      "metric": "GpuEngineUtilizationPercent",
+      "comparator": "ge",
+      "threshold": 90,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [ { "metric": "AverageCpuLoadPercent", "comparator": "lt", "threshold": 50, "kind": "required-any-of", "note": "GPU-bound work usually shows high GPU utilization with low CPU; a high CPU figure points at the CPU side instead" } ],
+      "severity": { "default": "medium", "escalations": [] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "GPU utilization is sustained, the per-process GPU memory series names a consumer, and no adapter reset event appears in the window" },
+          { "level": "Low", "when": "GPU counters exist but no per-process attribution is available" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "High GPU utilization for a compositor is a pipeline observation, not a cause; GPU counters can also be unavailable on some driver models, in which case the state must be reported as unsupported rather than zero.",
+      "nextSteps": "Collect a trace and inspect GPU and composition work against the symptom window."
+    },
+    {
+      "id": "ui-hang-events",
+      "category": "ui-responsiveness",
+      "sourceArtifact": "incident-events.json",
+      "metric": "ApplicationHangEvents",
+      "comparator": "ge",
+      "threshold": 1,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 1,
+      "minimumDurationSeconds": 1,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "the same process produces a hang and a crash in the same window" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "a hang event and a wait chain result or a sustained CPU, disk or paging condition overlap in the same window" },
+          { "level": "Low", "when": "only the hang event is present and no second channel overlaps it" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "A hang event records that the window stopped responding; it does not explain why, and a Wait Chain result covers only the documented synchronization primitives.",
+      "nextSteps": "Escalate to wait chain traversal for the hung process with operator consent."
+    },
+    {
+      "id": "boot-degradation",
+      "category": "boot-degradation",
+      "sourceArtifact": "boot-trace.json",
+      "metric": "TimeToDesktopSeconds",
+      "comparator": "gt",
+      "threshold": 120,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 1,
+      "minimumDurationSeconds": 1,
+      "correlationRequirements": [ { "metric": "ReadLatencySeconds", "comparator": "ge", "threshold": 0.02, "kind": "required-any-of", "note": "Boot delay must be linked to a phase; disk latency in the same boot window is one such link" } ],
+      "severity": { "default": "low", "escalations": [] },
+      "confidence": {
+        "default": "Low",
+        "conditions": [
+          { "level": "Medium", "when": "a boot recording exists for the affected boot and a slow phase can be identified in it" },
+          { "level": "Low", "when": "no boot recording exists, so the value comes from a coarse timestamp difference only" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "Boot duration depends on startup workload and update state; it must be compared against a baseline for the same machine, never against a vendor claim.",
+      "nextSteps": "Run a boot trace with the autologger escalation, which requires a reboot and explicit operator approval."
+    },
+    {
+      "id": "audio-glitch-dpc-starvation",
+      "category": "audio-glitch",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "DpcInterruptTimePercent",
+      "comparator": "ge",
+      "threshold": 5,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [ { "metric": "ProcessorUtilityPercent", "comparator": "ge", "threshold": 50, "kind": "required-any-of", "note": "DPC and ISR pressure only explains glitches when the audio path is also under load; a busy-but-realtime-capable system may glitch for other reasons" } ],
+      "severity": { "default": "low", "escalations": [] },
+      "confidence": {
+        "default": "Low",
+        "conditions": [
+          { "level": "Medium", "when": "the audio glitch window overlaps a sustained DPC or interrupt run with a named module in the trace" },
+          { "level": "Low", "when": "the counter evidence is indirect and no trace module attribution exists" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "Glitches can originate in the audio stack, the driver or the application timeline; counters alone cannot place the glitch in time.",
+      "nextSteps": "Collect a trace covering a reproduction and inspect DPC and ISR durations by module."
+    },
+    {
+      "id": "power-frequency-throttling",
+      "category": "power-throttling",
+      "sourceArtifact": "performance-samples.csv",
+      "metric": "ProcessorUtilityPercent",
+      "comparator": "ge",
+      "threshold": 60,
+      "thresholdBasis": "owner-tunable-initial-value",
+      "minimumSamples": 10,
+      "minimumDurationSeconds": 10,
+      "correlationRequirements": [],
+      "severity": { "default": "low", "escalations": [] },
+      "confidence": {
+        "default": "Low",
+        "conditions": [
+          { "level": "Medium", "when": "a frequency or power state series is available for the same window and shows a cap while demand is high" },
+          { "level": "Low", "when": "only demand-side counters exist and no frequency series was collected" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "Utility above 100 percent is documented behaviour on boost-capable systems; it is evidence of work done, not of throttling, and a power scheme is never changed by the toolkit.",
+      "nextSteps": "Collect the frequency series and, with consent, a powercfg energy report for a defined idle window."
+    },
+    {
+      "id": "crash-bugcheck-recurrence",
+      "category": "crash-evidence",
+      "sourceArtifact": "crash-analysis.json",
+      "metric": "BugcheckCount",
+      "comparator": "ge",
+      "threshold": 1,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 1,
+      "minimumDurationSeconds": 1,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [ { "severity": "high", "when": "the same bugcheck code recurs, or a Kernel-Power 41 event has no BugCheck or WER event inside the correlation window" } ] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "the bugcheck event and its dump or LiveKernelReport metadata are both present" },
+          { "level": "Low", "when": "only a bugcheck event exists and no dump metadata was collected" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "A dump or LiveKernelReport file name provides bounded classification hints; it does not decode the dump or prove a hardware cause.",
+      "nextSteps": "Correlate the bugcheck with the collected dump and WHEA evidence; no dump is deleted or moved."
+    },
+    {
+      "id": "servicing-failure-signature",
+      "category": "servicing-failure",
+      "sourceArtifact": "servicing-log-analysis.json",
+      "metric": "ServicingErrorSignatureCount",
+      "comparator": "ge",
+      "threshold": 1,
+      "thresholdBasis": "existing-toolkit-rule",
+      "minimumSamples": 1,
+      "minimumDurationSeconds": 1,
+      "correlationRequirements": [],
+      "severity": { "default": "medium", "escalations": [] },
+      "confidence": {
+        "default": "Medium",
+        "conditions": [
+          { "level": "High", "when": "the signature comes from a complete scanned log window" },
+          { "level": "Low", "when": "the scan was partial, bounded or cut short, so the absence of further signatures is not established" }
+        ]
+      },
+      "suggestedWprProfile": "GeneralProfile",
+      "uncertainty": "A servicing signature proves a failure occurred during servicing; it does not prove the current performance symptom and does not authorise a repair.",
+      "nextSteps": "Report the signature with its log window; no servicing or repair command is ever run."
+    }
+  ],
+  "coverageRules": [
+    {
+      "id": "paging-without-pressure-is-coverage",
+      "category": "coverage",
+      "outcome": "coverage-record",
+      "reason": "Pages Input/sec was elevated without a qualifying independent pressure channel, so the evidence supports a paging-rate observation only; it is reported as coverage and never as a memory-pressure finding."
+    },
+    {
+      "id": "cpu-counters-unavailable",
+      "category": "coverage",
+      "outcome": "unavailable",
+      "reason": "No finite CPU readings were collected, so CPU pressure cannot be assessed; this is unknown, not healthy."
+    },
+    {
+      "id": "memory-counters-unavailable",
+      "category": "coverage",
+      "outcome": "unavailable",
+      "reason": "Memory performance counters were unavailable, so memory pressure and paging cannot be assessed."
+    },
+    {
+      "id": "disk-series-unavailable",
+      "category": "coverage",
+      "outcome": "unavailable",
+      "reason": "No paired raw disk counter intervals were collected, so sustained disk contention cannot be assessed."
+    },
+    {
+      "id": "trace-missing-for-window",
+      "category": "coverage",
+      "outcome": "not-collected",
+      "reason": "No ETW trace covers the cited window, so counter findings cannot be attributed to a process; the finding keeps its counter evidence and says so."
+    },
+    {
+      "id": "gpu-counters-unsupported",
+      "category": "coverage",
+      "outcome": "unsupported",
+      "reason": "GPU counters are not exposed on this driver model or hardware; the state is recorded as unsupported and never as a zero utilization value."
+    },
+    {
+      "id": "optional-tool-absent",
+      "category": "coverage",
+      "outcome": "unsupported",
+      "reason": "An opt-in escalation tool or module is not present on the machine; it is reported as unsupported, never as healthy and never as a run-aborting error."
+    }
+  ],
+  "outcomeVocabulary": {
+    "finding": "Rule threshold, duration, sample and correlation requirements all met.",
+    "coverage-record": "Evidence exists but does not meet the finding requirements; the record states which requirement failed.",
+    "unavailable": "The measurement could not be taken.",
+    "not-collected": "The measurement was not requested or the artifact is absent from this case.",
+    "unsupported": "The platform or tool does not expose the measurement.",
+    "forbidden": "healthy is never a coverage outcome; no-data is unknown."
+  },
+  "confidenceConditions": "Every rule states its High and Low conditions here in the rule file, and the emitted finding carries the rule id, the threshold used and the confidence level with its stated condition.",
+  "crossRulePolicy": "A rule fires only on its own metric and its own minimum requirements. Correlation requirements are recorded as correlations, never as causation, and a rule that needs a second channel without one emits a coverage record instead."
+}

@@ -1,0 +1,185 @@
+{
+  "id": "kernel-pool-growth",
+  "title": "Kernel pool growth",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T13:00:00Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        },
+        {
+          "TimestampUtc": "2026-09-10T13:00:05Z",
+          "PagesInputPerSec": 0,
+          "CommittedBytes": 8589934592,
+          "CommitLimitBytes": 21474836480,
+          "AvailableBytes": 8589934592,
+          "PhysicalMemoryBytes": 17179869184
+        }
+      ],
+      "processSamples": [
+        {
+          "TimestampUtc": "2026-09-10T14:00:00Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 16,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:05Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 18,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:10Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 20,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:15Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 22,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:20Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 24,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:25Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 26,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:30Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 28,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:35Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 30,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:40Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 32,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:45Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 34,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:50Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 36,
+          "AvailableMemoryMB": 1024
+        },
+        {
+          "TimestampUtc": "2026-09-10T14:00:55Z",
+          "ProcessId": 4242,
+          "StartTimeUtc": "2026-09-10T13:00:00Z",
+          "ProcessName": "worker.exe",
+          "PoolGrowthPercent": 38,
+          "AvailableMemoryMB": 1024
+        }
+      ],
+      "rules": [
+        {
+          "id": "memory-leak-kernel-pool-growth",
+          "category": "memory-leak",
+          "title": "Kernel pool growth",
+          "summary": "Kernel pool bytes grew across the measured window.",
+          "metric": "PoolGrowthPercent",
+          "comparator": "ge",
+          "threshold": 15,
+          "minimumSamples": 10,
+          "minimumDurationSeconds": 10,
+          "sourceArtifact": "kernel-pool-samples.json",
+          "severity": {
+            "default": "medium",
+            "escalations": [
+              {
+                "severity": "high",
+                "when": "non-paged pool growth is monotonic and the committed charge curve follows it"
+              }
+            ]
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": []
+          },
+          "correlationRequirements": [
+            {
+              "metric": "AvailableMemoryMB",
+              "comparator": "le",
+              "threshold": 2048,
+              "kind": "required-any-of",
+              "note": "Pool growth is only attributable when it consumes headroom"
+            }
+          ],
+          "trend": {
+            "direction": "increasing",
+            "minimumDeltaPercent": 15,
+            "minimumSamples": 10,
+            "monotonicWindow": 10
+          },
+          "uncertainty": "Pool totals do not name the driver that grew.",
+          "nextSteps": [
+            "Collect a pool-monitor sample and a kernel trace."
+          ],
+          "suggestedWprProfile": "CPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "kernel-pool-samples.json",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

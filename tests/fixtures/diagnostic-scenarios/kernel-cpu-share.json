@@ -1,0 +1,97 @@
+{
+  "id": "kernel-cpu-share",
+  "title": "Kernel time dominates on every core",
+  "driver": {
+    "kind": "cpu",
+    "args": {
+      "rows": [
+        {
+          "TimestampUtc": "2026-09-10T22:00:00Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 70,
+          "KernelTimePercent": 65,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:00Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 68,
+          "KernelTimePercent": 63,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:05Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 70,
+          "KernelTimePercent": 65,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:05Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 68,
+          "KernelTimePercent": 63,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:10Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 70,
+          "KernelTimePercent": 65,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:10Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 68,
+          "KernelTimePercent": 63,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:15Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 70,
+          "KernelTimePercent": 65,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:15Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 68,
+          "KernelTimePercent": 63,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:20Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 70,
+          "KernelTimePercent": 65,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:20Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 68,
+          "KernelTimePercent": 63,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:25Z",
+          "ProcessorNumber": 0,
+          "CpuTimePercent": 70,
+          "KernelTimePercent": 65,
+          "UserTimePercent": 5
+        },
+        {
+          "TimestampUtc": "2026-09-10T22:00:25Z",
+          "ProcessorNumber": 1,
+          "CpuTimePercent": 68,
+          "KernelTimePercent": 63,
+          "UserTimePercent": 5
+        }
+      ],
+      "logicalProcessorCount": 2
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

@@ -1,0 +1,13 @@
+{
+  "id": "foreign-wpr-session",
+  "title": "Another product's WPR recording is running",
+  "driver": {
+    "kind": "abandoned-session",
+    "args": {
+      "statusOutput": "Recording is in progress.\nInstance name: WindowsPerformance_other\nDropped event: 0\nLogging mode: Memory",
+      "ownerTag": "wpd-",
+      "expectedInstanceName": "wpd-diag-2026-09-11"
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

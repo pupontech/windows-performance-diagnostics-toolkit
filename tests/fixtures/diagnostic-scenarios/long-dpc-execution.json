@@ -1,0 +1,29 @@
+{
+  "id": "long-dpc-execution",
+  "title": "DPCs above the long-execution threshold",
+  "driver": {
+    "kind": "dpc",
+    "args": {
+      "rows": [
+        {
+          "DpcTimePercent": 14,
+          "InterruptTimePercent": 6,
+          "DpcDurationMicroseconds": 2500,
+          "Provider": "storahci",
+          "Name": "StorPortDpc"
+        },
+        {
+          "DpcTimePercent": 12,
+          "InterruptTimePercent": 5,
+          "DpcDurationMicroseconds": 5000,
+          "Provider": "ndis",
+          "Name": "NdisDpc"
+        }
+      ],
+      "config": {
+        "DpcLongExecutionThresholdMicroseconds": 1000
+      }
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

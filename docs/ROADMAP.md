@@ -1,87 +1,115 @@
 # Roadmap
 
-## Completed Milestones
+This roadmap separates shipped implementation, hosted proof, and owner-live Windows
+proof. A green fixture or Linux-hosted test does not certify real Win32, WPR,
+WPA, elevation, launcher, or Windows PowerShell 5.1 behavior.
 
-### M1: Slowdown Diagnosis (v0.9.0)
+## Completed milestones
 
-- Symptom context and collection presets (`-SymptomContext`, `-Preset`),
-  recorded separately from the UTC collection window; a preset is recorded even
-  without symptom text.
-- Interval process CPU percentage paired by PID+StartTime over a monotonic
-  stopwatch window; unknown/new/reused/protected processes and unknown logical
-  processor counts report `unknown` (never a guessed or clamped value).
-- In-window telemetry series: per-sample memory committed/limit/available and
-  paging indicators (`Win32_PerfFormattedData_PerfOS_Memory`); paired raw
-  physical-disk counters (`Win32_PerfRawData_PerfDisk_PhysicalDisk`) for
-  read/write latency, throughput and instantaneous queue depth; per-volume free
-  space (`Win32_Volume`) with null guards.
-- Findings engine with sustained-pressure rules that find the qualifying run
-  anywhere in the series, cite start/end/source artifact/metric, count only
-  finite readings (nulls break a streak) and never infer from a single
-  post-run read.
-- Standalone offline `report.html` (all data HTML-encoded, fixed relative
-  links, no scripts/external assets) and machine-readable `findings.json`.
-- `findings.json`, `report.html`, `disk-samples.json` and `volume-metrics.json`
-  registered in the manifest before hashing, so they are in the case ZIP,
-  Verify and remote pull.
-- Automated fixture/behavioral tests including a fixture-driven Collect tail
-  that is verified and then refused after report tampering.
+### M0: Foundation (v0.1.0-v0.8.2)
 
-**Known limitations (tracked, not user-visible defects):** sustained-window
-selection cites the longest qualifying run and, for two runs of equal length,
-always the earlier one (deterministic, documented, but a later equal run is not
-reported). A raw-disk poll gap resets its baseline, so the following successful
-poll establishes coverage but does not yield a latency/throughput interval.
+* Read-only local collection with explicit consent gates.
+* Consent-gated WPR and Defender performance captures.
+* Crash evidence: minidumps and boot-failure logs.
+* Network state snapshot with DNS-vs-ping split test.
+* Remote collection over WinRM with SHA-256 verification.
+* Case packaging with artifact hash certification.
+* Plan, Collect, and Verify modes.
+* Read-only case verification.
 
-**Not yet owner-verified:** the raw disk counter math, the in-window series and
-the report generation have only been exercised by fixture tests and a hosted
-Windows smoke collection. A run on an owner Windows client is required before
-remediation planning (see `docs/windows-live-test-matrix.md`).
+### M1: Slowdown diagnosis (v0.9.0-v1.0.0)
 
-### M0: Foundation (v0.1.0 - v0.8.2)
+* Symptom context and collection presets are recorded separately from UTC
+  collection windows. A preset is retained even without symptom text.
+* Interval process CPU percentages use PID plus start time when available;
+  unknown, new, reused, and protected processes remain unknown rather than being
+  guessed or clamped.
+* In-window memory, paging, physical-disk, throughput, latency, queue, and
+  per-volume free-space series are bounded and preserve null coverage.
+* Sustained-pressure rules search the whole series, count finite readings, break
+  streaks on nulls, and cite a real source artifact and time window.
+* Offline `report.html` is HTML-encoded, uses fixed relative links, and has no
+  scripts or external assets. `findings.json` carries the machine-readable
+  findings.
+* Findings, report, disk, volume, and servicing artifacts are registered before
+  final manifest hashing so Verify, packaging, and remote pull can certify them.
+* Crash and servicing analysis keeps bounded signatures and line ranges while
+  leaving raw copied logs as the source of truth. It does not decode dump
+  binaries, run repair tools, or claim complete CBS/DISM grammar coverage.
 
-- Read-only local collection with explicit consent gates
-- Consent-gated WPR and Defender performance captures
-- Crash evidence (minidumps, boot-failure logs)
-- Network state snapshot with DNS-vs-ping split test
-- Remote collection over WinRM with SHA-256 verification
-- Case packaging with artifact hash certification
-- Three-mode workflow: Plan, Collect, Verify
-- Read-only case verification
+### M2: Tiered evidence contract (v2 implementation)
 
-## Planned (P2)
+* Thirteen canonical diagnostic presets and three compatibility aliases are
+  resolved from `config/diagnostic-presets.json`.
+* Tier 0 static inventory is collected once per run and served from a session
+  cache. Tier 1 counter sampling has an explicit one-second floor. Tier 2 WPR
+  policy distinguishes bounded memory mode from opt-in unbounded file mode.
+* Repro and Flight Recorder strategies are mutually exclusive. Tier 3 optional
+  escalation requires explicit selection and consent; absent tools remain
+  unsupported.
+* Coverage, data quality, evidence index, findings, incidents, inventory,
+  telemetry, escalation, privacy, and technician-report handoff are additive
+  schema 1.3 surfaces. No-data is never health and no health score is emitted.
+* WPR profile selection, marker planning, cleanup, abandoned-session ownership,
+  WPAExporter planning, event analysis, privacy projection, and report rendering
+  have provider-neutral or injected seams and focused tests.
 
-- Baseline comparison: compare current collection against a known-good baseline
-- Boot/login diagnostics: measure logon duration, startup item impact
-- Application diagnostics: per-application resource usage tracking
-- Storage health: S.M.A.R.T. attributes, disk lifecycle indicators
-- Power diagnostics: battery health, power plan impact on performance
+The v2 source and tests are implemented, but Windows execution remains an
+owner-live gate. The owner must verify the real APIs, tools, permissions, and
+launchers before declaring the Windows collection path complete.
 
-## Planned (P3)
+## In progress: P1 owner-live and release gates
 
-- Cancellation and deadline support for long-running collections
-- Sanitized export for sharing cases without sensitive data
-- Targeted WPR profiles driven by symptom presets
-- Reviewed remediation (behind explicit consent, after evidence review)
-- Owner-live Windows matrix execution for the new telemetry, findings and
-  report paths (hosted CI runs a controlled smoke collection only)
+* Run the Windows PowerShell 5.1 parser/runtime matrix on Windows Server 2022
+  and Windows Server 2025.
+* Run every canonical preset and each alias through Plan; verify requested and
+  effective names, profile policy, cadence, privacy, and evidence plans.
+* Run standard-user and administrator cases, including inventory elevation
+  boundaries, absent providers, empty event logs, and no-data semantics.
+* Run bounded WPR memory capture with markers, failed-stop cleanup, abandoned
+  session ownership, and optional WPAExporter tables.
+* Exercise the explicit refusal paths for file mode, Full privacy, Tier 3,
+  WPR consent, and local collection consent.
+* Verify real report artifacts, SHA-256 registration, case ZIPs, and Verify
+  after an intentional tamper.
+* Publish the v2 release only after `VERSION` and the CI release pin are updated
+  as one handshake. The unpersisted 100-section source specification remains a
+  traceability gap; do not claim complete specification coverage until it is
+  stored or the missing sections are owner-reviewed.
 
-## Windows evidence: hosted vs owner-live
+## Planned P2 work
 
-| Area | Hosted Windows CI | Owner-live client |
-| --- | --- | --- |
-| Parser (PS 5.1 + pwsh) | yes | - |
-| Consent/elevation gates, launchers | yes | - |
-| Controlled Collect smoke, findings/report/manifest | yes | - |
-| Remote collection over loopback WinRM | yes | - |
-| Real hardware disk latency/queue values | no (SMOKE only) | **required** |
-| MOTW / Defender quarantine behavior | N/A on runners | **required** |
-| Raw disk counter math on real devices | no | **required** |
+* Baseline comparison against a known-good machine or collection, with explicit
+  machine identity and retention policy.
+* Boot and login diagnostics that measure logon duration and startup impact.
+* Application-specific resource and responsiveness tracking.
+* Storage reliability and device-lifecycle evidence beyond the existing
+  capacity, latency, and queue measurements.
+* Power and battery evidence beyond the current power-plan and throttling
+  surfaces.
+* Reviewed remediation, only after evidence review and a separate explicit
+  consent contract. Automatic remediation remains a non-goal.
 
-## Non-Goals (unchanged)
+## Hosted vs owner-live proof
 
-- No automated repair or registry changes
-- No automatic event-log clearing
-- No automatic startup disablement/deletion
-- No automatic Defender exclusions, protection changes, or cloud upload
-- No unattended collection of full memory dumps
+| Area | Hosted fixture or Linux CI | Owner-live Windows |
+|------|----------------------------|--------------------|
+| PowerShell parse and ASCII/LF/no-BOM checks | Proves syntax accepted by the available pwsh parser and file hygiene. | Required for Windows PowerShell 5.1 runtime. |
+| Preset resolution, aliases, schema and refusal paths | Proves deterministic transforms and contract shape with injected inputs. | Required on Windows for real Plan invocation. |
+| Tier 0/Tier 1 provider transforms and cache | Proves provider-neutral math, nulls, gaps, and cache behavior. | Required against real CIM, performance counter, storage, NIC, and GPU providers. |
+| WPR command construction and cleanup seams | Proves documented argv, bounded policy, and cleanup logic without invoking Windows tools. | Required with real `wpr.exe`, profiles, markers, ETL output, and permissions. |
+| Optional escalation seams | Proves consent, privacy, absent-tool, and bounded-output behavior. | Required with real WCT, PoolMon, ProcDump, Defender, Search, and filter surfaces. |
+| Findings and technician report | Proves evidence links, safe HTML, and coverage fallback. | Required with real generated artifacts and an owner-reviewed case. |
+| Launcher, UAC, MOTW, Defender quarantine | Not proven by hosted provider fixtures. | Required on an owner-managed Windows machine. |
+| Remote loopback and package integrity | Synthetic/loopback checks can be hosted. | Required against the supported WinRM setup and a real target. |
+
+## Non-goals
+
+* No automated repair or registry changes.
+* No automatic event-log clearing.
+* No automatic startup disablement or deletion.
+* No automatic Defender exclusions, protection changes, or cloud upload.
+* No unattended collection of full memory dumps.
+* No health score, no-data-as-health conclusion, or correlation-as-causation
+  claim.
+* No reboot or suspension as part of normal collection.

@@ -1,5 +1,73 @@
 # Changelog
 
+## 2.0.0 — Unreleased test build
+
+The v2 integration is not a published release. Planner-only capture/escalation
+paths and owner-live validation remain open.
+
+### Continued implementation
+
+- `-CollectSearchContext` now executes read-only WSearch service collection after
+  `-ConfirmEscalationCollection`. The unregistered index-status provider is
+  explicitly partial, not a clean/complete index assessment.
+- `-CollectMinifilters` now executes `fltmc filters` and `fltmc instances` after
+  the same independent consent gate. Both adapters save JSON evidence under
+  `escalation/`, registered for hashes, evidence indexing and case packaging.
+- Tier 3 coverage, counts and artifact links now describe executed results, not
+  planned descriptors. Missing modules, failures and deferred adapters cannot
+  count as collected evidence. Unknown adapter identifiers refuse before I/O.
+- Collect privacy metadata no longer claims whole-case redaction or absence of
+  secrets. All levels mark case output sensitive; `secretsCollected: null`
+  means raw evidence has not been scanned, not that secret collection was enabled.
+
+Earlier v2 tiered architecture and crash/servicing implementation:
+
+- **Tiered diagnostic architecture.** Thirteen canonical presets plus three
+  compatibility aliases resolve through the checked-in preset contract. Tier 0
+  inventory is cached once per run, Tier 1 sampling enforces a one-second floor,
+  Tier 2 capture distinguishes bounded memory mode from explicitly accepted file
+  mode, and Tier 3 escalation remains selection- and consent-gated.
+- **Evidence-first schema 1.3.** Plan and Collect can emit additive coverage,
+  data-quality, evidence-index, incident, inventory, telemetry, finding,
+  escalation, privacy, and technician-handoff surfaces. Older schema 1.0-1.2
+  cases remain valid, and missing evidence is never presented as health.
+- **Capture policy and privacy controls.** Repro and Flight Recorder strategies
+  are mutually exclusive; Full privacy, unbounded WPR file mode, and optional
+  escalation collectors require explicit acceptance. Preset-selected WPR
+  profiles, cadence, duration, and trace budgets are recorded in the plan.
+- **Technician workflow and verification coverage.** Architecture, operator,
+  overhead, schema, source, and Windows live-test documentation now describe the
+  shipped tiered contract. Provider-neutral tests exercise preset resolution,
+  aliases, inventory caching, counter transforms, WPR policy, report handoff,
+  consent refusals, and schema compatibility.
+
+Crash and servicing evidence follow-up to the 1.0.0 incident-capture release:
+
+- **Crash findings now consume collected artifacts.** `Get-CrashAnalysis` keeps
+  copied minidumps visible even when their incident date is outside the bounded
+  24-hour System event query. Nearby BugCheck 1001 events can provide a
+  correlated code; minidump filename dates and LiveKernelReports filename
+  classes are retained as explicit hints, not root-cause claims. Repeated dump
+  evidence is grouped by a problem signature.
+- **Bounded servicing-log analysis.** Copied CBS, DISM, setup and boot logs are
+  read only through a bounded byte window and reduced to normalized error
+  signatures, counts and line ranges. Raw lines remain in their original
+  `bootfailure\` artifacts. Recurring signatures such as
+  `CBS_E_INVALID_PACKAGE` become `servicing-failure` findings and appear in
+  `servicing-log-analysis.json`.
+- **Evidence-boundary hardening.** Reparse-point and multi-link files or parent
+  directories are refused before analysis; a source that grows during a read
+  cannot exceed `maxScanBytes`, and capped prefixes are reported as partial
+  evidence. Source dump timestamps govern crash lookback membership, with
+  filename dates used only as fallback hints. Missing, partial and failed
+  servicing analysis now produce distinct coverage findings instead of silently
+  disappearing.
+- **Findings/report wiring.** The shared collection tail writes and hashes the
+  servicing analysis artifact, passes crash and servicing evidence into
+  `Evaluate-Findings`, and renders the results under an explicit crash/servicing
+  evidence heading. The first slice intentionally does not decode dump binaries
+  or claim complete CBS/DISM grammar coverage.
+
 ## 1.0.0 — 2026-09-10
 
 Incident-capture release: every telemetry source now shares one capture window,

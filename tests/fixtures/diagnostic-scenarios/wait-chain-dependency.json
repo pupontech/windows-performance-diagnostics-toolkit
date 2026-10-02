@@ -1,0 +1,32 @@
+{
+  "id": "wait-chain-dependency",
+  "title": "Two threads waiting on each other",
+  "driver": {
+    "kind": "waitchain",
+    "args": {
+      "chains": [
+        {
+          "ChainId": "chain-1",
+          "ProcessId": 4242,
+          "ThreadId": 100,
+          "Status": "Blocked",
+          "Nodes": [
+            {
+              "ObjectType": "CriticalSection",
+              "ThreadId": 100,
+              "OwnerThreadId": 200,
+              "Status": "Blocked"
+            },
+            {
+              "ObjectType": "CriticalSection",
+              "ThreadId": 200,
+              "OwnerThreadId": 100,
+              "Status": "Blocked"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

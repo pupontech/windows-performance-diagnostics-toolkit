@@ -5849,10 +5849,16 @@ function New-WpdEscalationSelectionBlock {
                 # does not depend on one serialization shape.
                 $descriptors = @($plan)
             }
+            # Entrypoint request identifiers and module descriptor identifiers
+            # are distinct vocabularies; preserve both through an explicit map.
+            $descriptorIds = @{ 'search-service-context' = 'search'; 'minifilter-enumeration' = 'minifilter'; 'wait-chain-traversal' = 'wct'; 'poolmon-tag-attribution' = 'pool' }
+            $wantedDescriptorIds = @($requested | ForEach-Object {
+                if ($descriptorIds.ContainsKey($_)) { $descriptorIds[$_] } else { $_ }
+            })
             $selected = @($descriptors | Where-Object {
                 $descriptorId = Get-WpdIntegrationProperty -InputObject $_ -Name 'Id'
                 if ($null -eq $descriptorId) { $descriptorId = Get-WpdIntegrationProperty -InputObject $_ -Name 'id' }
-                $requested -contains [string]$descriptorId
+                $wantedDescriptorIds -contains [string]$descriptorId
             })
             $record.status = 'planned'
             $record.source = 'Wpd.Escalation'
@@ -5989,6 +5995,71 @@ function New-WpdTieredPlanBlock {
     return $block
 }
 
+function Invoke-WpdSelectedEscalations {
+    <# Execute only explicitly selected, read-only adapters. Publication is part
+       of success: unpersisted evidence never contributes to coverage/counts. #>
+    param(
+        [AllowNull()][string[]]$RequestedAdapter = @(),
+        [switch]$Consent,
+        [string]$PrivacyLevel = 'Standard',
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$CollectedArtifacts
+    )
+    $requested = @($RequestedAdapter | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $record = [ordered]@{ status = 'not-collected'; coverage = 'not-collected'; recordCount = 0; adapters = @(); reasons = @() }
+    if ($requested.Count -eq 0) { return [pscustomobject]$record }
+    if (-not $Consent) { throw 'Tier 3 execution requires explicit consent.' }
+    $allowed = @('minifilter-enumeration', 'search-service-context', 'wait-chain-traversal', 'poolmon-tag-attribution')
+    foreach ($id in $requested) {
+        if ($allowed -notcontains $id) { throw ('Unknown Tier 3 adapter: ' + $id) }
+    }
+    foreach ($id in $requested) {
+        $command = $null
+        if ($id -eq 'minifilter-enumeration') { $command = 'Invoke-WpdMinifilterEscalation' }
+        if ($id -eq 'search-service-context') { $command = 'Get-WpdSearchContext' }
+        $result = [pscustomobject]@{ status = 'unsupported'; coverage = 'unsupported'; reason = 'adapter-execution-not-wired'; items = @() }
+        try {
+            if ($null -ne $command -and (Test-WpdModuleCommand -Name $command)) {
+                $result = Invoke-WpdModuleCall -Name $command -Arguments @{ Consent = $true; PrivacyLevel = $PrivacyLevel }
+            }
+            elseif ($null -ne $command) {
+                $result.reason = 'escalation-module-command-unavailable'
+            }
+            $status = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'status')
+            $coverage = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'coverage')
+            if (@('success', 'partial', 'unavailable', 'unsupported', 'not-collected', 'error') -notcontains $status) { throw 'Adapter returned an invalid result status.' }
+            if (@('complete', 'partial', 'unavailable', 'unsupported', 'not-collected') -notcontains $coverage) { throw 'Adapter returned an invalid coverage state.' }
+            $directory = Join-Path $OutputDirectory 'escalation'
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+            $relative = 'escalation/' + $id + '.json'
+            Write-JsonFile -InputObject $result -Path (Join-Path $OutputDirectory $relative)
+            [void]$CollectedArtifacts.Add($relative)
+            $count = @(Get-WpdIntegrationProperty -InputObject $result -Name 'items' | Where-Object { $null -ne $_ }).Count
+            if ($id -eq 'search-service-context') {
+                $count = 0
+                $data = Get-WpdIntegrationProperty -InputObject $result -Name 'data'
+                foreach ($field in @('service', 'index')) {
+                    if ($null -ne (Get-WpdIntegrationProperty -InputObject $data -Name $field)) { $count++ }
+                }
+            }
+            if ($status -notin @('success', 'partial')) { $count = 0 }
+            $record.recordCount += $count
+            $record.adapters += [pscustomobject]@{ id = $id; status = $status; coverage = $coverage; recordCount = $count; artifact = $relative; reason = Get-WpdIntegrationProperty -InputObject $result -Name 'reason'; startedUtc = Get-WpdIntegrationProperty -InputObject $result -Name 'startedUtc'; completedUtc = Get-WpdIntegrationProperty -InputObject $result -Name 'completedUtc' }
+        }
+        catch {
+            $record.adapters += [pscustomobject]@{ id = $id; status = 'error'; coverage = 'unavailable'; recordCount = 0; artifact = $null; reason = 'escalation-execution-or-publication-failed' }
+        }
+    }
+    $successful = @($record.adapters | Where-Object { $_.status -in @('success', 'partial') })
+    if ($successful.Count -eq $requested.Count -and @($record.adapters | Where-Object { $_.coverage -ne 'complete' }).Count -eq 0) {
+        $record.status = 'success'; $record.coverage = 'complete'
+    }
+    elseif ($successful.Count -gt 0) { $record.status = 'partial'; $record.coverage = 'partial' }
+    else { $record.status = 'unavailable'; $record.coverage = 'unavailable' }
+    $record.reasons = @($record.adapters | Where-Object { $_.status -ne 'success' } | ForEach-Object { $_.id + ':' + $_.reason })
+    return [pscustomobject]$record
+}
+
 function New-WpdTieredCollectBlock {
     <# The Collect-mode counterpart: real per-tier envelopes in, one manifest
        block out. Missing tiers stay not-collected; a tier whose collector failed
@@ -6044,6 +6115,9 @@ function New-WpdTieredCollectBlock {
         tier3 = [ordered]@{
             status = $tier3Status
             coverage = $tier3Coverage
+            recordCount = Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'recordCount'
+            adapters = @(Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'adapters')
+            reasons = @(Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'reasons')
             consentRequired = $true
             automaticRemediation = $false
         }
@@ -8108,6 +8182,22 @@ if ($script:WpdTieredEngaged) {
     }
 }
 
+# Tier 3 snapshots run after the incident window, never inside its sample loop.
+# Register their evidence before constructing the shared hash/evidence index.
+if ($script:WpdTieredEngaged) {
+    $script:WpdEscalationExecution = Invoke-WpdSelectedEscalations `
+        -RequestedAdapter $script:WpdRequestedEscalationAdapter `
+        -Consent:$ConfirmEscalationCollection `
+        -PrivacyLevel $script:WpdEffectivePrivacyLevel `
+        -OutputDirectory $resolvedOutputDirectory `
+        -CollectedArtifacts $collectedArtifacts
+    foreach ($adapter in @($script:WpdEscalationExecution.adapters)) {
+        if ($adapter.status -eq 'error') {
+            Add-CollectionErrorText -Stage ('tier3-' + $adapter.id) -Message $adapter.reason
+        }
+    }
+}
+
 if ($script:WpdTieredEngaged) {
     $tier0CoverageRecord = if ($null -ne $script:WpdTier0Snapshot) { $script:WpdTier0Snapshot.coverage } else { 'not-collected' }
     $tier0StatusRecord = if ($null -ne $script:WpdTier0Snapshot) { $script:WpdTier0Snapshot.status } else { 'not-collected' }
@@ -8131,15 +8221,15 @@ if ($script:WpdTieredEngaged) {
         }
         $tier2CoverageRecord = if ($tier2StatusRecord -eq 'completed') { 'complete' } else { 'unavailable' }
     }
-    $tier3StatusRecord = if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { $script:WpdEscalationBlock.status } else { 'not-collected' }
-    $tier3CoverageRecord = if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { 'partial' } else { 'not-collected' }
+    $tier3StatusRecord = $script:WpdEscalationExecution.status
+    $tier3CoverageRecord = $script:WpdEscalationExecution.coverage
     $tier1CoverageRecord = if (@($samples).Count -gt 0) { 'partial' } else { 'unavailable' }
 
     $coverageRecords = @(
         [pscustomobject]@{ collector = 'tier0-static-inventory'; tier = 0; status = $tier0StatusRecord; coverage = $tier0CoverageRecord; recordCount = $tier0CapabilityCount; reason = @($tier0Reasons) }
         [pscustomobject]@{ collector = 'tier1-performance-counters'; tier = 1; status = if (@($samples).Count -gt 0) { 'success' } else { 'unavailable' }; coverage = $tier1CoverageRecord; recordCount = @($samples).Count; reason = @() }
         [pscustomobject]@{ collector = 'tier2-wpr-recording'; tier = 2; status = $tier2StatusRecord; coverage = $tier2CoverageRecord; recordCount = if ($CaptureWpr) { 1 } else { 0 }; reason = @() }
-        [pscustomobject]@{ collector = 'tier3-optional-escalation'; tier = 3; status = $tier3StatusRecord; coverage = $tier3CoverageRecord; recordCount = @($script:WpdEscalationBlock.adapters).Count; reason = @($script:WpdEscalationBlock.reasons) }
+        [pscustomobject]@{ collector = 'tier3-optional-escalation'; tier = 3; status = $tier3StatusRecord; coverage = $tier3CoverageRecord; recordCount = $script:WpdEscalationExecution.recordCount; reason = @($script:WpdEscalationExecution.reasons) }
     )
 
     $collectionErrorsData = @($script:collectionErrors)
@@ -8191,14 +8281,27 @@ if ($script:WpdTieredEngaged) {
     $indexCounter = 0
     foreach ($artifactEntry in @(Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts))) {
         $indexCounter++
+        $artifactWindowStart = $startedAtUtc
+        $artifactWindowEnd = $completedAtUtc
+        if ($artifactEntry.Name -like 'escalation/*') {
+            $snapshot = @($script:WpdEscalationExecution.adapters | Where-Object { $_.artifact -eq $artifactEntry.Name } | Select-Object -First 1)
+            # Absent timestamps remain unknown; never bind a post-window snapshot
+            # to the earlier counter incident just because it shares the case.
+            $artifactWindowStart = $null
+            $artifactWindowEnd = $null
+            if ($snapshot.Count -eq 1) {
+                $artifactWindowStart = Get-WpdIntegrationProperty -InputObject $snapshot[0] -Name 'startedUtc'
+                $artifactWindowEnd = Get-WpdIntegrationProperty -InputObject $snapshot[0] -Name 'completedUtc'
+            }
+        }
         $evidenceIndexRecords += [pscustomobject]@{
             id = ('evidence-{0:d3}' -f $indexCounter)
             artifact = $artifactEntry.Name
             path = $artifactEntry.Name
             sha256 = $artifactEntry.Sha256
             sizeBytes = $artifactEntry.SizeBytes
-            windowStart = $startedAtUtc
-            windowEnd = $completedAtUtc
+            windowStart = $artifactWindowStart
+            windowEnd = $artifactWindowEnd
             registered = ($null -ne $artifactEntry.Sha256)
         }
     }
@@ -8207,7 +8310,7 @@ if ($script:WpdTieredEngaged) {
         -Modules $script:WpdModuleSurface `
         -Tier0 $script:WpdTier0Snapshot `
         -Tier2 ([pscustomobject]@{ status = $tier2StatusRecord; coverage = $tier2CoverageRecord }) `
-        -Tier3 ([pscustomobject]@{ status = $tier3StatusRecord; coverage = $tier3CoverageRecord }) `
+        -Tier3 $script:WpdEscalationExecution `
         -PresetSelection $script:WpdPresetSelection `
         -CapturePolicy $script:WpdCapturePolicy `
         -Tier1Interval $script:WpdTier1Interval `
@@ -8220,8 +8323,12 @@ if ($script:WpdTieredEngaged) {
     $collectionManifest.privacy = [ordered]@{
         level = $script:WpdEffectivePrivacyLevel
         requestedLevel = $PrivacyLevel
-        secretsCollected = $false
-        redactionApplied = ($script:WpdEffectivePrivacyLevel -ne 'Standard')
+        # Labels affect selected module fields only, not raw evidence/dumps/ETL.
+        # A whole-case secret scan/redaction pass has not been implemented.
+        secretsCollected = $null
+        redactionApplied = $false
+        wholeCaseRedaction = 'not-implemented'
+        sensitiveDataWarning = $true
     }
     if ($PerformanceMode -or $MarkerMode -or $script:WpdCaptureMode.status -eq 'resolved') {
         $collectionManifest.incidentMarkers = New-WpdIncidentMarkerPlan

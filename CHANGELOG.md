@@ -1,8 +1,26 @@
 # Changelog
 
-## 2.0.0 — 2026-09-22
+## 2.0.0 — Unreleased test build
 
-Tiered evidence architecture and crash/servicing analysis release.
+The v2 integration is not a published release. Planner-only capture/escalation
+paths and owner-live validation remain open.
+
+### Continued implementation
+
+- `-CollectSearchContext` now executes read-only WSearch service collection after
+  `-ConfirmEscalationCollection`. The unregistered index-status provider is
+  explicitly partial, not a clean/complete index assessment.
+- `-CollectMinifilters` now executes `fltmc filters` and `fltmc instances` after
+  the same independent consent gate. Both adapters save JSON evidence under
+  `escalation/`, registered for hashes, evidence indexing and case packaging.
+- Tier 3 coverage, counts and artifact links now describe executed results, not
+  planned descriptors. Missing modules, failures and deferred adapters cannot
+  count as collected evidence. Unknown adapter identifiers refuse before I/O.
+- Collect privacy metadata no longer claims whole-case redaction or absence of
+  secrets. All levels mark case output sensitive; `secretsCollected: null`
+  means raw evidence has not been scanned, not that secret collection was enabled.
+
+Earlier v2 tiered architecture and crash/servicing implementation:
 
 - **Tiered diagnostic architecture.** Thirteen canonical presets plus three
   compatibility aliases resolve through the checked-in preset contract. Tier 0

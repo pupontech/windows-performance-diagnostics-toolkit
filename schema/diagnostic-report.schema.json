@@ -2425,7 +2425,8 @@
           ]
         },
         "secretsCollected": {
-          "const": false
+          "description": "False in Plan (no evidence collected); null in Collect because raw evidence has not been scanned for secrets.",
+          "enum": [false, null]
         },
         "redactionApplied": {
           "type": [

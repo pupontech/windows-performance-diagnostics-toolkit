@@ -83,7 +83,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check pytest jsonschema pytest-timeout
           $env:WPD_POWERSHELL_EXE = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py -q --timeout=180 --timeout-method=thread
+          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py -q --timeout=180 --timeout-method=thread
           exit $LASTEXITCODE
 
       - name: Run tiered entrypoint regressions (pwsh)
@@ -91,7 +91,7 @@ jobs:
         shell: pwsh
         run: |
           $env:WPD_POWERSHELL_EXE = 'pwsh'
-          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py -q --timeout=180 --timeout-method=thread
+          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py -q --timeout=180 --timeout-method=thread
           exit $LASTEXITCODE
 
       - name: Collect and verify a tiered case (both PowerShell engines)
@@ -101,13 +101,23 @@ jobs:
           $engines = @((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'), 'pwsh')
           foreach ($engine in $engines) {
             $case = Join-Path $env:RUNNER_TEMP ('wpd-tiered-' + [guid]::NewGuid().ToString('N'))
-            & $engine -NoProfile -File src/Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -Preset general -DurationSeconds 5 -ConfirmLocalCollection -OutputDirectory $case -ZipOutput
+            & $engine -NoProfile -File src/Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -Preset general -DurationSeconds 5 -ConfirmLocalCollection -CollectSearchContext -CollectMinifilters -ConfirmEscalationCollection -OutputDirectory $case -ZipOutput
             if ($LASTEXITCODE -ne 0) { throw "Tiered collection failed under $engine" }
             $manifestPath = Join-Path $case 'diagnostic-manifest.json'
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
             if ($manifest.schemaVersion -ne '1.3') { throw 'Tiered case did not emit schema 1.3' }
-            foreach ($relative in @('inventory/tier0-inventory.json', 'telemetry/per-core-cpu-samples.json', 'case/technician-report.html')) {
+            foreach ($relative in @('inventory/tier0-inventory.json', 'telemetry/per-core-cpu-samples.json', 'case/technician-report.html', 'escalation/search-service-context.json', 'escalation/minifilter-enumeration.json')) {
               if (-not (Test-Path -LiteralPath (Join-Path $case $relative) -PathType Leaf)) { throw "Missing tiered artifact: $relative" }
+            }
+            if ($manifest.tiers.tier3.adapters.Count -ne 2) { throw 'Expected two executed Tier 3 adapter results' }
+            $minifilter = Get-Content -LiteralPath (Join-Path $case 'escalation/minifilter-enumeration.json') -Raw | ConvertFrom-Json
+            if ($minifilter.status -ne 'success' -or @($minifilter.data.filters).Count -lt 1) { throw 'Real fltmc collection did not produce filter evidence' }
+            $search = Get-Content -LiteralPath (Join-Path $case 'escalation/search-service-context.json') -Raw | ConvertFrom-Json
+            if ($search.status -ne 'partial' -or $null -eq $search.data.service) { throw 'Real WSearch service evidence missing or index coverage overstated' }
+            if ($manifest.privacy.redactionApplied -or $null -ne $manifest.privacy.secretsCollected) { throw 'Whole-case privacy claims are not truthful' }
+            foreach ($relative in @('escalation/search-service-context.json', 'escalation/minifilter-enumeration.json')) {
+              if (@($manifest.artifacts | Where-Object { $_.Name -eq $relative -and $_.Sha256 }).Count -ne 1) { throw "Escalation evidence not hashed: $relative" }
+              if (@($manifest.evidenceIndex.records | Where-Object { $_.artifact -eq $relative -and $_.registered }).Count -ne 1) { throw "Escalation evidence not indexed: $relative" }
             }
             $env:WPD_TIERED_MANIFEST = $manifestPath
             python -c 'import json,os,jsonschema; s=json.load(open("schema/diagnostic-report.schema.json")); m=json.load(open(os.environ["WPD_TIERED_MANIFEST"],encoding="utf-8-sig")); jsonschema.Draft7Validator(s).validate(m)'

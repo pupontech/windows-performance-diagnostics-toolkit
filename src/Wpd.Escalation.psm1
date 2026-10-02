@@ -84,7 +84,7 @@ function Get-WpdEscalationUtcTimestamp {
     [OutputType([string])]
     param()
 
-    return ([DateTime]::UtcNow.ToString('o') + 'Z')
+    return [DateTime]::UtcNow.ToString('o')
 }
 
 function Get-WpdEscalationPrivacyLevel {

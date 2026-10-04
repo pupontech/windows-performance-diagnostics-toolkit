@@ -5068,6 +5068,20 @@ function Write-CollectionOutputs {
 # ever invented when a module is missing (an unknown preset, profile or module
 # is reported unsupported, never silently substituted).
 
+function Complete-WpdRunTranscript {
+    param(
+        [Parameter(Mandatory = $true)][string]$TranscriptPath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.IList]$ArtifactNames,
+        [switch]$TranscriptStarted
+    )
+    if ($TranscriptStarted) { Stop-Transcript -ErrorAction Stop | Out-Null }
+    if (-not [System.IO.File]::Exists($TranscriptPath)) {
+        throw 'The run-owned transcript is missing and cannot be registered as evidence.'
+    }
+    $name = [System.IO.Path]::GetFileName($TranscriptPath)
+    if ($ArtifactNames -notcontains $name) { [void]$ArtifactNames.Add($name) }
+}
+
 function Get-WpdIntegrationProperty {
     param(
         [AllowNull()][object]$InputObject,
@@ -6894,6 +6908,9 @@ if ($RemoteComputer) {
         }
     }
 
+    Complete-WpdRunTranscript -TranscriptPath $transcriptPath -ArtifactNames $collectedArtifacts -TranscriptStarted:$script:WpdRunTranscriptStarted
+    $script:WpdRunTranscriptStarted = $false
+    $collectionManifest.artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
     $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
     Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
     if ($ZipOutput) {
@@ -8504,6 +8521,10 @@ if ($script:WpdTieredEngaged) {
     Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
 }
 
+Complete-WpdRunTranscript -TranscriptPath $transcriptPath -ArtifactNames $collectedArtifacts -TranscriptStarted:$script:WpdRunTranscriptStarted
+$script:WpdRunTranscriptStarted = $false
+$collectionManifest.artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
+Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"
 if ($ZipOutput) {
     $collectionManifest = Add-CasePackageBlock -CollectionManifest $collectionManifest -OutputDirectory $resolvedOutputDirectory -ArtifactNames @($collectedArtifacts)

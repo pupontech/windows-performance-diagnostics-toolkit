@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set "OUTDIR=C:\Temp\WPD-Case"
+set "OUTDIR=C:\WPD-Case"
 pushd "%~dp0"
 echo.
 echo ============================================
@@ -8,9 +8,10 @@ echo  Windows Performance Diagnostics Collector
 echo ============================================
 echo.
 echo This run performs 30-second baseline sampling.
+echo Read-only Search service and minifilter snapshots are included.
 echo Allow additional time for crash-evidence copies and final export, hashing, and ZIP packaging.
 echo The collector prints live baseline sample and percentage progress.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput -DurationSeconds 30 -OutputDirectory "%OUTDIR%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -CollectSearchContext -CollectMinifilters -ConfirmEscalationCollection -ZipOutput -DurationSeconds 30 -OutputDirectory "%OUTDIR%"
 if errorlevel 1 goto :collection_failed
 if not exist "%OUTDIR%\diagnostic-manifest.json" goto :collection_failed
 echo.

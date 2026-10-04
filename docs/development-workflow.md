@@ -32,7 +32,7 @@ being exercised on real Windows (GitHub-hosted VMs) first.
 | Job | Runner | Verifies |
 |---|---|---|
 | `linux-verify` | ubuntu-latest | pytest suite (plan mode, consent gates, WPR gates, schema, packaging, Verify mode, and the incident-capture behavioral tests in `tests/test_incident_capture.py`) + pwsh parse gate |
-| `windows-verify` | windows-2022 **and** windows-2025 | Parse gates under Windows PowerShell 5.1 and pwsh 7; Plan mode; Collect-without-consent refusal; WPR-without-consent refusal; **invalid-`-OutputDirectory` clear error**; **executes the real `Run-Diagnostics.bat` via `cmd`**; executes START-HERE Plan/Collect/Verify modes and asserts `C:\Temp\WPD-Case\diagnostic-manifest.json` |
+| `windows-verify` | windows-2022 **and** windows-2025 | Parse gates under Windows PowerShell 5.1 and pwsh 7; Plan mode; Collect-without-consent refusal; WPR-without-consent refusal; **invalid-`-OutputDirectory` clear error**; **executes the real `Run-Diagnostics.bat` via `cmd`**; executes START-HERE Plan/Collect/Verify modes and asserts `C:\WPD-Case\diagnostic-manifest.json` |
 | `CodeQL` | ubuntu-latest | Static analysis of Python test/support code and GitHub Actions workflows on every PR and `main` push; scheduled weekly scan. |
 
 `main` is protected: pull requests, up-to-date passing CI, resolved review

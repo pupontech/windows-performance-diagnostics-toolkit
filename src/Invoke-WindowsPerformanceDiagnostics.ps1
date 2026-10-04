@@ -9,7 +9,7 @@ param(
     [ValidateRange(1, 1000)]
     [int]$MaxEventCount = 200,
 
-    [string]$OutputDirectory = (Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics'),
+    [string]$OutputDirectory = $(if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'C:\WPD-Case' } else { Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics' }),
 
     [string]$InputDirectory,
 

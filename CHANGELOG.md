@@ -7,6 +7,12 @@ paths and owner-live validation remain open.
 
 ### Continued implementation
 
+- **Launcher follow-up:** both double-click collection paths now select the
+  Search/minifilter adapters and pass their independent consent flag. Cases and
+  logs default to `C:\WPD-Case`, including the Windows script default; existing
+  files under the former Temp location are neither moved nor deleted. Hosted
+  Windows checks assert each launcher creates the two escalation JSON files.
+
 - `-CollectSearchContext` now executes read-only WSearch service collection after
   `-ConfirmEscalationCollection`. The unregistered index-status provider is
   explicitly partial, not a clean/complete index assessment.

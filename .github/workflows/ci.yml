@@ -83,7 +83,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check pytest jsonschema pytest-timeout
           $env:WPD_POWERSHELL_EXE = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py -q --timeout=180 --timeout-method=thread
+          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py tests/test_launcher_tier3_path.py -q --timeout=180 --timeout-method=thread
           exit $LASTEXITCODE
 
       - name: Run tiered entrypoint regressions (pwsh)
@@ -91,7 +91,7 @@ jobs:
         shell: pwsh
         run: |
           $env:WPD_POWERSHELL_EXE = 'pwsh'
-          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py -q --timeout=180 --timeout-method=thread
+          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py tests/test_launcher_tier3_path.py -q --timeout=180 --timeout-method=thread
           exit $LASTEXITCODE
 
       - name: Collect and verify a tiered case (both PowerShell engines)
@@ -232,9 +232,17 @@ jobs:
         shell: cmd
         run: call Run-Diagnostics.bat
 
+      - name: Assert standalone launcher Tier 3 artifacts under C root
+        shell: powershell
+        run: .\tests\live\Assert-WpdLauncherTier3.ps1
+
       - name: Run the START-HERE menu in auto mode (option 2, collect)
         shell: cmd
         run: call START-HERE.bat 2
+
+      - name: Assert guided launcher Tier 3 artifacts under C root
+        shell: powershell
+        run: .\tests\live\Assert-WpdLauncherTier3.ps1
 
       - name: Run the START-HERE menu in auto mode (option 1, plan)
         shell: cmd
@@ -242,13 +250,13 @@ jobs:
 
       - name: Run the START-HERE menu in auto mode (option 4, verify)
         shell: cmd
-        run: call START-HERE.bat 4 C:\Temp\WPD-Case
+        run: call START-HERE.bat 4 C:\WPD-Case
 
       - name: Assert launchers produced the diagnostic artifacts
         shell: pwsh
         run: |
-          $manifest = "C:\Temp\WPD-Case\diagnostic-manifest.json"
-          $plan = "C:\Temp\WPD-Case\diagnostic-plan.json"
+          $manifest = "C:\WPD-Case\diagnostic-manifest.json"
+          $plan = "C:\WPD-Case\diagnostic-plan.json"
           foreach ($file in @($manifest, $plan)) {
             if (-not (Test-Path -LiteralPath $file)) {
               Write-Error "Launcher did not produce $file"
@@ -276,7 +284,7 @@ jobs:
             Write-Error "Unexpected servicingAnalysis block: $($m.servicingAnalysis | ConvertTo-Json -Compress)"
             exit 1
           }
-          if (-not (Test-Path -LiteralPath "C:\Temp\WPD-Case\servicing-log-analysis.json")) {
+          if (-not (Test-Path -LiteralPath "C:\WPD-Case\servicing-log-analysis.json")) {
             Write-Error "servicing-log-analysis.json missing"
             exit 1
           }
@@ -302,7 +310,7 @@ jobs:
             Write-Error "Unexpected dnsVsPing verdict: $($m.network.dnsVsPing.verdict)"
             exit 1
           }
-          if (-not (Test-Path -LiteralPath "C:\Temp\WPD-Case\network-state.json")) {
+          if (-not (Test-Path -LiteralPath "C:\WPD-Case\network-state.json")) {
             Write-Error "network-state.json missing"
             exit 1
           }
@@ -325,7 +333,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $case = 'C:\Temp\WPD-Case'
+          $case = 'C:\WPD-Case'
           $manifestPath = Join-Path $case 'diagnostic-manifest.json'
           $m = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 

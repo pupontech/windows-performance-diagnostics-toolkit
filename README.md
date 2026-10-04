@@ -84,7 +84,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -ConfirmLocalCollection `
   -DurationSeconds 30 `
   -MaxEventCount 200 `
-  -OutputDirectory C:\Temp\WPD-Case-001
+  -OutputDirectory C:\WPD-Case-001
 ```
 
 `-DurationSeconds 30` is the wall-clock budget for the **baseline sampling**
@@ -108,7 +108,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -MarkerMode `
   -ConfirmWprCapture -CaptureWpr `
   -DurationSeconds 120 `
-  -OutputDirectory C:\Temp\WPD-Case-002
+  -OutputDirectory C:\WPD-Case-002
 ```
 
 - **One capture window.** Performance counters, repeated per-process commit
@@ -159,7 +159,7 @@ Verify an existing case folder and its optional package without modifying it:
 ```powershell
 powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -Mode Verify `
-  -InputDirectory C:\Temp\WPD-Case-001
+  -InputDirectory C:\WPD-Case-001
 ```
 
 Verify mode emits a machine-readable `case-verification` report on stdout and
@@ -176,7 +176,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -CaptureWpr `
   -ConfirmWprCapture `
   -DurationSeconds 30 `
-  -OutputDirectory C:\Temp\WPD-Case-001
+  -OutputDirectory C:\WPD-Case-001
 ```
 
 Capture a **bounded Microsoft Defender performance recording** (elevated console + Defender platform 4.18.2108.7 or later, its own consent gate):
@@ -188,7 +188,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -CaptureDefender `
   -ConfirmDefenderCapture `
   -DurationSeconds 30 `
-  -OutputDirectory C:\Temp\WPD-Case-001
+  -OutputDirectory C:\WPD-Case-001
 ```
 
 Collect **from a remote machine over WinRM** (WinRM must already be enabled on the target; the tool never enables it — run the same consent gates, the case folder is pulled back and every file's SHA-256 is verified against the remote manifest):
@@ -201,7 +201,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -RemoteComputer SRV-DIAG-01 `
   -Credential (Get-Credential) `
   -DurationSeconds 30 `
-  -OutputDirectory C:\Temp\WPD-Case-001
+  -OutputDirectory C:\WPD-Case-001
 ```
 
 The collector writes a timestamped CPU/memory/disk sample CSV, a top-process snapshot, a bounded System-event summary, optional `wpr-trace.etl` / `defender-performance.etl`, optional consent-gated crash evidence (`minidumps\` dumps + `bootfailure\` SRT/boot/CBS logs), and, when boot-failure logs are collected, the bounded `servicing-log-analysis.json` evidence summary. `findings.json` includes crash and servicing findings alongside telemetry findings, and the manifest records the structured `crashAnalysis` block. With `-ZipOutput` it also packages this run's certified evidence (artifacts + manifest) into a timestamped case zip next to the output folder - stale files from reused folders are never included. `-Mode Verify -InputDirectory <case>` validates an existing Collect manifest, its listed artifacts, and any recorded case ZIP without modifying the case. It does **not** start Procmon recordings, invoke DISM/SFC, alter startup items, change policy, or remediate anything. In local mode it never transfers artifacts off the machine; in remote mode (`-RemoteComputer`) the pull-back to this machine is consent-gated and hash-verified. On a non-elevated console, WPR and Defender captures are skipped and recorded in the manifest rather than auto-elevating.
@@ -211,7 +211,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 `make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from the exact matching release tag in a verified clean git tree. It refuses to create a same-version archive from a later `main` commit. The bundle ships:
 
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
-- `START-HERE.bat` — double-click console menu: 1) Plan preview, 2) Collect diagnostics (recommended full read-only evidence), 3) Verify an existing case, 4) Exit; Collect is UAC-elevated only when needed and every run is logged to `C:\Temp\WPD-Case\diagnostics-run.log`
+- `START-HERE.bat` — double-click console menu: 1) Plan preview, 2) Collect diagnostics with Search/minifilter snapshots, 3) Incident capture with those snapshots, 4) Verify an existing case, 5) Exit; Collect is UAC-elevated only when needed and every run is logged to `C:\WPD-Case\diagnostics-run.log`
 - `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace; includes minidumps + boot-failure evidence)
 - `Pull-BootFailureLogs.bat` — WinRE/WinPE runbook launcher for machines that will not boot (SRT/boot/CBS/setup/DISM evidence to a PE drive; `bcdedit bootlog` only via an explicit y/N prompt)
 - `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)

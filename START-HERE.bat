@@ -2,7 +2,7 @@
 setlocal
 pushd "%~dp0"
 
-set "OUTDIR=C:\Temp\WPD-Case"
+set "OUTDIR=C:\WPD-Case"
 set "LOG=%OUTDIR%\diagnostics-run.log"
 set "CHOICE=%~1"
 set "INPUTDIR=%~2"
@@ -31,8 +31,8 @@ if not "%CHOICE%"=="" goto :choice_set
 echo Choose an operating mode:
 echo.
 echo   1 - Plan preview
-echo   2 - Collect diagnostics (recommended)
-echo   3 - Incident capture (performance window + symptom marker)
+echo   2 - Collect diagnostics + Search/minifilter snapshots (recommended)
+echo   3 - Incident capture + Search/minifilter snapshots
 echo   4 - Verify an existing case
 echo   5 - Exit
 echo.
@@ -66,7 +66,7 @@ if "%errorlevel%"=="1" goto :end_failed
 goto :end_no_pause
 
 :collect_ready
-set "EXTRA=-CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
+set "EXTRA=-CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -CollectSearchContext -CollectMinifilters -ConfirmEscalationCollection -ZipOutput"
 set "DURATION=30"
 goto :run
 
@@ -81,7 +81,7 @@ echo.
 echo Incident capture runs ONE shared window for counters, process/commit,
 echo GPU, disk, pagefile and the WPR trace. Press Enter when the slowdown
 echo happens: 60 s before the marker and 30 s after it are kept.
-set "EXTRA=-PerformanceMode -MarkerMode -CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
+set "EXTRA=-PerformanceMode -MarkerMode -CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -CollectSearchContext -CollectMinifilters -ConfirmEscalationCollection -ZipOutput"
 set "DURATION=120"
 goto :run
 
@@ -105,6 +105,7 @@ echo Collecting: baseline sampling for %DURATION% seconds, with the WPR trace,
 echo process/commit, GPU, pagefile and UDP capture running in the SAME window.
 echo The console shows baseline progress by sample and percentage.
 echo Allow additional time for event/log collection and final export, hashing, and ZIP packaging.
+echo Read-only Search service and minifilter snapshots are included.
 echo Output: %OUTDIR%
 echo Run started: %date% %time% - mode Collect >> "%LOG%"
 echo ============================================================ >> "%LOG%"
@@ -135,6 +136,8 @@ echo   - minidumps\                   (crash dumps)
 echo   - bootfailure\                 (SRT/boot/CBS logs)
 echo   - servicing-log-analysis.json (CBS/DISM/setup signatures)
 echo   - WPD-Case-^<time^>.zip          (case package, next to the output folder)
+echo   - escalation\search-service-context.json
+echo   - escalation\minifilter-enumeration.json
 echo Full log: %LOG%
 echo.
 goto :end

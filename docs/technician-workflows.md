@@ -29,7 +29,7 @@ A basic plan does no collection and writes one file:
 powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -Mode Plan `
   -Preset general `
-  -OutputDirectory C:\Temp\WPD-Case-001
+  -OutputDirectory C:\WPD-Case-001
 ```
 
 For a reproduction plan with a one-second counter cadence:
@@ -40,7 +40,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -Preset ui-hang `
   -Repro `
   -Tier1IntervalSeconds 1 `
-  -OutputDirectory C:\Temp\WPD-Case-001
+  -OutputDirectory C:\WPD-Case-001
 ```
 
 Review `diagnostic-plan.json` before collecting. Confirm:
@@ -73,7 +73,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -Mode Collect `
   -Preset general `
   -ConfirmLocalCollection `
-  -OutputDirectory C:\Temp\WPD-Case-001
+  -OutputDirectory C:\WPD-Case-001
 ```
 
 A CPU case with a WPR trace requires both local and WPR consent:
@@ -85,7 +85,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -CaptureWpr `
   -ConfirmLocalCollection `
   -ConfirmWprCapture `
-  -OutputDirectory C:\Temp\WPD-Case-002
+  -OutputDirectory C:\WPD-Case-002
 ```
 
 Keep the process running for the planned window. Do not reboot, suspend, stop,
@@ -156,7 +156,7 @@ powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -CollectMinifilters `
   -ConfirmEscalationCollection `
   -ConfirmLocalCollection `
-  -OutputDirectory C:\Temp\WPD-Case-003
+  -OutputDirectory C:\WPD-Case-003
 ```
 
 Escalation can produce bounded adapter artifacts or an unsupported/not-collected
@@ -227,7 +227,7 @@ Run the read-only verifier after collection:
 ```powershell
 powershell.exe -NoProfile -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
   -Mode Verify `
-  -InputDirectory C:\Temp\WPD-Case-001
+  -InputDirectory C:\WPD-Case-001
 ```
 
 A successful verification checks the manifest contract, safe paths, artifact

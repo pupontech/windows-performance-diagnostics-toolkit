@@ -13,7 +13,7 @@ bundle. Choose a fresh case directory, then run:
 .\src\Invoke-WindowsPerformanceDiagnostics.ps1 -Mode Collect -Preset general `
   -DurationSeconds 30 -ConfirmLocalCollection `
   -CollectSearchContext -CollectMinifilters -ConfirmEscalationCollection `
-  -OutputDirectory C:\Temp\WPD-Tier3-Case -ZipOutput
+  -OutputDirectory C:\WPD-Case -ZipOutput
 ```
 
 The independent `-ConfirmEscalationCollection` gate is required in addition to

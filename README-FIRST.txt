@@ -42,9 +42,9 @@ Option A (START-HERE modes):
     4 - Verify an existing case
     5 - Exit
   Collect requests UAC only when administrator rights are needed. Every
-  collection run is logged to C:\Temp\WPD-Case\diagnostics-run.log. The default
-  full workflow has a 30-second baseline sample window followed by a separate
-  30-second WPR trace; event/log export, report generation, hashing, and ZIP
+  collection run is logged to C:\WPD-Case\diagnostics-run.log. The default
+  full workflow has one shared 30-second baseline/WPR capture window;
+  event/log export, report generation, hashing, and ZIP
   packaging take additional time. The console shows baseline sample/percentage
   progress.
 
@@ -52,8 +52,13 @@ Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.
   This standard launcher passes the explicit collection-consent switches for
   its documented read-only workflow; it does not display a second prompt.
-  Output goes to C:\Temp\WPD-Case (no WPR trace; includes crash evidence and
-  a local case package).
+  Output goes to C:\WPD-Case (no WPR trace; includes crash evidence and
+  a local case package). Both collection launchers now include read-only
+  Search service and minifilter snapshots under escalation\. Run this basic
+  launcher as Administrator for minifilter details; without access the adapter
+  records a failure/coverage gap rather than pretending there are no filters.
+  The Windows script default is also C:\WPD-Case unless overridden. Existing
+  case folders in the old location are left untouched.
 
 Option C (manual):
   Open PowerShell and run:
@@ -67,7 +72,7 @@ Option C (manual):
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass `
       -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
-      -Mode Verify -InputDirectory C:\Temp\WPD-Case
+      -Mode Verify -InputDirectory C:\WPD-Case
 
   Verify returns exit code 0 only when the Collect manifest, listed artifacts,
   and any recorded case ZIP pass validation.
@@ -117,7 +122,7 @@ SAFETY SUMMARY
 - WPR TRACE: Only collected when you pass -CaptureWpr AND confirm with
   -ConfirmWprCapture from an already-elevated PowerShell console.
 - OUTPUT: All results are written to the directory you specify via
-  -OutputDirectory (default when using Run-Diagnostics.bat: C:\Temp\WPD-Case).
+  -OutputDirectory (default when using Run-Diagnostics.bat: C:\WPD-Case).
 
 FILE LAYOUT
 -----------

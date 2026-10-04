@@ -41,8 +41,9 @@ Option A (START-HERE modes):
     3 - Incident capture
     4 - Verify an existing case
     5 - Exit
-  Collect requests UAC only when administrator rights are needed. Every
-  collection run is logged to C:\WPD-Case\diagnostics-run.log. The default
+  Collect requests UAC only when administrator rights are needed. Each run
+  gets a unique timestamped folder under C:\WPD-Case and its own diagnostics
+  log; the final summary shows the exact case folder and report. The default
   full workflow has one shared 30-second baseline/WPR capture window;
   event/log export, report generation, hashing, and ZIP
   packaging take additional time. The console shows baseline sample/percentage
@@ -52,7 +53,7 @@ Option B (basic collection, no admin needed):
   Double-click Run-Diagnostics.bat in the extracted folder.
   This standard launcher passes the explicit collection-consent switches for
   its documented read-only workflow; it does not display a second prompt.
-  Output goes to C:\WPD-Case (no WPR trace; includes crash evidence and
+  Output goes to a unique timestamped folder under C:\WPD-Case (no WPR trace; includes crash evidence and
   a local case package). Both collection launchers now include read-only
   Search service and minifilter snapshots under escalation\. Run this basic
   launcher as Administrator for minifilter details; without access the adapter
@@ -72,8 +73,10 @@ Option C (manual):
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass `
       -File .\src\Invoke-WindowsPerformanceDiagnostics.ps1 `
-      -Mode Verify -InputDirectory C:\WPD-Case
+      -Mode Verify -InputDirectory C:\WPD-Case\<exact-case-folder>
 
+  For default launcher runs, use the exact timestamped child folder printed by
+  the completion summary as -InputDirectory; do not verify the C:\WPD-Case base.
   Verify returns exit code 0 only when the Collect manifest, listed artifacts,
   and any recorded case ZIP pass validation.
 

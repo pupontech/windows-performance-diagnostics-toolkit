@@ -228,34 +228,102 @@ jobs:
             }
           }
 
-      - name: Run the real launcher (Run-Diagnostics.bat)
-        shell: cmd
-        run: call Run-Diagnostics.bat
+      - name: Exercise both real batch launchers and exact-run UX proof (both engines)
+        timeout-minutes: 30
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CI = 'true'
+          $root = [System.IO.Path]::GetFullPath('C:\WPD-Case')
+          $powershell51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $pwshEngine = (Get-Command pwsh.exe -ErrorAction Stop).Source
+          $engines = @(
+            [pscustomobject]@{ name = 'windows-powershell-51'; path = $powershell51 },
+            [pscustomobject]@{ name = 'pwsh'; path = $pwshEngine }
+          )
+          foreach ($engine in $engines) {
+            if (-not (Test-Path -LiteralPath $engine.path -PathType Leaf)) { throw "PowerShell child engine is missing: $($engine.path)" }
+            $nonce = [guid]::NewGuid().ToString('N')
+            $firstReceiptPath = Join-Path $env:RUNNER_TEMP "wpd-$($engine.name)-first-$nonce.json"
+            $firstEnvelopePath = Join-Path $env:RUNNER_TEMP "wpd-$($engine.name)-first-summary-$nonce.json"
+            $baselinePath = Join-Path $env:RUNNER_TEMP "wpd-$($engine.name)-baseline-$nonce.json"
+            $secondReceiptPath = Join-Path $env:RUNNER_TEMP "wpd-$($engine.name)-second-$nonce.json"
+            $secondEnvelopePath = Join-Path $env:RUNNER_TEMP "wpd-$($engine.name)-second-summary-$nonce.json"
+            $presentationPath = Join-Path $env:RUNNER_TEMP "wpd-$($engine.name)-presentation-$nonce.json"
+            foreach ($path in @($firstReceiptPath, $firstEnvelopePath, $baselinePath, $secondReceiptPath, $secondEnvelopePath, $presentationPath)) {
+              if (Test-Path -LiteralPath $path) { throw "Refusing to reuse a proof receipt path: $path" }
+            }
 
-      - name: Assert standalone launcher Tier 3 artifacts under C root
-        shell: powershell
-        run: .\tests\live\Assert-WpdLauncherTier3.ps1
+            # First real batch invocation; the environment selects its child engine.
+            $env:WPD_POWERSHELL_EXE = $engine.path
+            $env:WPD_RUN_RECEIPT_PATH = $firstReceiptPath
+            $env:WPD_COMPLETION_ENVELOPE_PATH = $firstEnvelopePath
+            Remove-Item Env:WPD_PRESENTATION_ARGV_RECEIPT_PATH -ErrorAction SilentlyContinue
+            & cmd.exe /d /c call Run-Diagnostics.bat
+            $firstLauncherExit = $LASTEXITCODE
+            if ($firstLauncherExit -ne 0) { throw "Run-Diagnostics.bat failed under $($engine.name) (exit $firstLauncherExit)" }
+            if (-not (Test-Path -LiteralPath $firstReceiptPath -PathType Leaf)) { throw "First launcher receipt is missing: $firstReceiptPath" }
+            $firstReceipt = Get-Content -LiteralPath $firstReceiptPath -Raw | ConvertFrom-Json
+            $firstCase = [System.IO.Path]::GetFullPath([string]$firstReceipt.casePath)
+            if ([System.IO.Path]::GetDirectoryName($firstCase) -ne $root) { throw "First case is not an immediate C:\WPD-Case child: $firstCase" }
+            if ([System.IO.Path]::GetFileName($firstCase) -notmatch '^\d{8}T\d{9}Z-[A-Za-z0-9-]{1,64}$') { throw "First case leaf is not the exact UTC/run-id form: $firstCase" }
+            if (-not (Test-Path -LiteralPath $firstEnvelopePath -PathType Leaf)) { throw "First completion envelope is missing: $firstEnvelopePath" }
+            $firstLog = Join-Path $firstCase ('diagnostics-run-' + [string]$firstReceipt.runId + '.log')
+            & $engine.path -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\live\Assert-WpdLauncherTier3.ps1 -CaseDirectory $firstCase
+            $assertExit = $LASTEXITCODE
+            if ($assertExit -ne 0) { throw "First Tier 3 assertion failed under $($engine.name) (exit $assertExit)" }
+            & $engine.path -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\live\Invoke-WpdRunUxProof.ps1 `
+              -CaptureFirstCaseBaseline -RootDirectory $root -FirstCaseDirectory $firstCase `
+              -FirstRunLogPath $firstLog -BaselineReceiptPath $baselinePath
+            $baselineExit = $LASTEXITCODE
+            if ($baselineExit -ne 0) { throw "First-case baseline capture failed under $($engine.name) (exit $baselineExit)" }
 
-      - name: Run the START-HERE menu in auto mode (option 2, collect)
-        shell: cmd
-        run: call START-HERE.bat 2
+            # Second real batch invocation, after the first case snapshot exists.
+            $env:WPD_RUN_RECEIPT_PATH = $secondReceiptPath
+            $env:WPD_COMPLETION_ENVELOPE_PATH = $secondEnvelopePath
+            $env:WPD_PRESENTATION_ARGV_RECEIPT_PATH = $presentationPath
+            & cmd.exe /d /c call START-HERE.bat 2
+            $secondLauncherExit = $LASTEXITCODE
+            if ($secondLauncherExit -ne 0) { throw "START-HERE.bat 2 failed under $($engine.name) (exit $secondLauncherExit)" }
+            if (-not (Test-Path -LiteralPath $secondReceiptPath -PathType Leaf)) { throw "Second launcher receipt is missing: $secondReceiptPath" }
+            $secondReceipt = Get-Content -LiteralPath $secondReceiptPath -Raw | ConvertFrom-Json
+            $secondCase = [System.IO.Path]::GetFullPath([string]$secondReceipt.casePath)
+            if ([System.IO.Path]::GetDirectoryName($secondCase) -ne $root) { throw "Second case is not an immediate C:\WPD-Case child: $secondCase" }
+            if ($firstCase -eq $secondCase) { throw "The two launcher runs reused one case directory: $firstCase" }
+            if ([System.IO.Path]::GetFileName($secondCase) -notmatch '^\d{8}T\d{9}Z-[A-Za-z0-9-]{1,64}$') { throw "Second case leaf is not the exact UTC/run-id form: $secondCase" }
+            $secondLog = Join-Path $secondCase ('diagnostics-run-' + [string]$secondReceipt.runId + '.log')
+            & $engine.path -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\live\Assert-WpdLauncherTier3.ps1 -CaseDirectory $secondCase
+            $assertExit = $LASTEXITCODE
+            if ($assertExit -ne 0) { throw "Second Tier 3 assertion failed under $($engine.name) (exit $assertExit)" }
+            if (-not (Test-Path -LiteralPath $secondEnvelopePath -PathType Leaf)) { throw "Second completion envelope is missing: $secondEnvelopePath" }
+            if (-not (Test-Path -LiteralPath $presentationPath -PathType Leaf)) { throw "Injected presentation argv receipt is missing: $presentationPath" }
+            & $engine.path -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\live\Invoke-WpdRunUxProof.ps1 `
+              -RootDirectory $root -FirstCaseDirectory $firstCase -SecondCaseDirectory $secondCase `
+              -FirstRunLogPath $firstLog -SecondRunLogPath $secondLog `
+              -ToolkitScriptPath (Join-Path (Get-Location).Path 'src\Invoke-WindowsPerformanceDiagnostics.ps1') `
+              -BaselineReceiptPath $baselinePath -SummaryEnvelopePath $secondEnvelopePath `
+              -PresentationArgvReceiptPath $presentationPath
+            $proofExit = $LASTEXITCODE
+            if ($proofExit -ne 0) { throw "Two-run UX proof failed under $($engine.name) (exit $proofExit)" }
+            if ($engine.name -eq 'pwsh') { $env:WPD_SECOND_CASE = $secondCase }
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WPD_SECOND_CASE)) { throw 'pwsh exact second-run path was not captured' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ("WPD_SECOND_CASE=" + $env:WPD_SECOND_CASE)
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ("WPD_POWERSHELL_EXE=" + $pwshEngine)
 
-      - name: Assert guided launcher Tier 3 artifacts under C root
-        shell: powershell
-        run: .\tests\live\Assert-WpdLauncherTier3.ps1
-
-      - name: Run the START-HERE menu in auto mode (option 1, plan)
+      - name: Run the START-HERE menu in auto mode (option 1, plan at case base)
         shell: cmd
         run: call START-HERE.bat 1
 
-      - name: Run the START-HERE menu in auto mode (option 4, verify)
+      - name: Run the START-HERE menu in auto mode (option 4, verify exact case)
         shell: cmd
-        run: call START-HERE.bat 4 C:\WPD-Case
+        run: call START-HERE.bat 4 "%WPD_SECOND_CASE%"
 
       - name: Assert launchers produced the diagnostic artifacts
         shell: pwsh
         run: |
-          $manifest = "C:\WPD-Case\diagnostic-manifest.json"
+          $case = $env:WPD_SECOND_CASE
+          $manifest = Join-Path $case "diagnostic-manifest.json"
           $plan = "C:\WPD-Case\diagnostic-plan.json"
           foreach ($file in @($manifest, $plan)) {
             if (-not (Test-Path -LiteralPath $file)) {
@@ -284,7 +352,7 @@ jobs:
             Write-Error "Unexpected servicingAnalysis block: $($m.servicingAnalysis | ConvertTo-Json -Compress)"
             exit 1
           }
-          if (-not (Test-Path -LiteralPath "C:\WPD-Case\servicing-log-analysis.json")) {
+          if (-not (Test-Path -LiteralPath (Join-Path $case "servicing-log-analysis.json"))) {
             Write-Error "servicing-log-analysis.json missing"
             exit 1
           }
@@ -310,7 +378,7 @@ jobs:
             Write-Error "Unexpected dnsVsPing verdict: $($m.network.dnsVsPing.verdict)"
             exit 1
           }
-          if (-not (Test-Path -LiteralPath "C:\WPD-Case\network-state.json")) {
+          if (-not (Test-Path -LiteralPath (Join-Path $case "network-state.json"))) {
             Write-Error "network-state.json missing"
             exit 1
           }
@@ -333,7 +401,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $case = 'C:\WPD-Case'
+          $case = $env:WPD_SECOND_CASE
           $manifestPath = Join-Path $case 'diagnostic-manifest.json'
           $m = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 

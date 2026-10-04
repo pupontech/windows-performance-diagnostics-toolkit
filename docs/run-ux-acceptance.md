@@ -1,9 +1,12 @@
 # Run UX acceptance: completion summary and isolated case folders
 
-Status: bounded acceptance design and proof harness only. This document does not
-claim the completion module, unique-child launcher routing, CI wiring, or owner
-live validation is implemented. Parent integration must wire the harness to the
-exact run handoffs and the completion presentation test double.
+Status: production completion and unique-child launcher routing are wired, and
+the Windows workflow now invokes both real batch launchers under both child
+engines. This document does not claim a hosted Windows pass or owner-live
+validation. A known contract mismatch remains for parent review: production case
+leaves use `yyyyMMddTHHmmssfffZ-<run-id>`, while the current proof harness leaf
+validator accepts `yyyyMMddTHHmmss[.fraction]Z-<run-id>`; align the harness before
+the new Windows proof can pass.
 
 ## Scope and proof boundary
 
@@ -23,7 +26,10 @@ proof on non-Windows. Linux tests exercise only its pure name/status helpers and
 PowerShell parsing.
 
 The acceptance harness owns two small input formats; neither is an API
-assumption about `Wpd.Completion.psm1` or the launchers:
+assumption about `Wpd.Completion.psm1` or the launchers. Production writes the
+summary envelope only to the caller-owned path supplied with
+`-CompletionEnvelopePath` (or `WPD_COMPLETION_ENVELOPE_PATH`); it never adds an
+unregistered summary file to the packaged case.
 
 - First-case baseline receipt: capture immediately after the first launcher
   completes and before the second launcher starts. The receipt stores the
@@ -44,12 +50,21 @@ assumption about `Wpd.Completion.psm1` or the launchers:
   separate arguments. A successful receipt proves argument delivery to the test
   double; it does not prove a browser was visible.
 
-The current harness recognizes a case leaf of
-`yyyyMMddTHHmmss[.fraction]Z-<8+ alphanumeric/hyphen run-id>` and can be aligned
-by the parent if the chosen production timestamp/run-id spelling differs. The
-parent must supply exact run paths from each launch's own output/receipt; it
-must not infer paths by sorting the shared root or using a global latest-case
-pointer.
+The production case leaf is `yyyyMMddTHHmmssfffZ-<32-hex run-id>`. The parent
+must align the proof harness validator to this exact production form before
+Windows acceptance; the launcher supplies exact run paths through its
+caller-owned `RunReceiptPath` parameter or `WPD_RUN_RECEIPT_PATH`, never by
+sorting the root or using a global latest-case pointer.
+
+`WPD_POWERSHELL_EXE` selects the PowerShell child executable used by both batch
+files; it defaults to `powershell.exe` and accepts a filename or full path
+(including spaces; the batch files quote the value, so do not include literal
+quote characters in the variable).
+The completion module's production caller verifies the exact case and any
+requested package using `-Mode Verify` before invoking `Show-WpdRunCompletion`.
+Batch launchers request output opening interactively; `CI=true` suppresses real
+GUI use. The CI injected presenter receives the actual case and report paths in
+separate calls and writes its receipt only from those observed arguments.
 
 ## Compatibility and consent criteria
 
@@ -180,21 +195,13 @@ or browser is visible and usable. Owner validation must be a separate,
 consented Windows client check; do not install software, reboot, suspend, or
 change host policy as part of this acceptance harness.
 
-## Parent integration work still required
+## Hosted and owner-live validation still required
 
-- Adapt the two launcher implementations to generate unique default Collect
-  children while preserving explicit `-OutputDirectory` paths and `C:` root
-  placement.
-- Provide exact first/second case and run-log handoffs to this harness; do not
-  add latest-case discovery. Pick the final leaf format or align the harness
-  pattern.
-- Adapt the completion result to the documented test envelope and capture its
-  real rendered summary. Keep final manifest/report/artifact reads after all
-  collection, hashing, evidence-index, and ZIP packaging stages.
-- Wire the completion presentation dependency to an injected runner for CI and
-  emit the Windows argv receipt without opening a GUI.
-- Add Windows CI steps that invoke each `.bat` individually under `cmd.exe` on
-  both Windows OS versions and both PowerShell engines. Add Plan, consent
-  refusal, explicit-path compatibility, no-report/missing-artifact/tamper, and
-  Verify read-only legs. These workflow changes are outside this worker's
-  ownership.
+- Align the current 553-line proof harness case-leaf validator with the actual
+  production timestamp spelling above; do not change the production naming
+  contract or fake a case path.
+- Run the wired Windows OS/engine matrix. Hosted collection, package tamper
+  refusal, and read-only Verify have not been executed in this work session.
+- Run the separate owner-live UAC and visible browser-opening check with
+  consent. CI's injected runner proves only discrete path delivery, not a visible
+  browser or UAC experience.

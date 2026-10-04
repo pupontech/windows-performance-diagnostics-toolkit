@@ -18,6 +18,15 @@ param(
     # Optional, caller-owned exact-run receipt used by launchers and CI.
     [string]$RunReceiptPath,
 
+    # Optional caller-owned completion handoff outside the packaged case.
+    [string]$CompletionEnvelopePath,
+
+    # Batch entry points request local output presentation after verification.
+    [switch]$OpenOutputs,
+
+    # Test-only presentation seam; production callers should omit this.
+    [scriptblock]$PresentationRunner,
+
     [string]$InputDirectory,
 
     [switch]$ConfirmLocalCollection,
@@ -140,19 +149,30 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:WpdRunTranscriptStarted = $false
 $script:WpdOutputDirectoryWasExplicit = $PSBoundParameters.ContainsKey('OutputDirectory')
 if ($script:WpdOutputDirectoryWasExplicit -and -not [string]::IsNullOrWhiteSpace($CaseBaseDirectory)) {
     throw 'Use either -OutputDirectory for an exact case or -CaseBaseDirectory for a run base, not both.'
 }
-Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.CasePath.psm1') -Force -ErrorAction Stop
+$script:WpdCasePathModulePath = Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.CasePath.psm1'
+$script:WpdCasePathModuleAvailable = [System.IO.File]::Exists($script:WpdCasePathModulePath)
+if ($script:WpdCasePathModuleAvailable) {
+    Import-Module -Name $script:WpdCasePathModulePath -Force -ErrorAction Stop
+}
 if ($script:WpdOutputDirectoryWasExplicit) {
     $script:WpdCaseBaseDirectory = $OutputDirectory
 }
 elseif (-not [string]::IsNullOrWhiteSpace($CaseBaseDirectory)) {
     $script:WpdCaseBaseDirectory = $CaseBaseDirectory
 }
-else {
+elseif ($script:WpdCasePathModuleAvailable) {
     $script:WpdCaseBaseDirectory = Get-WpdDefaultCaseBaseDirectory
+}
+elseif ($null -ne $env:SystemRoot -or [Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+    $script:WpdCaseBaseDirectory = 'C:\WPD-Case'
+}
+else {
+    $script:WpdCaseBaseDirectory = [System.IO.Path]::GetFullPath((Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics'))
 }
 if (-not $script:WpdOutputDirectoryWasExplicit) {
     $OutputDirectory = $script:WpdCaseBaseDirectory
@@ -6565,6 +6585,9 @@ if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 
 # Consent and platform gates passed. A default Collect gets a newly reserved
 # child; an explicit OutputDirectory remains the exact legacy case directory.
+if (-not $script:WpdOutputDirectoryWasExplicit -and -not $script:WpdCasePathModuleAvailable) {
+    throw 'Wpd.CasePath.psm1 is required for default Collect case-folder allocation. Restore the module or pass an explicit -OutputDirectory.'
+}
 try {
     if (-not $script:WpdOutputDirectoryWasExplicit) {
         $resolvedOutputDirectory = New-WpdCaseDirectory -BaseDirectory $resolvedOutputDirectory
@@ -6614,10 +6637,16 @@ if (-not [string]::IsNullOrWhiteSpace($RunReceiptPath)) {
 
 $script:WpdRunTranscriptStarted = $false
 $transcriptPath = Join-Path -Path $resolvedOutputDirectory -ChildPath ('diagnostics-run-' + $script:WpdRunId + '.log')
-if ([System.IO.File]::Exists($transcriptPath)) {
-    throw "Refusing to overwrite an existing run log: $transcriptPath"
+$transcriptReservation = [System.IO.File]::Open($transcriptPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+$transcriptReservation.Dispose()
+trap {
+    if ($script:WpdRunTranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch { }
+        $script:WpdRunTranscriptStarted = $false
+    }
+    throw $_
 }
-Start-Transcript -LiteralPath $transcriptPath -ErrorAction Stop | Out-Null
+Start-Transcript -LiteralPath $transcriptPath -Append -ErrorAction Stop | Out-Null
 $script:WpdRunTranscriptStarted = $true
 Write-Output "Collection case directory: $resolvedOutputDirectory"
 
@@ -6872,8 +6901,16 @@ if ($RemoteComputer) {
         Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
     }
     if ($remoteStatus -eq 'completed') {
+        if ($script:WpdRunTranscriptStarted) {
+            Stop-Transcript | Out-Null
+            $script:WpdRunTranscriptStarted = $false
+        }
         Write-Output "Remote collection complete. Manifest written to $collectionManifestPath"
         exit 0
+    }
+    if ($script:WpdRunTranscriptStarted) {
+        Stop-Transcript | Out-Null
+        $script:WpdRunTranscriptStarted = $false
     }
     Write-Output "Remote collection failed. Manifest written to $collectionManifestPath"
     exit 1
@@ -8475,4 +8512,121 @@ if ($ZipOutput) {
 if ($script:WpdRunTranscriptStarted) {
     Stop-Transcript | Out-Null
     $script:WpdRunTranscriptStarted = $false
+}
+
+# Verify the persisted case and any published ZIP with the same production
+# Verify entry point users invoke. Capture the native exit code immediately so
+# later JSON handling or console presentation cannot replace it.
+$verificationExitCode = 1
+$verificationReport = $null
+$verificationText = ''
+$verificationFailure = $null
+try {
+    $verifyEngineName = if ($PSVersionTable.PSVersion.Major -le 5) { 'powershell.exe' } else { 'pwsh.exe' }
+    $verifyEnginePath = Join-Path -Path $PSHOME -ChildPath $verifyEngineName
+    $verificationOutput = @(& $verifyEnginePath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $PSCommandPath -Mode Verify -InputDirectory $resolvedOutputDirectory 2>&1)
+    $verificationExitCode = $LASTEXITCODE
+    $verificationText = ($verificationOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+    if ($verificationExitCode -ne 0) {
+        throw "production Verify exited $($verificationExitCode): $verificationText"
+    }
+    $verificationReport = $verificationText | ConvertFrom-Json -ErrorAction Stop
+    if ([string]$verificationReport.status -ne 'verified') {
+        throw "production Verify status was '$($verificationReport.status)'"
+    }
+    if ($ZipOutput -and [string]$verificationReport.package.status -ne 'verified') {
+        throw "production Verify package status was '$($verificationReport.package.status)'"
+    }
+    if (-not $ZipOutput -and [string]$verificationReport.package.status -notin @('verified', 'not-present')) {
+        throw "production Verify package status was '$($verificationReport.package.status)'"
+    }
+}
+catch {
+    $verificationFailure = $_.Exception.Message
+}
+
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.Completion.psm1') -Force -ErrorAction Stop
+$requiredCompletionArtifacts = @($collectedArtifacts | Where-Object { [string]$_ -match '\.json$' })
+if ($CollectSearchContext -and $requiredCompletionArtifacts -notcontains 'escalation/search-service-context.json') {
+    $requiredCompletionArtifacts += 'escalation/search-service-context.json'
+}
+if ($CollectMinifilters -and $requiredCompletionArtifacts -notcontains 'escalation/minifilter-enumeration.json') {
+    $requiredCompletionArtifacts += 'escalation/minifilter-enumeration.json'
+}
+$completionCollectorExitCode = if ($null -ne $verificationFailure) { 1 } else { 0 }
+$completion = Get-WpdRunCompletion -CaseDirectory $resolvedOutputDirectory `
+    -RequiredArtifacts $requiredCompletionArtifacts `
+    -CollectorExitCode $completionCollectorExitCode
+if ($null -ne $verificationFailure) {
+    Write-Warning ('Production Verify rejected the final case/package: ' + $verificationFailure)
+}
+
+$showParameters = @{ Completion = $completion }
+if ($OpenOutputs) { $showParameters.OpenOutputs = $true }
+if ($null -ne $PresentationRunner) { $showParameters.PresentationRunner = $PresentationRunner }
+$showOutput = @(Show-WpdRunCompletion @showParameters 6>&1)
+$renderedSummaryLines = @(
+    $showOutput |
+        Where-Object { $_ -is [System.Management.Automation.InformationRecord] } |
+        ForEach-Object { [string]$_.MessageData }
+)
+foreach ($line in $renderedSummaryLines) { Write-Host $line }
+$presentationResult = $null
+foreach ($item in $showOutput) {
+    if ($null -ne $item -and $null -ne $item.PSObject.Properties['openedCase']) {
+        $presentationResult = $item
+    }
+}
+if ($null -ne $presentationResult -and [string]$presentationResult.status -eq 'failed') {
+    Write-Warning ('Collection completed, but output presentation failed: ' + [string]$presentationResult.reason)
+}
+
+$effectiveCompletionExitCode = if ([string]$completion.status -eq 'failed') { 1 } else { 0 }
+if (-not [string]::IsNullOrWhiteSpace($CompletionEnvelopePath)) {
+    $completionStages = @(
+        foreach ($stage in @($completion.stages)) {
+            $stageReason = ''
+            if ($null -ne $stage.coverage -and -not [string]::IsNullOrWhiteSpace([string]$stage.coverage)) {
+                $stageReason = [string]$stage.coverage
+            }
+            elseif ([string]$stage.outcome -eq 'skipped') {
+                $stageReason = [string]$stage.status
+            }
+            [pscustomobject]@{
+                name = [string]$stage.collector
+                status = [string]$stage.status
+                reason = $stageReason
+            }
+        }
+    )
+    $completionEnvelope = [ordered]@{
+        status = [string]$completion.status
+        exitCode = [int]$effectiveCompletionExitCode
+        caseDirectory = [string]$completion.caseDirectory
+        manifestPath = [System.IO.Path]::Combine($resolvedOutputDirectory, 'diagnostic-manifest.json')
+        reportPath = $completion.reportPath
+        errors = @($completion.reasons)
+        missingJson = @($completion.missingArtifacts | Where-Object { [string]$_ -match '\.json$' })
+        stages = @($completionStages)
+        renderedText = $renderedSummaryLines -join [Environment]::NewLine
+    }
+    $envelopeStream = $null
+    try {
+        $envelopeFullPath = [System.IO.Path]::GetFullPath($CompletionEnvelopePath)
+        $envelopeStream = [System.IO.File]::Open($envelopeFullPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $envelopeBytes = [System.Text.Encoding]::UTF8.GetBytes(($completionEnvelope | ConvertTo-Json -Depth 12))
+        $envelopeStream.Write($envelopeBytes, 0, $envelopeBytes.Length)
+        $envelopeStream.Flush()
+    }
+    catch {
+        Write-Warning ('Completion handoff could not be retained at the caller-owned path: ' + $_.Exception.Message)
+    }
+    finally {
+        if ($null -ne $envelopeStream) { $envelopeStream.Dispose() }
+    }
+}
+
+if ($effectiveCompletionExitCode -ne 0) {
+    throw 'Collection failed final completion or integrity verification; see the run summary and Verify output.'
 }

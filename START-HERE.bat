@@ -3,6 +3,7 @@ setlocal
 pushd "%~dp0"
 
 set "OUTDIR=C:\WPD-Case"
+if not defined WPD_POWERSHELL_EXE set "WPD_POWERSHELL_EXE=powershell.exe"
 set "CHOICE=%~1"
 set "INPUTDIR=%~2"
 
@@ -49,7 +50,7 @@ goto :end
 
 :opt_plan
 echo Writing plan only...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Plan -OutputDirectory "%OUTDIR%"
+"%WPD_POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Plan -OutputDirectory "%OUTDIR%"
 if errorlevel 1 goto :plan_failed
 echo Plan written to %OUTDIR%\diagnostic-plan.json
 goto :end
@@ -87,7 +88,7 @@ goto :run
 if not defined INPUTDIR set /p INPUTDIR="Enter the case directory to verify: "
 if not defined INPUTDIR goto :verify_failed
 echo Verifying case: "%INPUTDIR%"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Verify -InputDirectory "%INPUTDIR%"
+"%WPD_POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Verify -InputDirectory "%INPUTDIR%"
 if errorlevel 1 goto :verify_failed
 echo Verify completed successfully.
 goto :end
@@ -102,7 +103,7 @@ echo Collecting diagnostics. The console shows baseline progress by sample and p
 echo Allow additional time for event/log collection and final export, hashing, and ZIP packaging.
 echo Read-only Search service and minifilter snapshots are included.
 echo New case folders are created beneath %OUTDIR%.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WpdLauncher.ps1" -LaunchMode "%LAUNCHMODE%"
+"%WPD_POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WpdLauncher.ps1" -LaunchMode "%LAUNCHMODE%"
 if errorlevel 1 goto :collection_failed
 echo.
 echo Collection complete. The exact case directory, matching log, and manifest were verified above.
@@ -118,7 +119,7 @@ if %errorlevel% equ 0 exit /b 0
 if "%CI%"=="true" goto :ci_not_elevated
 echo Requesting administrator privileges via UAC...
 echo.
-powershell.exe -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%CHOICE%' -Verb RunAs"
+"%WPD_POWERSHELL_EXE%" -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%CHOICE%' -Verb RunAs"
 exit /b 2
 
 :ci_not_elevated

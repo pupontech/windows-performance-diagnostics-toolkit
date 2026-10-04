@@ -211,7 +211,7 @@ The collector writes a timestamped CPU/memory/disk sample CSV, a top-process sna
 `make-deploy-bundle.sh` builds `dist/windows-performance-diagnostics-toolkit-<version>.zip` plus a SHA-256 file from the exact matching release tag in a verified clean git tree. It refuses to create a same-version archive from a later `main` commit. The bundle ships:
 
 - `src\Invoke-WindowsPerformanceDiagnostics.ps1` — the collector
-- `START-HERE.bat` — double-click console menu: 1) Plan preview, 2) Collect diagnostics with Search/minifilter snapshots, 3) Incident capture with those snapshots, 4) Verify an existing case, 5) Exit; Collect is UAC-elevated only when needed and every run is logged to `C:\WPD-Case\diagnostics-run.log`
+- `START-HERE.bat` — double-click console menu: 1) Plan preview, 2) Collect diagnostics with Search/minifilter snapshots, 3) Incident capture with those snapshots, 4) Verify an existing case, 5) Exit; default Collect runs use unique timestamped child folders under `C:\WPD-Case`, print a completion summary, and open the verified case/report outside CI.
 - `Run-Diagnostics.bat` — double-click launcher for a basic, non-elevated collection (no WPR trace; includes minidumps + boot-failure evidence)
 - `Pull-BootFailureLogs.bat` — WinRE/WinPE runbook launcher for machines that will not boot (SRT/boot/CBS/setup/DISM evidence to a PE drive; `bcdedit bootlog` only via an explicit y/N prompt)
 - `README-FIRST.txt` — quick start plus recovery steps when Windows Security removes downloaded unsigned scripts (right-click Properties → Unblock, or `Unblock-File`, and check Protection history if the `.ps1` vanishes after extraction)

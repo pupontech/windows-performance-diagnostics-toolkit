@@ -2,7 +2,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('GuidedCollect', 'IncidentCollect', 'StandaloneCollect')]
-    [string]$LaunchMode
+    [string]$LaunchMode,
+
+    # Optional retained handoff owned by a caller/CI invocation.
+    [string]$RunReceiptPath
 )
 
 Set-StrictMode -Version Latest
@@ -11,7 +14,34 @@ $modulePath = Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.CasePath.psm1'
 Import-Module -Name $modulePath -Force -ErrorAction Stop
 $collectorPath = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-WindowsPerformanceDiagnostics.ps1'
 $baseDirectory = Get-WpdDefaultCaseBaseDirectory
-$receiptPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('wpd-run-receipt-' + [Guid]::NewGuid().ToString('N') + '.json')
+$environmentReceiptPath = [string]$env:WPD_RUN_RECEIPT_PATH
+if (-not [string]::IsNullOrWhiteSpace($RunReceiptPath) -and
+    -not [string]::IsNullOrWhiteSpace($environmentReceiptPath) -and
+    -not [string]::Equals($RunReceiptPath, $environmentReceiptPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw 'RunReceiptPath and WPD_RUN_RECEIPT_PATH identify different receipt paths.'
+}
+$callerOwnedReceipt = $false
+if (-not [string]::IsNullOrWhiteSpace($RunReceiptPath)) {
+    $receiptPath = $RunReceiptPath
+    $callerOwnedReceipt = $true
+}
+elseif (-not [string]::IsNullOrWhiteSpace($environmentReceiptPath)) {
+    $receiptPath = $environmentReceiptPath
+    $callerOwnedReceipt = $true
+}
+else {
+    $receiptPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('wpd-run-receipt-' + [Guid]::NewGuid().ToString('N') + '.json')
+}
+if ($callerOwnedReceipt) {
+    $receiptPath = [System.IO.Path]::GetFullPath($receiptPath)
+    if ([System.IO.Directory]::Exists($receiptPath) -or [System.IO.File]::Exists($receiptPath)) {
+        throw "Caller-owned run receipt already exists; refusing to overwrite: $receiptPath"
+    }
+    $receiptParent = [System.IO.Path]::GetDirectoryName($receiptPath)
+    if (-not [System.IO.Directory]::Exists($receiptParent)) {
+        throw "Caller-owned run receipt parent directory does not exist: $receiptParent"
+    }
+}
 
 $collectorParameters = @{
     Mode = 'Collect'
@@ -19,6 +49,10 @@ $collectorParameters = @{
     CaseBaseDirectory = $baseDirectory
     RunReceiptPath = $receiptPath
     DurationSeconds = 30
+    OpenOutputs = $true
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$env:WPD_COMPLETION_ENVELOPE_PATH)) {
+    $collectorParameters.CompletionEnvelopePath = [string]$env:WPD_COMPLETION_ENVELOPE_PATH
 }
 
 switch ($LaunchMode) {
@@ -59,6 +93,45 @@ switch ($LaunchMode) {
         $collectorParameters.ConfirmEscalationCollection = $true
         $collectorParameters.ZipOutput = $true
     }
+}
+
+$presentationArgvReceiptPath = [string]$env:WPD_PRESENTATION_ARGV_RECEIPT_PATH
+if (-not [string]::IsNullOrWhiteSpace($presentationArgvReceiptPath)) {
+    $presentationCalls = New-Object System.Collections.ArrayList
+    $collectorParameters.PresentationRunner = {
+        param([string]$Action, [string]$Path)
+        [void]$presentationCalls.Add([pscustomobject]@{ action = $Action; path = $Path })
+        if ($Action -notin @('open-case', 'open-report')) {
+            throw "Unexpected injected presentation action: $Action"
+        }
+        if ($Action -eq 'open-report') {
+            if ($presentationCalls.Count -ne 2 -or $presentationCalls[0].action -ne 'open-case') {
+                throw 'Injected presenter did not receive the final case before the final report.'
+            }
+            $caseArgument = [string]$presentationCalls[0].path
+            $reportArgument = [string]$presentationCalls[1].path
+            if ([string]::IsNullOrWhiteSpace($caseArgument) -or [string]::IsNullOrWhiteSpace($reportArgument)) {
+                throw 'Injected presenter received an empty output path.'
+            }
+            $argvReceipt = [ordered]@{
+                runnerInjected = $true
+                guiOpened = $false
+                presentationStatus = 'accepted'
+                runnerExitCode = 0
+                caseDirectory = $caseArgument
+                reportPath = $reportArgument
+                argv = @($caseArgument, $reportArgument)
+            }
+            $receiptStream = [System.IO.File]::Open([System.IO.Path]::GetFullPath($presentationArgvReceiptPath), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try {
+                $receiptBytes = [System.Text.Encoding]::UTF8.GetBytes(($argvReceipt | ConvertTo-Json -Compress))
+                $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
+                $receiptStream.Flush()
+            }
+            finally { $receiptStream.Dispose() }
+        }
+        return $true
+    }.GetNewClosure()
 }
 
 $collectorSucceeded = $false
@@ -129,7 +202,7 @@ try {
     exit 0
 }
 finally {
-    if ([System.IO.File]::Exists($receiptPath)) {
+    if (-not $callerOwnedReceipt -and [System.IO.File]::Exists($receiptPath)) {
         try { [System.IO.File]::Delete($receiptPath) } catch { }
     }
 }

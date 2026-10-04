@@ -1356,30 +1356,40 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
         "5 - Exit",
     ):
         assert option in text, f"missing menu option {option!r}"
-    # the incident-capture path must reach the same elevatable Collect flow with
-    # its own consent flags and a marker-aware duration
+    # Collect is intentionally routed through the shared PowerShell launcher;
+    # its mode table owns the consent flags and per-mode duration.
+    launcher = (REPO_ROOT / "src" / "Invoke-WpdLauncher.ps1").read_text(encoding="utf-8")
     assert ":opt_incident" in text
-    assert 'set "DURATION=120"' in text
-    assert "-DurationSeconds %DURATION%" in text
-    # Consent flags remain explicit in the single launcher Collect flow
-    assert "-Mode Collect" in text
-    assert "-ConfirmLocalCollection" in text
-    assert "-CaptureWpr" in text
-    assert "-ConfirmWprCapture" in text
-    assert "-CollectMinidumps" in text
-    assert "-ConfirmMinidumpCollection" in text
-    assert "-CollectBootFailureLogs" in text
-    assert "-ConfirmBootFailureLogCollection" in text
-    assert "-ZipOutput" in text
+    assert 'set "LAUNCHMODE=IncidentCollect"' in text
+    assert "$collectorParameters.DurationSeconds = 120" in launcher
+    assert "Mode = 'Collect'" in launcher
+    for flag in (
+        "ConfirmLocalCollection = $true",
+        "CaptureWpr = $true",
+        "ConfirmWprCapture = $true",
+        "CollectMinidumps = $true",
+        "ConfirmMinidumpCollection = $true",
+        "CollectBootFailureLogs = $true",
+        "ConfirmBootFailureLogCollection = $true",
+        "ZipOutput = $true",
+        "OpenOutputs = $true",
+    ):
+        assert flag in launcher, f"shared launcher lost collection contract {flag!r}"
     assert "-Mode Verify" in text
     assert "-InputDirectory" in text
     # Defender-strip resilience: pre-flight existence check with recovery steps
     assert "src\\Invoke-WindowsPerformanceDiagnostics.ps1 was not found" in text
-    # Result visibility: log everything with Tee-Object, never a silent failure
-    assert "Tee-Object" in text
-    assert "diagnostic-manifest.json" in text
-    # No trailing backslash before the closing quote of -OutputDirectory
-    assert '-OutputDirectory \'%OUTDIR%\'' in text
+    # The actual route now uses an exact run receipt rather than Tee-Object and
+    # a fixed shared output path. Plan remains rooted at OUTDIR; Collect uses the
+    # launcher's unique child under that same base.
+    assert '"%WPD_POWERSHELL_EXE%"' in text
+    assert "if not defined WPD_POWERSHELL_EXE set \"WPD_POWERSHELL_EXE=powershell.exe\"" in text
+    assert "Invoke-WpdLauncher.ps1" in text
+    assert "RunReceiptPath = $receiptPath" in launcher
+    assert "CaseBaseDirectory = $baseDirectory" in launcher
+    assert "Tee-Object" not in text
+    assert "diagnostic-manifest.json" not in text
+    assert '-Mode Plan -OutputDirectory "%OUTDIR%"' in text
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
 
 

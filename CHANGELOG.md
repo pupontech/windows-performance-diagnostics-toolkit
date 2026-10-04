@@ -5,6 +5,16 @@
 The v2 integration is not a published release. Planner-only capture/escalation
 paths and owner-live validation remain open.
 
+- **Run completion and case isolation.** Default Collect runs reserve unique
+  timestamp/run-id child folders under `C:\WPD-Case`; explicit
+  `-OutputDirectory` remains the exact case path. A final summary runs after
+  report/hash/package publication, reflects partial Search and skipped stages,
+  and uses production Verify before optional case/report presentation. Batch
+  launchers retain exact caller-owned run receipts and accept the documented
+  `WPD_POWERSHELL_EXE` child-engine override for Windows PowerShell 5.1 or pwsh.
+  The double-click paths are not a release claim; Windows hosted proof and
+  owner-live validation remain pending.
+
 ### Continued implementation
 
 - **Launcher follow-up:** both double-click collection paths now select the

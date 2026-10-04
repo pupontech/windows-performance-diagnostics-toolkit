@@ -232,6 +232,43 @@ def test_collection_errors_and_partial_search_adapter_cannot_be_hidden(tmp_path)
     assert "collection-errors:1" in result["reasons"]
 
 
+@pytest.mark.parametrize(
+    "collection_error_stages",
+    [
+        [],
+        ["disk-series-export"],
+        ["disk-series-export", "memory-series-export", "event-log-export"],
+    ],
+)
+def test_collection_error_stage_identity_is_preserved_for_zero_one_and_many(
+    tmp_path, collection_error_stages
+):
+    case = tmp_path / "case"
+    _valid_case(case)
+    manifest_path = case / "diagnostic-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["collectionErrors"] = [
+        {"Stage": stage, "Message": f"controlled {stage} error"}
+        for stage in collection_error_stages
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_pwsh_json(
+        tmp_path,
+        f"$completion = Get-WpdRunCompletion -CaseDirectory {_ps_quote(case)}; "
+        "$completion | ConvertTo-Json -Depth 20 -Compress",
+    )
+
+    error_stages = [
+        stage["collector"] for stage in result["stages"] if stage["status"] == "error"
+    ]
+    assert error_stages == collection_error_stages
+    if collection_error_stages:
+        assert f"collection-errors:{len(collection_error_stages)}" in result["reasons"]
+    else:
+        assert not any(reason.startswith("collection-errors:") for reason in result["reasons"])
+
+
 def test_traversal_and_arbitrary_required_paths_are_refused(tmp_path):
     case = tmp_path / "case"
     _valid_case(case)

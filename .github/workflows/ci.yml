@@ -83,7 +83,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check pytest jsonschema pytest-timeout
           $env:WPD_POWERSHELL_EXE = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py tests/test_launcher_tier3_path.py -q --timeout=180 --timeout-method=thread
+          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py tests/test_launcher_tier3_path.py tests/test_unique_case_runs.py tests/test_run_completion.py tests/test_run_ux_integration.py tests/test_run_ux_proof_helpers.py tests/test_completion_caller_regressions.py -q --timeout=180 --timeout-method=thread
           exit $LASTEXITCODE
 
       - name: Run tiered entrypoint regressions (pwsh)
@@ -91,7 +91,7 @@ jobs:
         shell: pwsh
         run: |
           $env:WPD_POWERSHELL_EXE = 'pwsh'
-          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py tests/test_launcher_tier3_path.py -q --timeout=180 --timeout-method=thread
+          python -m pytest tests/test_entrypoint_tiered_integration.py tests/test_tier1_disk_totals.py tests/test_report_handoff_persistence.py tests/test_package_path_normalization.py tests/test_tier3_execution.py tests/test_launcher_tier3_path.py tests/test_unique_case_runs.py tests/test_run_completion.py tests/test_run_ux_integration.py tests/test_run_ux_proof_helpers.py tests/test_completion_caller_regressions.py -q --timeout=180 --timeout-method=thread
           exit $LASTEXITCODE
 
       - name: Collect and verify a tiered case (both PowerShell engines)

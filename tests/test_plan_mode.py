@@ -165,7 +165,12 @@ def test_collect_progress_uses_a_wall_clock_deadline_and_launchers_explain_extra
     assert "running in the SAME window" in start_here
     assert "then a separate 30-second WPR trace" not in start_here
     assert "final export, hashing, and ZIP packaging" in start_here
-    assert "-PerformanceMode -MarkerMode" in start_here
+    assert 'set "LAUNCHMODE=IncidentCollect"' in start_here
+    assert '-LaunchMode "%LAUNCHMODE%"' in start_here
+    helper = (REPO_ROOT / 'src' / 'Invoke-WpdLauncher.ps1').read_text(encoding='utf-8-sig')
+    incident_route = helper.split("'IncidentCollect' {", 1)[1].split("'StandaloneCollect' {", 1)[0]
+    assert '$collectorParameters.PerformanceMode = $true' in incident_route
+    assert '$collectorParameters.MarkerMode = $true' in incident_route
     assert "30-second baseline sampling" in run_diagnostics
 
 
@@ -927,9 +932,13 @@ def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
     assert b'\\"' not in bat, "backslash-immediately-before-quote hazard in Run-Diagnostics.bat"
 
     text = bat.decode("ascii")
-    assert "-Mode Collect" in text
-    assert "-ConfirmLocalCollection" in text  # consent flag must be passed explicitly
-    assert "-ZipOutput" in text  # case package is part of the standard launcher
+    assert '-LaunchMode StandaloneCollect' in text
+    assert 'src\\Invoke-WpdLauncher.ps1' in text
+    helper = (REPO_ROOT / 'src' / 'Invoke-WpdLauncher.ps1').read_text(encoding='utf-8-sig')
+    standalone = helper.split("'StandaloneCollect' {", 1)[1].split('\n}', 1)[0]
+    assert "Mode = 'Collect'" in helper
+    assert 'ConfirmLocalCollection = $true' in helper
+    assert '$collectorParameters.ZipOutput = $true' in standalone
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
 
 
@@ -939,7 +948,11 @@ def test_run_diagnostics_bat_reports_collection_failures():
     text = (REPO_ROOT / "Run-Diagnostics.bat").read_bytes().decode("ascii")
 
     assert "if errorlevel 1 goto :collection_failed" in text
-    assert 'if not exist "%OUTDIR%\\diagnostic-manifest.json" goto :collection_failed' in text
+    assert 'Invoke-WpdLauncher.ps1' in text
+    helper = (REPO_ROOT / 'src' / 'Invoke-WpdLauncher.ps1').read_text(encoding='utf-8-sig')
+    missing_manifest = helper.split('if (-not [System.IO.File]::Exists($manifestPath)) {', 1)[1].split('if (-not [System.IO.File]::Exists($logPath)) {', 1)[0]
+    assert 'exit 1' in missing_manifest
+    assert 'if (-not $collectorSucceeded) { exit 1 }' in helper
     assert ":collection_failed" in text
     failure_block = text.split(":collection_failed", 1)[1]
     assert "exit /b 1" in failure_block

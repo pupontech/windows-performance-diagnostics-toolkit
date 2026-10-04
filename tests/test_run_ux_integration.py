@@ -78,24 +78,27 @@ def test_two_launcher_runs_keep_exact_caller_receipts_and_prior_case(tmp_path):
         encoding="utf-8",
     )
     launcher = staged / "src" / "Invoke-WpdLauncher.ps1"
-    base = tmp_path / "cases"
     receipt_one = tmp_path / "run-one.json"
     receipt_two = tmp_path / "run-two.json"
-    results = []
-    for receipt in (receipt_one, receipt_two):
+
+    def invoke(receipt):
         env = os.environ.copy()
         env["WPD_RUN_RECEIPT_PATH"] = str(receipt)
-        results.append(run_ps(tmp_path, launcher, "-LaunchMode", "StandaloneCollect", env=env))
-    for result in results:
+        result = run_ps(tmp_path, launcher, "-LaunchMode", "StandaloneCollect", env=env)
         assert result.returncode == 0, result.stdout + result.stderr
+
+    invoke(receipt_one)
     first_receipt = json.loads(receipt_one.read_text(encoding="utf-8"))
     first_case = Path(first_receipt["casePath"])
+    (first_case / 'preserve-first-run.txt').write_text('First run sentinel', encoding='ascii')
     first_snapshot = {p.relative_to(first_case): p.read_bytes() for p in first_case.rglob("*") if p.is_file()}
+    invoke(receipt_two)
     second_receipt = json.loads(receipt_two.read_text(encoding="utf-8"))
     second_case = Path(second_receipt["casePath"])
     assert first_case != second_case
     assert first_case.parent == second_case.parent
-    assert first_case.parent.name == "windows-performance-diagnostics"
+    expected_base_name = 'WPD-Case' if os.name == 'nt' else 'windows-performance-diagnostics'
+    assert first_case.parent.name == expected_base_name
     assert (first_case / "diagnostic-manifest.json").read_bytes() == first_snapshot[Path("diagnostic-manifest.json")]
     assert {p.relative_to(first_case): p.read_bytes() for p in first_case.rglob("*") if p.is_file()} == first_snapshot
     assert receipt_one.is_file() and receipt_two.is_file()

@@ -8546,7 +8546,18 @@ catch {
     $verificationFailure = $_.Exception.Message
 }
 
-Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.Completion.psm1') -Force -ErrorAction Stop
+$completionModulePath = Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.Completion.psm1'
+if (-not [System.IO.File]::Exists($completionModulePath)) {
+    # Standalone copies (including WinRM staging) retain their verified legacy
+    # output path. They cannot promise the new summary/presentation without its
+    # helper, and failed integrity checks still propagate as failures.
+    Write-Warning 'Completion summary unavailable: Wpd.Completion.psm1 is absent from this standalone copy.'
+    if ($null -ne $verificationFailure -or $OpenOutputs -or -not [string]::IsNullOrWhiteSpace($CompletionEnvelopePath)) {
+        throw 'Final verification failed or requested completion presentation requires Wpd.Completion.psm1.'
+    }
+    return
+}
+Import-Module -Name $completionModulePath -Force -ErrorAction Stop
 $requiredCompletionArtifacts = @($collectedArtifacts | Where-Object { [string]$_ -match '\.json$' })
 if ($CollectSearchContext -and $requiredCompletionArtifacts -notcontains 'escalation/search-service-context.json') {
     $requiredCompletionArtifacts += 'escalation/search-service-context.json'
@@ -8587,8 +8598,9 @@ if (-not [string]::IsNullOrWhiteSpace($CompletionEnvelopePath)) {
     $completionStages = @(
         foreach ($stage in @($completion.stages)) {
             $stageReason = ''
-            if ($null -ne $stage.coverage -and -not [string]::IsNullOrWhiteSpace([string]$stage.coverage)) {
-                $stageReason = [string]$stage.coverage
+            $stageCoverage = Get-WpdIntegrationProperty -InputObject $stage -Name 'coverage'
+            if ($null -ne $stageCoverage -and -not [string]::IsNullOrWhiteSpace([string]$stageCoverage)) {
+                $stageReason = [string]$stageCoverage
             }
             elseif ([string]$stage.outcome -eq 'skipped') {
                 $stageReason = [string]$stage.status
@@ -8614,6 +8626,12 @@ if (-not [string]::IsNullOrWhiteSpace($CompletionEnvelopePath)) {
     $envelopeStream = $null
     try {
         $envelopeFullPath = [System.IO.Path]::GetFullPath($CompletionEnvelopePath)
+        $caseFullPath = [System.IO.Path]::GetFullPath($resolvedOutputDirectory)
+        $casePrefix = $caseFullPath.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
+        if ([string]::Equals($envelopeFullPath, $caseFullPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $envelopeFullPath.StartsWith($casePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Completion handoff must be outside the finalized case directory.'
+        }
         $envelopeStream = [System.IO.File]::Open($envelopeFullPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
         $envelopeBytes = [System.Text.Encoding]::UTF8.GetBytes(($completionEnvelope | ConvertTo-Json -Depth 12))
         $envelopeStream.Write($envelopeBytes, 0, $envelopeBytes.Length)

@@ -45,6 +45,34 @@ function Test-WpdSafeCompletionArtifactName {
     return $true
 }
 
+function Test-WpdSafeCompletionPhysicalPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $root = [System.IO.Path]::GetPathRoot($fullPath)
+    }
+    catch { return $false }
+    if ([string]::IsNullOrWhiteSpace($root)) { return $false }
+    $current = $root
+    try {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) { return $false }
+    }
+    catch { return $false }
+    $separatorChars = @([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $relativePath = $fullPath.Substring($root.Length)
+    foreach ($segment in $relativePath.Split([char[]]$separatorChars, [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        $current = [System.IO.Path]::Combine($current, $segment)
+        if (-not (Test-Path -LiteralPath $current -PathType Any)) { return $true }
+        try {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) { return $false }
+        }
+        catch { return $false }
+    }
+    return $true
+}
+
 function Get-WpdRunCompletion {
     [CmdletBinding()]
     param(
@@ -53,7 +81,29 @@ function Get-WpdRunCompletion {
         [int]$CollectorExitCode = 0
     )
 
-    $absoluteCase = [System.IO.Path]::GetFullPath($CaseDirectory)
+    try { $absoluteCase = [System.IO.Path]::GetFullPath($CaseDirectory) }
+    catch {
+        return [pscustomobject]@{
+            status = 'failed'
+            caseDirectory = [string]$CaseDirectory
+            reportPath = $null
+            stages = @()
+            artifacts = @()
+            missingArtifacts = @('diagnostic-manifest.json', 'report.html')
+            reasons = @('case-directory-invalid-path')
+        }
+    }
+    if (-not (Test-WpdSafeCompletionPhysicalPath -Path $absoluteCase)) {
+        return [pscustomobject]@{
+            status = 'failed'
+            caseDirectory = $absoluteCase
+            reportPath = $null
+            stages = @()
+            artifacts = @()
+            missingArtifacts = @()
+            reasons = @('case-directory-path-unsafe')
+        }
+    }
     $manifestPath = [System.IO.Path]::Combine($absoluteCase, 'diagnostic-manifest.json')
     $stages = New-Object System.Collections.ArrayList
     $artifactRows = New-Object System.Collections.ArrayList
@@ -66,7 +116,12 @@ function Get-WpdRunCompletion {
     }
     $manifestValid = $false
     $manifest = $null
-    if (-not [System.IO.File]::Exists($manifestPath)) {
+    $manifestPathSafe = Test-WpdSafeCompletionPhysicalPath -Path $manifestPath
+    if (-not $manifestPathSafe) {
+        [void]$reasons.Add('manifest-path-unsafe')
+        $hardFailure = $true
+    }
+    elseif (-not [System.IO.File]::Exists($manifestPath)) {
         [void]$missingArtifacts.Add('diagnostic-manifest.json')
         [void]$reasons.Add('manifest-missing')
     }
@@ -74,14 +129,21 @@ function Get-WpdRunCompletion {
         try {
             $manifest = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($manifestPath)) -ErrorAction Stop
             if ($null -eq $manifest -or $manifest -is [array] -or $manifest -is [string]) { throw 'Invalid manifest root.' }
-            $manifestValid = $true
+            if ([string](Get-WpdCompletionProperty -InputObject $manifest -Name 'mode') -ceq 'Collect') { $manifestValid = $true }
+            else { [void]$reasons.Add('manifest-mode-not-collect') }
         }
         catch {
             [void]$reasons.Add('manifest-malformed')
         }
     }
     $reportPath = [System.IO.Path]::Combine($absoluteCase, 'report.html')
-    if (-not [System.IO.File]::Exists($reportPath)) { $reportPath = $null }
+    $reportPathSafe = Test-WpdSafeCompletionPhysicalPath -Path $reportPath
+    if (-not $reportPathSafe) {
+        $reportPath = $null
+        [void]$reasons.Add('artifact-path-unsafe:report.html')
+        $hardFailure = $true
+    }
+    elseif (-not [System.IO.File]::Exists($reportPath)) { $reportPath = $null }
     if ($null -eq $reportPath) { [void]$missingArtifacts.Add('report.html') }
     if (-not $manifestValid) {
         $unverifiedNames = New-Object System.Collections.ArrayList
@@ -97,7 +159,11 @@ function Get-WpdRunCompletion {
             $relativePath = ([string]$name).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
             $path = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($absoluteCase, $relativePath))
             $exists = $false
-            if ($name -eq 'diagnostic-manifest.json') { $exists = [System.IO.File]::Exists($manifestPath) }
+            $pathSafe = Test-WpdSafeCompletionPhysicalPath -Path $path
+            if (-not $pathSafe) {
+                [void]$reasons.Add(('artifact-path-unsafe:{0}' -f $name))
+            }
+            elseif ($name -eq 'diagnostic-manifest.json') { $exists = $manifestPathSafe -and [System.IO.File]::Exists($manifestPath) }
             elseif ($name -eq 'report.html') { $exists = ($null -ne $reportPath) }
             else { $exists = [System.IO.File]::Exists($path) }
             if (-not $exists -and -not $missingArtifacts.Contains([string]$name)) { [void]$missingArtifacts.Add([string]$name) }
@@ -151,6 +217,12 @@ function Get-WpdRunCompletion {
         if (-not $path.StartsWith($casePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
             [void]$reasons.Add('artifact-path-outside-case')
             $hardFailure = $true
+            continue
+        }
+        if (-not (Test-WpdSafeCompletionPhysicalPath -Path $path)) {
+            [void]$reasons.Add(('artifact-path-unsafe:{0}' -f $name))
+            $hardFailure = $true
+            [void]$artifactRows.Add([pscustomobject]@{ name = [string]$name; exists = $false; hashCheckStatus = 'unsafe-path' })
             continue
         }
         $exists = [System.IO.File]::Exists($path)

@@ -543,3 +543,120 @@ def test_open_outputs_never_launches_a_gui_on_non_windows_host(tmp_path):
 
     assert result["status"] == "suppressed"
     assert result["reason"] == "non-windows-host"
+
+
+def test_plan_manifest_with_registered_outputs_fails_and_is_not_presented(tmp_path):
+    case = tmp_path / "case"
+    _valid_case(case)
+    manifest_path = case / "diagnostic-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["mode"] = "Plan"
+    for coverage in manifest["tiers"]["coverage"]:
+        coverage["status"] = "success"
+        coverage["coverage"] = "complete"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    result = run_pwsh_json(
+        tmp_path,
+        "$env:CI = 'true'; $seen = New-Object System.Collections.ArrayList; "
+        "$runner = { param($Action, $Path) [void]$seen.Add($Action); $true }.GetNewClosure(); "
+        f"$completion = Get-WpdRunCompletion -CaseDirectory {_ps_quote(case)}; "
+        "$presentation = Show-WpdRunCompletion -Completion $completion -OpenOutputs "
+        "-PresentationRunner $runner 6>&1 | Select-Object -Last 1; "
+        "[pscustomobject]@{ completion=$completion; presentation=$presentation; calls=@($seen) } "
+        "| ConvertTo-Json -Depth 20 -Compress",
+    )
+
+    assert result["completion"]["status"] == "failed"
+    assert "manifest-mode-not-collect" in result["completion"]["reasons"]
+    assert result["presentation"]["status"] == "refused"
+    assert result["calls"] == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux symlink reproduction")
+@pytest.mark.parametrize(
+    "unsafe_path",
+    ["registered-file", "nested-directory", "report", "case-directory", "ancestor"],
+)
+def test_reparse_paths_fail_closed_before_presentation(tmp_path, unsafe_path):
+    case = tmp_path / "real" / "case" if unsafe_path == "ancestor" else tmp_path / "case"
+    _valid_case(case)
+    manifest_path = case / "diagnostic-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for coverage in manifest["tiers"]["coverage"]:
+        coverage["status"] = "success"
+        coverage["coverage"] = "complete"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    call_case = case
+
+    if unsafe_path == "registered-file":
+        outside = tmp_path / "outside-findings.json"
+        outside.write_bytes((case / "findings.json").read_bytes())
+        (case / "findings.json").unlink()
+        (case / "findings.json").symlink_to(outside)
+    elif unsafe_path == "nested-directory":
+        outside = tmp_path / "outside-escalation"
+        outside.mkdir()
+        (outside / "minifilter-enumeration.json").write_bytes(
+            (case / "escalation" / "minifilter-enumeration.json").read_bytes()
+        )
+        shutil.rmtree(case / "escalation")
+        (case / "escalation").symlink_to(outside, target_is_directory=True)
+    elif unsafe_path == "report":
+        outside = tmp_path / "outside-report.html"
+        outside.write_bytes((case / "report.html").read_bytes())
+        (case / "report.html").unlink()
+        (case / "report.html").symlink_to(outside)
+    elif unsafe_path == "case-directory":
+        call_case = tmp_path / "case-link"
+        call_case.symlink_to(case, target_is_directory=True)
+    else:
+        linked_root = tmp_path / "linked-root"
+        linked_root.symlink_to(case.parent, target_is_directory=True)
+        call_case = linked_root / "case"
+
+    result = run_pwsh_json(
+        tmp_path,
+        "$env:CI = 'true'; $seen = New-Object System.Collections.ArrayList; "
+        "$runner = { param($Action, $Path) [void]$seen.Add($Action); $true }.GetNewClosure(); "
+        f"$completion = Get-WpdRunCompletion -CaseDirectory {_ps_quote(call_case)}; "
+        "$presentation = Show-WpdRunCompletion -Completion $completion -OpenOutputs "
+        "-PresentationRunner $runner 6>&1 | Select-Object -Last 1; "
+        "[pscustomobject]@{ completion=$completion; presentation=$presentation; calls=@($seen) } "
+        "| ConvertTo-Json -Depth 20 -Compress",
+    )
+
+    assert result["completion"]["status"] == "failed"
+    assert result["presentation"]["status"] == "refused"
+    assert result["calls"] == []
+
+
+def test_invalid_case_path_returns_failed_envelope_instead_of_throwing(tmp_path):
+    result = run_pwsh_json(
+        tmp_path,
+        "$invalidPath = [string][char]0; "
+        "$completion = Get-WpdRunCompletion -CaseDirectory $invalidPath; "
+        "$completion | ConvertTo-Json -Depth 20 -Compress",
+    )
+
+    assert result["status"] == "failed"
+    assert "case-directory-invalid-path" in result["reasons"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-native symlink fixture")
+def test_windows_native_symlink_artifact_fails_closed_when_available(tmp_path):
+    case = tmp_path / "case"
+    _valid_case(case)
+    outside = tmp_path / "outside-findings.json"
+    outside.write_bytes((case / "findings.json").read_bytes())
+    (case / "findings.json").unlink()
+    try:
+        (case / "findings.json").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"Windows symlink creation unavailable: {exc}")
+    result = run_pwsh_json(
+        tmp_path,
+        f"$completion = Get-WpdRunCompletion -CaseDirectory {_ps_quote(case)}; "
+        "$completion | ConvertTo-Json -Depth 20 -Compress",
+    )
+
+    assert result["status"] == "failed"

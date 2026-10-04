@@ -50,11 +50,12 @@ unregistered summary file to the packaged case.
   separate arguments. A successful receipt proves argument delivery to the test
   double; it does not prove a browser was visible.
 
-The production case leaf is `yyyyMMddTHHmmssfffZ-<32-hex run-id>`. The parent
-must align the proof harness validator to this exact production form before
-Windows acceptance; the launcher supplies exact run paths through its
-caller-owned `RunReceiptPath` parameter or `WPD_RUN_RECEIPT_PATH`, never by
-sorting the root or using a global latest-case pointer.
+The harness recognizes the production case leaf
+`yyyyMMddTHHmmssfffZ-<32-hex run-id>` and accepts valid whole-second or dotted
+fraction UTC forms with an 8+ alphanumeric/hyphen suffix for existing fixtures.
+The launcher supplies exact run paths through its caller-owned `RunReceiptPath`
+parameter or `WPD_RUN_RECEIPT_PATH`, never by sorting the root or using a global
+latest-case pointer.
 
 `WPD_POWERSHELL_EXE` selects the PowerShell child executable used by both batch
 files; it defaults to `powershell.exe` and accepts a filename or full path

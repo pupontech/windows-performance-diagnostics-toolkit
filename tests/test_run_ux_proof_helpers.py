@@ -67,6 +67,7 @@ def test_case_leaf_name_requires_a_real_utc_timestamp_and_random_suffix():
 [pscustomobject]@{
     valid = Test-WpdCaseLeafName -LeafName '20261004T123456Z-4a62ec81'
     fractional = Test-WpdCaseLeafName -LeafName '20261004T123456.123Z-a73e9c10'
+    production = Test-WpdCaseLeafName -LeafName '20261004T123456123Z-4a62ec81000000000000000000000000'
     invalidDate = Test-WpdCaseLeafName -LeafName '20261340T256199Z-4a62ec81'
     noRunId = Test-WpdCaseLeafName -LeafName '20261004T123456Z'
     tooShort = Test-WpdCaseLeafName -LeafName '20261004T123456Z-a'
@@ -76,6 +77,7 @@ def test_case_leaf_name_requires_a_real_utc_timestamp_and_random_suffix():
     assert payload == {
         "valid": True,
         "fractional": True,
+        "production": True,
         "invalidDate": False,
         "noRunId": False,
         "tooShort": False,

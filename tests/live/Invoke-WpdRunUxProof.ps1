@@ -73,7 +73,7 @@ function Test-WpdCaseLeafName {
     param([AllowEmptyString()][string]$LeafName)
 
     if ([string]::IsNullOrWhiteSpace($LeafName)) { return $false }
-    if ($LeafName -notmatch '^(?<stamp>\d{8}T\d{6}(?:\.\d{1,7})?Z)-(?<runid>[A-Za-z0-9][A-Za-z0-9-]{7,})$') {
+    if ($LeafName -notmatch '^(?<stamp>\d{8}T\d{6}(?:\d{3}|\.\d{1,7})?Z)-(?<runid>[A-Za-z0-9][A-Za-z0-9-]{7,})$') {
         return $false
     }
     try {

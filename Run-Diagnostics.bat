@@ -11,11 +11,11 @@ echo This run performs 30-second baseline sampling.
 echo Read-only Search service and minifilter snapshots are included.
 echo Allow additional time for crash-evidence copies and final export, hashing, and ZIP packaging.
 echo The collector prints live baseline sample and percentage progress.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Collect -ConfirmLocalCollection -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -CollectSearchContext -CollectMinifilters -ConfirmEscalationCollection -ZipOutput -DurationSeconds 30 -OutputDirectory "%OUTDIR%"
+echo New case folders are created beneath %OUTDIR%.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WpdLauncher.ps1" -LaunchMode StandaloneCollect
 if errorlevel 1 goto :collection_failed
-if not exist "%OUTDIR%\diagnostic-manifest.json" goto :collection_failed
 echo.
-echo Diagnostics collection complete. Output saved to %OUTDIR%
+echo Diagnostics collection complete. The exact case directory, matching log, and manifest were verified above.
 if not "%CI%"=="true" pause
 popd
 endlocal & exit /b 0
@@ -23,7 +23,7 @@ endlocal & exit /b 0
 :collection_failed
 echo.
 echo [ERROR] Diagnostics collection failed or produced no manifest.
-echo Review the console output and any files in %OUTDIR% for details.
+echo Review the exact run path and log printed above.
 if not "%CI%"=="true" pause
 popd
 endlocal & exit /b 1

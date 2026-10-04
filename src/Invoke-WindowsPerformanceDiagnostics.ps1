@@ -9,7 +9,14 @@ param(
     [ValidateRange(1, 1000)]
     [int]$MaxEventCount = 200,
 
-    [string]$OutputDirectory = $(if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'C:\WPD-Case' } else { Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics' }),
+    [string]$OutputDirectory,
+
+    # Selects the parent for a new default Collect run. Unlike OutputDirectory,
+    # this path is never itself used as the case directory in Collect mode.
+    [string]$CaseBaseDirectory,
+
+    # Optional, caller-owned exact-run receipt used by launchers and CI.
+    [string]$RunReceiptPath,
 
     [string]$InputDirectory,
 
@@ -133,6 +140,23 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:WpdOutputDirectoryWasExplicit = $PSBoundParameters.ContainsKey('OutputDirectory')
+if ($script:WpdOutputDirectoryWasExplicit -and -not [string]::IsNullOrWhiteSpace($CaseBaseDirectory)) {
+    throw 'Use either -OutputDirectory for an exact case or -CaseBaseDirectory for a run base, not both.'
+}
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.CasePath.psm1') -Force -ErrorAction Stop
+if ($script:WpdOutputDirectoryWasExplicit) {
+    $script:WpdCaseBaseDirectory = $OutputDirectory
+}
+elseif (-not [string]::IsNullOrWhiteSpace($CaseBaseDirectory)) {
+    $script:WpdCaseBaseDirectory = $CaseBaseDirectory
+}
+else {
+    $script:WpdCaseBaseDirectory = Get-WpdDefaultCaseBaseDirectory
+}
+if (-not $script:WpdOutputDirectoryWasExplicit) {
+    $OutputDirectory = $script:WpdCaseBaseDirectory
+}
 # Single source of truth for the version is the VERSION file at the repo/bundle
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
@@ -6539,20 +6563,63 @@ if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw 'Collect mode is supported only on Windows. Use -Mode Plan for a non-collecting safety plan.'
 }
 
-# Consent gates passed: only now may the output directory be created, so a
-# consent-refusing Collect leaves no side effects behind.
+# Consent and platform gates passed. A default Collect gets a newly reserved
+# child; an explicit OutputDirectory remains the exact legacy case directory.
 try {
-    if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
-        throw 'OutputDirectory is a reparse point and is not a safe case root.'
+    if (-not $script:WpdOutputDirectoryWasExplicit) {
+        $resolvedOutputDirectory = New-WpdCaseDirectory -BaseDirectory $resolvedOutputDirectory
+        $OutputDirectory = $resolvedOutputDirectory
     }
-    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
-    if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
-        throw 'OutputDirectory is a reparse point and is not a safe case root.'
+    else {
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
+        New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
     }
 }
 catch {
     throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
 }
+
+$caseLeaf = [System.IO.Path]::GetFileName($resolvedOutputDirectory.TrimEnd([char]92, [char]47))
+$caseNameMatch = [regex]::Match($caseLeaf, '^(?<stamp>\d{8}T\d{9}Z)-(?<runId>[A-Za-z0-9-]{1,64})$')
+$script:WpdRunId = if ($caseNameMatch.Success) { $caseNameMatch.Groups['runId'].Value } else { [Guid]::NewGuid().ToString('N') }
+if (-not [string]::IsNullOrWhiteSpace($RunReceiptPath)) {
+    if ($script:WpdOutputDirectoryWasExplicit -or -not $caseNameMatch.Success) {
+        throw 'RunReceiptPath is supported only for an automatically reserved run directory.'
+    }
+    $receiptFullPath = [System.IO.Path]::GetFullPath($RunReceiptPath)
+    if ([System.IO.Directory]::Exists($receiptFullPath)) {
+        throw "RunReceiptPath is a directory: $receiptFullPath"
+    }
+    $receipt = [ordered]@{
+        schemaVersion = '1'
+        casePath = $resolvedOutputDirectory
+        runId = $script:WpdRunId
+    }
+    $receiptStream = $null
+    try {
+        $receiptStream = [System.IO.File]::Open($receiptFullPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $receiptBytes = [System.Text.Encoding]::UTF8.GetBytes(($receipt | ConvertTo-Json -Compress))
+        $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
+        $receiptStream.Flush()
+    }
+    finally {
+        if ($null -ne $receiptStream) { $receiptStream.Dispose() }
+    }
+}
+
+$script:WpdRunTranscriptStarted = $false
+$transcriptPath = Join-Path -Path $resolvedOutputDirectory -ChildPath ('diagnostics-run-' + $script:WpdRunId + '.log')
+if ([System.IO.File]::Exists($transcriptPath)) {
+    throw "Refusing to overwrite an existing run log: $transcriptPath"
+}
+Start-Transcript -LiteralPath $transcriptPath -ErrorAction Stop | Out-Null
+$script:WpdRunTranscriptStarted = $true
+Write-Output "Collection case directory: $resolvedOutputDirectory"
 
 $script:collectionErrors = New-Object System.Collections.ArrayList
 
@@ -8401,8 +8468,11 @@ if ($script:WpdTieredEngaged) {
 }
 
 Write-Output "Collection complete. Manifest written to $collectionManifestPath"
-
 if ($ZipOutput) {
     $collectionManifest = Add-CasePackageBlock -CollectionManifest $collectionManifest -OutputDirectory $resolvedOutputDirectory -ArtifactNames @($collectedArtifacts)
     Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+}
+if ($script:WpdRunTranscriptStarted) {
+    Stop-Transcript | Out-Null
+    $script:WpdRunTranscriptStarted = $false
 }

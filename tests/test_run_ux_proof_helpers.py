@@ -138,6 +138,10 @@ def test_live_harness_refuses_non_windows_before_touching_proof_paths(tmp_path):
     if not shutil.which(powershell):
         pytest.skip(f"{powershell} is required for the live-harness guard")
     root = tmp_path / "must-not-be-created"
+    baseline_receipt = tmp_path / "baseline.json"
+    presentation_receipt = tmp_path / "presentation.json"
+    subprocess_env = os.environ.copy()
+    subprocess_env["OS"] = "Linux"
     result = subprocess.run(
         [
             powershell,
@@ -150,7 +154,7 @@ def test_live_harness_refuses_non_windows_before_touching_proof_paths(tmp_path):
             "-SecondCaseDirectory",
             str(root / "20261004T123457Z-a73e9c10"),
             "-BaselineReceiptPath",
-            str(tmp_path / "baseline.json"),
+            str(baseline_receipt),
             "-FirstRunLogPath",
             str(root / "first" / "diagnostics-run.log"),
             "-SecondRunLogPath",
@@ -158,17 +162,20 @@ def test_live_harness_refuses_non_windows_before_touching_proof_paths(tmp_path):
             "-ToolkitScriptPath",
             str(root / "collector.ps1"),
             "-PresentationArgvReceiptPath",
-            str(tmp_path / "presentation.json"),
+            str(presentation_receipt),
             "-RootDirectory",
             str(root),
         ],
         capture_output=True,
         check=False,
         text=True,
+        env=subprocess_env,
     )
     assert result.returncode != 0
     assert "real-Windows proof harness" in (result.stdout + result.stderr)
     assert not root.exists(), "a Linux proof attempt must not create a Windows case root"
+    assert not baseline_receipt.exists(), "the rejected proof attempt must not create a baseline receipt"
+    assert not presentation_receipt.exists(), "the rejected proof attempt must not create a presentation receipt"
 
 
 def test_presentation_receipt_rejects_failed_runner_and_nonzero_exit(tmp_path):

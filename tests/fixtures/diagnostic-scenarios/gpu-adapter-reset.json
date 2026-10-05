@@ -1,0 +1,17 @@
+{
+  "id": "gpu-adapter-reset",
+  "title": "GPU adapter reset with no engine counters",
+  "driver": {
+    "kind": "gpu",
+    "args": {
+      "rows": [
+        {
+          "Adapter": "NVIDIA GeForce RTX 3060",
+          "DriverVersion": "31.0.15.3699",
+          "Event": "adapter-reset"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

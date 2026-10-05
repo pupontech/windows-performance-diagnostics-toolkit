@@ -9,7 +9,23 @@ param(
     [ValidateRange(1, 1000)]
     [int]$MaxEventCount = 200,
 
-    [string]$OutputDirectory = (Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics'),
+    [string]$OutputDirectory,
+
+    # Selects the parent for a new default Collect run. Unlike OutputDirectory,
+    # this path is never itself used as the case directory in Collect mode.
+    [string]$CaseBaseDirectory,
+
+    # Optional, caller-owned exact-run receipt used by launchers and CI.
+    [string]$RunReceiptPath,
+
+    # Optional caller-owned completion handoff outside the packaged case.
+    [string]$CompletionEnvelopePath,
+
+    # Batch entry points request local output presentation after verification.
+    [switch]$OpenOutputs,
+
+    # Test-only presentation seam; production callers should omit this.
+    [scriptblock]$PresentationRunner,
 
     [string]$InputDirectory,
 
@@ -46,8 +62,57 @@ param(
 
     [string]$SymptomContext,
 
-    [ValidateSet('baseline', 'cpu-heavy', 'memory-pressure', 'storage-io', 'network-io', 'boot-slowdown', 'application-freeze')]
+    # Functional presets: the 13 canonical names from config/diagnostic-presets.json
+    # plus the 3 deprecated aliases that existing manifests and remote forwarding
+    # still use (baseline -> general, network-io -> network,
+    # application-freeze -> ui-hang). The alias map lives in the configuration
+    # file, not here, and the manifest records both the requested and the
+    # effective name.
+    [ValidateSet(
+        'general', 'cpu-heavy', 'memory-pressure', 'memory-leak', 'storage-io',
+        'network', 'gpu', 'ui-hang', 'ui-stutter', 'boot-slowdown', 'audio-glitch',
+        'power', 'intermittent',
+        'baseline', 'network-io', 'application-freeze'
+    )]
     [string]$Preset,
+
+    # ---- Tiered architecture (v2) --------------------------------------
+    # Tier 0 static inventory is collected once per run and served from a session
+    # cache; Tier 1 counters sample at or above the 1 s floor; Tier 2 is the WPR
+    # recording; Tier 3 is opt-in escalation. None of these switches changes a
+    # default: a run without a preset behaves exactly as v1.0 did.
+    [switch]$Repro,
+
+    [switch]$FlightRecorder,
+
+    [ValidateSet('Standard', 'Redacted', 'Full')]
+    [string]$PrivacyLevel = 'Standard',
+
+    [switch]$ConfirmFullPrivacy,
+
+    # 0 = take the preset's Tier 1 cadence; any explicit value must be >= 1.
+    [ValidateRange(0, 3600)]
+    [int]$Tier1IntervalSeconds = 0,
+
+    [switch]$RefreshInventory,
+
+    # WPR file mode records to an unbounded file, so it is opt-in and never a
+    # default; -AcceptUnboundedFileMode also accepts the free-space risk.
+    [switch]$AllowWprFileMode,
+
+    [switch]$AcceptUnboundedFileMode,
+
+    [switch]$CaptureWpaTables,
+
+    [switch]$CollectWaitChains,
+
+    [switch]$CollectPoolEscalation,
+
+    [switch]$CollectSearchContext,
+
+    [switch]$CollectMinifilters,
+
+    [switch]$ConfirmEscalationCollection,
 
     # ---- Incident capture mode (v1.0) -----------------------------------
     # Everything below shares ONE capture window: WPR, process/commit samples,
@@ -84,11 +149,39 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:WpdRunTranscriptStarted = $false
+$script:WpdOutputDirectoryWasExplicit = $PSBoundParameters.ContainsKey('OutputDirectory')
+if ($script:WpdOutputDirectoryWasExplicit -and -not [string]::IsNullOrWhiteSpace($CaseBaseDirectory)) {
+    throw 'Use either -OutputDirectory for an exact case or -CaseBaseDirectory for a run base, not both.'
+}
+$script:WpdCasePathModulePath = Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.CasePath.psm1'
+$script:WpdCasePathModuleAvailable = [System.IO.File]::Exists($script:WpdCasePathModulePath)
+if ($script:WpdCasePathModuleAvailable) {
+    Import-Module -Name $script:WpdCasePathModulePath -Force -ErrorAction Stop
+}
+if ($script:WpdOutputDirectoryWasExplicit) {
+    $script:WpdCaseBaseDirectory = $OutputDirectory
+}
+elseif (-not [string]::IsNullOrWhiteSpace($CaseBaseDirectory)) {
+    $script:WpdCaseBaseDirectory = $CaseBaseDirectory
+}
+elseif ($script:WpdCasePathModuleAvailable) {
+    $script:WpdCaseBaseDirectory = Get-WpdDefaultCaseBaseDirectory
+}
+elseif ($null -ne $env:SystemRoot -or [Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+    $script:WpdCaseBaseDirectory = 'C:\WPD-Case'
+}
+else {
+    $script:WpdCaseBaseDirectory = [System.IO.Path]::GetFullPath((Join-Path -Path (Get-Location).Path -ChildPath 'windows-performance-diagnostics'))
+}
+if (-not $script:WpdOutputDirectoryWasExplicit) {
+    $OutputDirectory = $script:WpdCaseBaseDirectory
+}
 # Single source of truth for the version is the VERSION file at the repo/bundle
 # root; the constant below is only a fallback for standalone copies of the
 # script (e.g. CI staging copies) - test_version_file_matches_script_fallback
 # keeps the two in sync so drift fails CI.
-$script:ScriptVersion = '1.0.0'
+$script:ScriptVersion = '2.0.0'
 try {
     $script:ScriptVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -ErrorAction Stop | Select-Object -First 1).Trim()
 }
@@ -138,6 +231,39 @@ function Add-CollectionErrorText {
     })
 }
 
+function Write-CaseFileAtomically {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [AllowNull()]
+        [string]$Content
+    )
+
+    $fullPath = Assert-CaseFileDestinationSafe -Path $Path
+    $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+    $parentDirectory = Split-Path -Parent $fullPath
+
+    if ($null -eq $Content) { $Content = '' }
+    $contentBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Content)
+    $temporaryPath = Join-Path -Path $parentDirectory -ChildPath ('.' + [System.IO.Path]::GetFileName($fullPath) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $temporaryStream = $null
+    try {
+        $temporaryStream = [System.IO.File]::Open($temporaryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $temporaryStream.Write($contentBytes, 0, $contentBytes.Length)
+        $temporaryStream.Flush()
+        $temporaryStream.Dispose()
+        $temporaryStream = $null
+
+        $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $temporaryPath -DestinationPath $fullPath
+        $temporaryPath = $null
+    }
+    finally {
+        if ($null -ne $temporaryStream) { $temporaryStream.Dispose() }
+        if ($null -ne $temporaryPath -and [System.IO.File]::Exists($temporaryPath)) { [System.IO.File]::Delete($temporaryPath) }
+    }
+}
+
 function Write-JsonFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -149,10 +275,21 @@ function Write-JsonFile {
 
     # Explicit UTF-8 WITHOUT BOM: Windows PowerShell 5.1's Set-Content -Encoding
     # UTF8 writes a BOM while pwsh 7 does not, so manifests would differ by
-    # engine. WriteAllText with UTF8Encoding($false) makes the JSON contract
-    # byte-identical on both.
+    # engine.
     $json = $InputObject | ConvertTo-Json -Depth 8
-    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-CaseFileAtomically -Path $Path -Content $json
+}
+
+function Write-CaseCsvFile {
+    param(
+        [AllowNull()][object[]]$Rows,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $csvLines = @($Rows | ConvertTo-Csv -NoTypeInformation)
+    $csv = $csvLines -join [Environment]::NewLine
+    if ($csv.Length -gt 0) { $csv += [Environment]::NewLine }
+    Write-CaseFileAtomically -Path $Path -Content $csv
 }
 
 function Get-UtcTimestamp {
@@ -277,6 +414,285 @@ function Test-CasePathContained {
         $rootPrefix = $rootFull.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
     }
     return $candidateFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-CasePathHasReparsePoint {
+    <#
+      Refuses a file or any parent directory that is a junction, symlink or
+      other reparse point. Lexical containment alone is insufficient because a
+      path under the case directory can resolve outside it at read time.
+      Attribute-read failures are treated as unsafe.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Candidate
+    )
+
+    try {
+        $rootFull = [System.IO.Path]::GetFullPath($Root)
+        $candidateFull = [System.IO.Path]::GetFullPath($Candidate)
+        $rootRoot = [System.IO.Path]::GetPathRoot($rootFull)
+        if ($rootFull -eq $rootRoot) { $rootPrefix = $rootFull }
+        else { $rootPrefix = $rootFull.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar }
+        if ($candidateFull -ne $rootFull -and -not $candidateFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+
+        $current = $candidateFull
+        while ($true) {
+            try {
+                $attributes = [System.IO.File]::GetAttributes($current)
+                if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            }
+            catch {
+                # A missing final destination is safe to create; attribute
+                # failures for an existing path are not safe to read or write.
+                if ($current -eq $rootFull -or [System.IO.File]::Exists($current) -or [System.IO.Directory]::Exists($current)) { return $true }
+            }
+            if ($current -eq $rootFull) { break }
+            $parent = [System.IO.Directory]::GetParent($current)
+            if ($null -eq $parent) { return $true }
+            $current = [System.IO.Path]::GetFullPath($parent.FullName)
+            if (-not $current.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        return $false
+    }
+    catch {
+        return $true
+    }
+}
+
+function Get-CaseFileLinkCount {
+    <#
+      Return the filesystem link count for a case artifact. A copied artifact
+      should have exactly one link; rejecting a higher count prevents a hardlink
+      under the case directory from exposing or overwriting an outside file.
+      -1 means identity could not be established and callers must fail closed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (-not [System.IO.File]::Exists($Path)) { return 0 }
+    $runningOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+    if (-not $runningOnWindows) {
+        try {
+            $statCommand = Get-Command stat -ErrorAction Stop
+            $rawCount = & $statCommand.Source -c '%h' -- $Path 2>$null
+            [int64]$linkCount = 0
+            if ([int64]::TryParse(([string]$rawCount).Trim(), [ref]$linkCount)) { return $linkCount }
+        }
+        catch { }
+        return -1
+    }
+
+    try {
+        try { return [WpdFileIdentityNative]::GetLinkCount($Path) }
+        catch { }
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class WpdFileIdentityNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle fileHandle,
+        out BY_HANDLE_FILE_INFORMATION information);
+
+    public static long GetLinkCount(string path)
+    {
+        const uint FILE_READ_ATTRIBUTES = 0x00000080;
+        const uint FILE_SHARE_READ = 0x00000001;
+        const uint FILE_SHARE_WRITE = 0x00000002;
+        const uint FILE_SHARE_DELETE = 0x00000004;
+        const uint OPEN_EXISTING = 3;
+        const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        using (SafeFileHandle handle = CreateFile(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero))
+        {
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(handle, out information)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return information.NumberOfLinks;
+        }
+    }
+}
+'@ -ErrorAction Stop
+        return [WpdFileIdentityNative]::GetLinkCount($Path)
+    }
+    catch {
+        return -1
+    }
+}
+
+function Assert-CaseFileDestinationSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+    if (Test-CasePathHasReparsePoint -Root $pathRoot -Candidate $fullPath) {
+        throw "File destination contains a reparse point: $fullPath"
+    }
+    if ([System.IO.Directory]::Exists($fullPath)) {
+        throw "File destination is a directory: $fullPath"
+    }
+    $linkCount = Get-CaseFileLinkCount -Path $fullPath
+    if ($linkCount -lt 0 -or $linkCount -gt 1) {
+        throw "File destination identity is unsafe: $fullPath"
+    }
+    $parentDirectory = Split-Path -Parent $fullPath
+    if (-not [System.IO.Directory]::Exists($parentDirectory)) {
+        throw "File destination directory does not exist: $parentDirectory"
+    }
+    return $fullPath
+}
+
+function Move-CaseTemporaryFileIntoPlace {
+    param(
+        [Parameter(Mandatory = $true)][string]$TemporaryPath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+
+    $temporaryFull = Assert-CaseFileDestinationSafe -Path $TemporaryPath
+    $destinationFull = Assert-CaseFileDestinationSafe -Path $DestinationPath
+    if (-not [System.IO.File]::Exists($temporaryFull)) {
+        throw "Temporary file does not exist: $temporaryFull"
+    }
+    if ([System.IO.File]::Exists($destinationFull)) {
+        $destinationLinkCount = Get-CaseFileLinkCount -Path $destinationFull
+        if ($destinationLinkCount -ne 1) {
+            throw "File destination identity is unsafe: $destinationFull"
+        }
+        [System.IO.File]::Delete($destinationFull)
+        [System.IO.File]::Move($temporaryFull, $destinationFull)
+    }
+    else {
+        [System.IO.File]::Move($temporaryFull, $destinationFull)
+    }
+    return $destinationFull
+}
+
+function Test-CasePathIsNetworkShare {
+    param(
+        [AllowNull()][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return $Path.StartsWith('\\', [System.StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith('//', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Copy-CaseFileBounded {
+    <#
+      Copy a file without following unsafe case paths or reading past the
+      source length observed at the start. A size change aborts the copy, so a
+      growing log/dump is never silently truncated or copied without its cap.
+      The destination is written to a unique file and placed only after a final
+      identity check; an existing single-link file is replaced without following
+      a hardlink target.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [int64]$MaxBytes
+    )
+
+    if ($MaxBytes -lt 0) { throw 'Bounded copy maximum cannot be negative.' }
+    $sourceFull = [System.IO.Path]::GetFullPath($SourcePath)
+    $sourceRoot = [System.IO.Path]::GetPathRoot($sourceFull)
+    if (Test-CasePathHasReparsePoint -Root $sourceRoot -Candidate $sourceFull) {
+        throw "Source path contains a reparse point: $sourceFull"
+    }
+    if (-not [System.IO.File]::Exists($sourceFull)) {
+        throw "Source file does not exist: $sourceFull"
+    }
+    $sourceInfo = [System.IO.FileInfo]::new($sourceFull)
+    $sourceLength = $sourceInfo.Length
+    if ($sourceLength -gt $MaxBytes) {
+        throw "Source file exceeds bounded copy size of $MaxBytes bytes: $sourceFull"
+    }
+    $copyOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+    $destinationFull = Assert-CaseFileDestinationSafe -Path $DestinationPath
+    $destinationDirectory = Split-Path -Parent $destinationFull
+
+    $temporaryPath = Join-Path -Path $destinationDirectory -ChildPath ('.' + [System.IO.Path]::GetFileName($destinationFull) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $sourceStream = $null
+    $temporaryStream = $null
+    try {
+        if ($copyOnWindows) {
+            $sourceLinkCount = Get-CaseFileLinkCount -Path $sourceFull
+            if ($sourceLinkCount -ne 1) { throw "Source file identity is unsafe: $sourceFull" }
+            $sourceStream = [System.IO.File]::OpenRead($sourceFull)
+        }
+        else {
+            $sourceStream = [System.IO.File]::OpenRead($sourceFull)
+        }
+        $temporaryStream = [System.IO.File]::Open($temporaryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $buffer = [byte[]]::new(65536)
+        $bytesCopied = 0L
+        while ($bytesCopied -lt $sourceLength) {
+            $remainingBytes = $sourceLength - $bytesCopied
+            $readCount = [int][Math]::Min([int64]$buffer.Length, $remainingBytes)
+            $readCount = $sourceStream.Read($buffer, 0, $readCount)
+            if ($readCount -le 0) { throw "Source changed while copying: $sourceFull" }
+            $temporaryStream.Write($buffer, 0, $readCount)
+            $bytesCopied += $readCount
+        }
+        $latestLength = ([System.IO.FileInfo]::new($sourceFull)).Length
+        if ($latestLength -ne $sourceLength -or $bytesCopied -ne $sourceLength) {
+            throw "Source changed while copying: $sourceFull"
+        }
+        $temporaryStream.Flush()
+        $temporaryStream.Dispose()
+        $temporaryStream = $null
+        $sourceStream.Dispose()
+        $sourceStream = $null
+
+        $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $temporaryPath -DestinationPath $destinationFull
+        $temporaryPath = $null
+        return $bytesCopied
+    }
+    finally {
+        if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+        if ($null -ne $temporaryStream) { $temporaryStream.Dispose() }
+        if ($null -ne $temporaryPath -and [System.IO.File]::Exists($temporaryPath)) { [System.IO.File]::Delete($temporaryPath) }
+    }
 }
 
 function Invoke-CasePackageVerification {
@@ -428,7 +844,8 @@ function Invoke-CasePackageVerification {
             foreach ($innerArtifact in $innerArtifacts) {
                 $innerName = [string](Get-CaseJsonProperty -InputObject $innerArtifact -Name 'Name')
                 if (-not [string]::IsNullOrWhiteSpace($innerName)) {
-                    $innerByName[$innerName.ToUpperInvariant()] = $innerArtifact
+                    $normalizedInnerName = Get-ValidatedRemoteArtifactName -Name $innerName
+                    $innerByName[$normalizedInnerName.ToUpperInvariant()] = $innerArtifact
                 }
             }
             foreach ($outerName in $outerArtifactsByName.Keys) {
@@ -703,45 +1120,100 @@ function New-CasePackage {
         [string]$LeafName
     )
 
-    $packageStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
-    $packagePath = Join-Path -Path $DestinationDirectory -ChildPath "$LeafName-$packageStamp.zip"
-    if (Test-Path -LiteralPath $packagePath) {
-        throw "Case package already exists: $packagePath"
+    $directoryFull = [System.IO.Path]::GetFullPath($Directory)
+    $destinationDirectoryFull = [System.IO.Path]::GetFullPath($DestinationDirectory)
+    if (-not [System.IO.Directory]::Exists($directoryFull)) {
+        throw "Case package source directory does not exist: $directoryFull"
     }
+    if (-not [System.IO.Directory]::Exists($destinationDirectoryFull)) {
+        throw "Case package destination directory does not exist: $destinationDirectoryFull"
+    }
+    $pathRoot = [System.IO.Path]::GetPathRoot($directoryFull)
+    if (Test-CasePathHasReparsePoint -Root $pathRoot -Candidate $directoryFull) {
+        throw "Case package source directory contains a reparse point: $directoryFull"
+    }
+    $destinationRoot = [System.IO.Path]::GetPathRoot($destinationDirectoryFull)
+    if (Test-CasePathHasReparsePoint -Root $destinationRoot -Candidate $destinationDirectoryFull) {
+        throw "Case package destination directory contains a reparse point: $destinationDirectoryFull"
+    }
+    if ([string]::IsNullOrWhiteSpace($LeafName) -or [System.IO.Path]::GetFileName($LeafName) -ne $LeafName) {
+        throw "Case package leaf name must be a single safe file name: $LeafName"
+    }
+
+    $directoryPrefix = $directoryFull
+    if (-not $directoryPrefix.EndsWith([string][System.IO.Path]::DirectorySeparatorChar)) {
+        $directoryPrefix += [System.IO.Path]::DirectorySeparatorChar
+    }
+    $validatedEntries = @()
+    foreach ($relativeName in @($RelativeNames)) {
+        $relativeText = [string]$relativeName
+        if ([string]::IsNullOrWhiteSpace($relativeText) -or [System.IO.Path]::IsPathRooted($relativeText) -or $relativeText -match '(^|[\\/])\.\.?([\\/]|$)') {
+            throw "Case package entry is not a safe relative path: $relativeText"
+        }
+        $relativeForPath = $relativeText.Replace('\', [string][System.IO.Path]::DirectorySeparatorChar).Replace('/', [string][System.IO.Path]::DirectorySeparatorChar)
+        $sourceFile = [System.IO.Path]::GetFullPath((Join-Path -Path $directoryFull -ChildPath $relativeForPath))
+        if (-not $sourceFile.StartsWith($directoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Case package entry escapes its source directory: $relativeText"
+        }
+        if (-not [System.IO.File]::Exists($sourceFile)) {
+            continue
+        }
+        if (Test-CasePathHasReparsePoint -Root $pathRoot -Candidate $sourceFile) {
+            throw "Case package source is a reparse point: $relativeText"
+        }
+        $sourceInfo = [System.IO.FileInfo]::new($sourceFile)
+        if ((Get-CaseFileLinkCount -Path $sourceFile) -ne 1) {
+            throw "Case package source has unsafe file identity: $relativeText"
+        }
+        $validatedEntries += [pscustomobject]@{
+            RelativeName = $relativeText.Replace('\', '/')
+            SourcePath = $sourceFile
+            Length = $sourceInfo.Length
+        }
+    }
+
+    $packageStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
+    $packagePath = Join-Path -Path $destinationDirectoryFull -ChildPath "$LeafName-$packageStamp.zip"
+    $packagePath = Assert-CaseFileDestinationSafe -Path $packagePath
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-    $packageFileStream = [System.IO.File]::Open($packagePath, [System.IO.FileMode]::Create)
+    $packageFileStream = $null
+    $packageArchive = $null
+    $packageSucceeded = $false
     try {
+        $packageFileStream = [System.IO.File]::Open($packagePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
         $packageArchive = New-Object System.IO.Compression.ZipArchive($packageFileStream, [System.IO.Compression.ZipArchiveMode]::Create)
-        try {
-            foreach ($relativeName in $RelativeNames) {
-                $sourceFile = Join-Path -Path $Directory -ChildPath $relativeName
-                if (-not (Test-Path -LiteralPath $sourceFile)) {
-                    continue
+        foreach ($validatedEntry in $validatedEntries) {
+            $entry = $packageArchive.CreateEntry($validatedEntry.RelativeName, [System.IO.Compression.CompressionLevel]::Optimal)
+            $entryStream = $entry.Open()
+            $inputStream = $null
+            try {
+                $copyOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+                if ($copyOnWindows) {
+                    $inputStream = [System.IO.File]::OpenRead($validatedEntry.SourcePath)
                 }
-                $entry = $packageArchive.CreateEntry($relativeName.Replace('\', '/'), [System.IO.Compression.CompressionLevel]::Optimal)
-                $entryStream = $entry.Open()
-                try {
-                    $inputStream = [System.IO.File]::OpenRead($sourceFile)
-                    try {
-                        $inputStream.CopyTo($entryStream)
-                    }
-                    finally {
-                        $inputStream.Dispose()
-                    }
+                else {
+                    $inputStream = [System.IO.File]::OpenRead($validatedEntry.SourcePath)
                 }
-                finally {
-                    $entryStream.Dispose()
+                $inputStream.CopyTo($entryStream)
+                if (([System.IO.FileInfo]::new($validatedEntry.SourcePath)).Length -ne $validatedEntry.Length) {
+                    throw "Case package source changed while reading: $($validatedEntry.RelativeName)"
                 }
             }
+            finally {
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+                $entryStream.Dispose()
+            }
         }
-        finally {
-            $packageArchive.Dispose()
-        }
+        $packageSucceeded = $true
     }
     finally {
-        $packageFileStream.Dispose()
+        if ($null -ne $packageArchive) { $packageArchive.Dispose() }
+        if ($null -ne $packageFileStream) { $packageFileStream.Dispose() }
+        if (-not $packageSucceeded -and [System.IO.File]::Exists($packagePath)) {
+            try { [System.IO.File]::Delete($packagePath) } catch { }
+        }
     }
 
     return $packagePath
@@ -1566,51 +2038,632 @@ function Test-CaptureWindowCoverage {
     }
 }
 
+function ConvertFrom-ServicingLogLines {
+    <#
+      Parse bounded text evidence without retaining the raw log in the analysis
+      artifact. CBS/DISM logs use several failure grammars, so retain normalized
+      signatures, counts and line ranges rather than trying to assign a cause.
+      The original copied log remains the evidence a technician can open.
+    #>
+    param(
+        [AllowNull()][object[]]$Lines,
+        [Parameter(Mandatory = $true)][string]$SourceName,
+        [int]$StartingLineNumber = 1
+    )
+
+    $lineCount = 0
+    $matchedLineCount = 0
+    $signatureMap = @{}
+    $signatureOrder = New-Object System.Collections.ArrayList
+    $addSignature = {
+        param(
+            [string]$Signature,
+            [string]$Kind,
+            [int]$LineNumber
+        )
+        if (-not $signatureMap.ContainsKey($Signature)) {
+            $signatureMap[$Signature] = [ordered]@{
+                signature = $Signature
+                kind = $Kind
+                count = 0
+                firstLineNumber = $LineNumber
+                lastLineNumber = $LineNumber
+            }
+            [void]$signatureOrder.Add($Signature)
+        }
+        $row = $signatureMap[$Signature]
+        $row.count = [int]$row.count + 1
+        if ($LineNumber -lt [int]$row.firstLineNumber) { $row.firstLineNumber = $LineNumber }
+        if ($LineNumber -gt [int]$row.lastLineNumber) { $row.lastLineNumber = $LineNumber }
+    }
+
+    $lineItems = if ($null -ne $Lines) { @($Lines) } else { @() }
+    foreach ($line in $lineItems) {
+        if ($null -eq $line) { continue }
+        $lineCount++
+        $lineNumber = $StartingLineNumber + $lineCount - 1
+        if ($line -is [string]) {
+            $text = [string]$line
+        }
+        else {
+            $text = Get-SafeObjectProperty -InputObject $line -Name 'Line'
+            if ($null -eq $text) { $text = [string]$line }
+        }
+
+        $lineSignatures = @{}
+        $cbsMatches = [regex]::Matches(
+            [string]$text,
+            '\bCBS_E_[A-Za-z0-9_]+\b',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        foreach ($match in $cbsMatches) {
+            $signature = $match.Value.ToUpperInvariant()
+            if (-not $lineSignatures.ContainsKey($signature)) {
+                $lineSignatures[$signature] = $true
+                & $addSignature $signature 'cbs-error' $lineNumber
+            }
+        }
+
+        $win32Matches = [regex]::Matches(
+            [string]$text,
+            '\bERROR_[A-Za-z0-9_]+\b',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        $ignoredSuccessStatus = $false
+        foreach ($match in $win32Matches) {
+            $signature = $match.Value.ToUpperInvariant()
+            if ($signature -in @('ERROR_SUCCESS', 'ERROR_SUCCESS_REBOOT_REQUIRED')) {
+                $ignoredSuccessStatus = $true
+                continue
+            }
+            if (-not $lineSignatures.ContainsKey($signature)) {
+                $lineSignatures[$signature] = $true
+                & $addSignature $signature 'win32-error' $lineNumber
+            }
+        }
+
+        $hasFailureContext = [string]$text -match '(?i)\b(error|failed|failure|fatal|hresult|hr|return\s+code|exit\s+code)\b'
+        if ($hasFailureContext) {
+            $hresultMatches = [regex]::Matches(
+                [string]$text,
+                '(?<![0-9A-Za-z])0x[0-9A-Fa-f]{8,}(?![0-9A-Za-z])'
+            )
+            foreach ($match in $hresultMatches) {
+                $rawHex = [string]$match.Value
+                $signature = '0x' + $rawHex.Substring(2).ToUpperInvariant()
+                if ($signature -in @('0x00000000', '0x00000BC2')) {
+                    $ignoredSuccessStatus = $true
+                    continue
+                }
+                if (-not $lineSignatures.ContainsKey($signature)) {
+                    $lineSignatures[$signature] = $true
+                    & $addSignature $signature 'hresult' $lineNumber
+                }
+            }
+        }
+
+        if ($lineSignatures.Count -eq 0 -and -not $ignoredSuccessStatus -and [string]$text -match '(?i)\b(error|failed|failure|fatal)\b') {
+            $lineSignatures['generic-error'] = $true
+            & $addSignature 'generic-error' 'generic-error' $lineNumber
+        }
+        if ($lineSignatures.Count -gt 0) { $matchedLineCount++ }
+    }
+
+    $signatureRows = @()
+    foreach ($signature in @($signatureOrder)) {
+        $row = $signatureMap[$signature]
+        $signatureRows += [pscustomobject]@{
+            signature = $row.signature
+            kind = $row.kind
+            count = $row.count
+            firstLineNumber = $row.firstLineNumber
+            lastLineNumber = $row.lastLineNumber
+        }
+    }
+
+    return [ordered]@{
+        sourceName = $SourceName
+        status = 'completed'
+        lineCount = $lineCount
+        matchedLineCount = $matchedLineCount
+        signatures = @($signatureRows)
+    }
+}
+
+function Get-ServicingLogAnalysis {
+    <#
+      Read copied boot/servicing logs into a bounded byte window, then parse
+      that window in small chunks. The collection stage already caps each copied
+      file; this second bound prevents an accidentally reused case folder or
+      future caller from analyzing an unbounded or concurrently growing file.
+      Only aggregate signatures leave this function - raw lines stay in the
+      copied log artifact.
+    #>
+    param(
+        [AllowNull()][object[]]$SourceEntries,
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [ValidateRange(1, 1073741824)][int64]$MaxScanBytes = 100MB
+    )
+
+    $logs = @()
+    $scannedLogCount = 0
+    $failedLogCount = 0
+    $truncatedLogCount = 0
+    $unavailableLogCount = 0
+    $rootPath = $null
+    $runningOnWindows = ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+    try { $rootPath = [System.IO.Path]::GetFullPath($OutputDirectory) } catch { $rootPath = $null }
+
+    foreach ($entry in $(if ($null -ne $SourceEntries) { @($SourceEntries) } else { @() })) {
+        if ($null -eq $entry) { continue }
+        $copied = [bool](Get-SafeObjectProperty -InputObject $entry -Name 'copied')
+        $copiedTo = [string](Get-SafeObjectProperty -InputObject $entry -Name 'copiedTo')
+        if (-not $copied) { $unavailableLogCount++ }
+        $record = [ordered]@{
+            name = [string](Get-SafeObjectProperty -InputObject $entry -Name 'name')
+            artifact = if ([string]::IsNullOrWhiteSpace($copiedTo)) { $null } else { $copiedTo.Replace('\', '/') }
+            found = [bool](Get-SafeObjectProperty -InputObject $entry -Name 'found')
+            copied = $copied
+            sizeBytes = Get-SafeObjectProperty -InputObject $entry -Name 'sizeBytes'
+            scanStatus = 'not-copied'
+            lineCount = 0
+            matchedLineCount = 0
+            bytesScanned = 0
+            scanTruncated = $false
+            signatures = @()
+            error = $null
+        }
+        if (-not $copied) {
+            $logs += [pscustomobject]$record
+            continue
+        }
+        if ($null -eq $rootPath -or [string]::IsNullOrWhiteSpace($copiedTo)) {
+            $record.scanStatus = 'invalid-metadata'
+            $record.error = 'Copied log did not contain a valid relative artifact path.'
+            $logs += [pscustomobject]$record
+            $failedLogCount++
+            continue
+        }
+
+        try {
+            $relativePath = $copiedTo.Replace('\', [string][System.IO.Path]::DirectorySeparatorChar)
+            if ([System.IO.Path]::IsPathRooted($relativePath)) { throw 'Artifact path is rooted.' }
+            $fullPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($rootPath, $relativePath))
+            $rootPrefix = $rootPath.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
+            if (-not $fullPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Artifact path escapes the case directory.'
+            }
+            if (-not [System.IO.File]::Exists($fullPath)) {
+                $record.scanStatus = 'missing'
+                $record.error = 'Copied log artifact was not present at the recorded path.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+            if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($fullPath)) -Candidate $fullPath) {
+                $record.scanStatus = 'reparse-point'
+                $record.error = 'Copied log artifact or one of its parent directories is a reparse point.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+            $linkCount = Get-CaseFileLinkCount -Path $fullPath
+            if ($linkCount -lt 1) {
+                $record.scanStatus = 'identity-unavailable'
+                $record.error = 'Could not establish the copied artifact link identity.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+            if ($linkCount -gt 1) {
+                $record.scanStatus = 'hardlink'
+                $record.error = 'Copied log artifact has multiple filesystem links and was not analyzed.'
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+
+            $fileInfo = [System.IO.FileInfo]::new($fullPath)
+            $record.sizeBytes = $fileInfo.Length
+            if ($fileInfo.Length -gt $MaxScanBytes) {
+                $record.scanStatus = 'oversized'
+                $record.error = "File exceeds the bounded servicing scan size of $MaxScanBytes bytes."
+                $logs += [pscustomobject]$record
+                $failedLogCount++
+                continue
+            }
+
+            $aggregateMap = @{}
+            $aggregateOrder = New-Object System.Collections.ArrayList
+            $aggregateMatchedLines = 0
+            $aggregateLineCount = 0
+            $reader = $null
+            $boundedStream = $null
+            $inputStream = $null
+            $bytesRead = 0L
+            $lineBuffer = New-Object System.Collections.ArrayList
+            $chunkStartLine = 1
+            try {
+                $boundedStream = [System.IO.MemoryStream]::new()
+                if ($runningOnWindows) {
+                    $inputStream = [System.IO.File]::OpenRead($fullPath)
+                }
+                else {
+                    $inputStream = [System.IO.File]::OpenRead($fullPath)
+                }
+                $byteChunk = [byte[]]::new(65536)
+                while ($bytesRead -lt $MaxScanBytes) {
+                    $remainingBytes = $MaxScanBytes - $bytesRead
+                    $readCount = [int][Math]::Min([int64]$byteChunk.Length, $remainingBytes)
+                    $readCount = $inputStream.Read($byteChunk, 0, $readCount)
+                    if ($readCount -le 0) { break }
+                    $boundedStream.Write($byteChunk, 0, $readCount)
+                    $bytesRead += $readCount
+                }
+                $record.bytesScanned = $bytesRead
+                $latestLength = $fileInfo.Length
+                try { $latestLength = ([System.IO.FileInfo]::new($fullPath)).Length } catch { }
+                $record.scanTruncated = ($latestLength -gt $MaxScanBytes -or $latestLength -ne $fileInfo.Length -or ($bytesRead -ge $MaxScanBytes -and $fileInfo.Length -lt $MaxScanBytes))
+                $inputStream.Dispose()
+                $inputStream = $null
+                $boundedStream.Position = 0
+                $reader = [System.IO.StreamReader]::new($boundedStream, $true)
+                while (-not $reader.EndOfStream) {
+                    $readLine = $reader.ReadLine()
+                    if ($null -eq $readLine) { break }
+                    [void]$lineBuffer.Add($readLine)
+                    $aggregateLineCount++
+                    if ($lineBuffer.Count -ge 1000) {
+                        $part = ConvertFrom-ServicingLogLines -SourceName $record.name -Lines @($lineBuffer) -StartingLineNumber $chunkStartLine
+                        $aggregateMatchedLines += [int]$part.matchedLineCount
+                        foreach ($signature in @($part.signatures)) {
+                            $signatureName = [string]$signature.signature
+                            if (-not $aggregateMap.ContainsKey($signatureName)) {
+                                $aggregateMap[$signatureName] = [ordered]@{
+                                    signature = $signatureName
+                                    kind = [string]$signature.kind
+                                    count = 0
+                                    firstLineNumber = [int]$signature.firstLineNumber
+                                    lastLineNumber = [int]$signature.lastLineNumber
+                                }
+                                [void]$aggregateOrder.Add($signatureName)
+                            }
+                            $aggregate = $aggregateMap[$signatureName]
+                            $aggregate.count = [int]$aggregate.count + [int]$signature.count
+                            if ([int]$signature.firstLineNumber -lt [int]$aggregate.firstLineNumber) { $aggregate.firstLineNumber = [int]$signature.firstLineNumber }
+                            if ([int]$signature.lastLineNumber -gt [int]$aggregate.lastLineNumber) { $aggregate.lastLineNumber = [int]$signature.lastLineNumber }
+                        }
+                        [void]$lineBuffer.Clear()
+                        $chunkStartLine = $aggregateLineCount + 1
+                    }
+                }
+                if ($lineBuffer.Count -gt 0) {
+                    $part = ConvertFrom-ServicingLogLines -SourceName $record.name -Lines @($lineBuffer) -StartingLineNumber $chunkStartLine
+                    $aggregateMatchedLines += [int]$part.matchedLineCount
+                    foreach ($signature in @($part.signatures)) {
+                        $signatureName = [string]$signature.signature
+                        if (-not $aggregateMap.ContainsKey($signatureName)) {
+                            $aggregateMap[$signatureName] = [ordered]@{
+                                signature = $signatureName
+                                kind = [string]$signature.kind
+                                count = 0
+                                firstLineNumber = [int]$signature.firstLineNumber
+                                lastLineNumber = [int]$signature.lastLineNumber
+                            }
+                            [void]$aggregateOrder.Add($signatureName)
+                        }
+                        $aggregate = $aggregateMap[$signatureName]
+                        $aggregate.count = [int]$aggregate.count + [int]$signature.count
+                        if ([int]$signature.firstLineNumber -lt [int]$aggregate.firstLineNumber) { $aggregate.firstLineNumber = [int]$signature.firstLineNumber }
+                        if ([int]$signature.lastLineNumber -gt [int]$aggregate.lastLineNumber) { $aggregate.lastLineNumber = [int]$signature.lastLineNumber }
+                    }
+                }
+            }
+            finally {
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+                if ($null -ne $reader) { $reader.Dispose() }
+                elseif ($null -ne $boundedStream) { $boundedStream.Dispose() }
+            }
+
+            $signatureRows = @()
+            foreach ($signatureName in @($aggregateOrder)) {
+                $aggregate = $aggregateMap[$signatureName]
+                $signatureRows += [pscustomobject]@{
+                    signature = $aggregate.signature
+                    kind = $aggregate.kind
+                    count = $aggregate.count
+                    firstLineNumber = $aggregate.firstLineNumber
+                    lastLineNumber = $aggregate.lastLineNumber
+                }
+            }
+            $record.scanStatus = 'completed'
+            $record.lineCount = $aggregateLineCount
+            $record.matchedLineCount = $aggregateMatchedLines
+            $record.signatures = @($signatureRows)
+            if ($record.scanTruncated) { $truncatedLogCount++ }
+            $logs += [pscustomobject]$record
+            $scannedLogCount++
+        }
+        catch {
+            $record.scanStatus = 'failed'
+            $record.error = $_.Exception.Message
+            $logs += [pscustomobject]$record
+            $failedLogCount++
+        }
+    }
+
+    $overallStatus = 'completed'
+    if ($failedLogCount -gt 0 -or $truncatedLogCount -gt 0 -or $unavailableLogCount -gt 0) { $overallStatus = 'partial' }
+    return [ordered]@{
+        status = $overallStatus
+        maxScanBytes = $MaxScanBytes
+        logCount = @($logs).Count
+        scannedLogCount = $scannedLogCount
+        failedLogCount = $failedLogCount
+        truncatedLogCount = $truncatedLogCount
+        unavailableLogCount = $unavailableLogCount
+        logs = @($logs)
+    }
+}
+
+function ConvertTo-CrashDateTime {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    try { return ([datetime]$Value).ToUniversalTime() } catch { return $null }
+}
+
+function ConvertTo-CrashIsoTimestamp {
+    param([AllowNull()][object]$Value)
+
+    $parsed = ConvertTo-CrashDateTime $Value
+    if ($null -eq $parsed) { return $null }
+    return $parsed.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-CrashFilenameDate {
+    param([AllowNull()][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $shortDate = [regex]::Match($Name, '(?i)(?<!\d)(?<date>\d{6})-\d+-\d+\.dmp$')
+    if ($shortDate.Success) {
+        try {
+            return [datetime]::ParseExact($shortDate.Groups['date'].Value, 'MMddyy', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd')
+        }
+        catch { }
+    }
+    $longDate = [regex]::Match($Name, '(?i)(?<date>\d{8})[-_]\d{4}(?:[-_]\d+)?\.dmp$')
+    if ($longDate.Success) {
+        try {
+            return [datetime]::ParseExact($longDate.Groups['date'].Value, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd')
+        }
+        catch { }
+    }
+    return $null
+}
+
 function Get-CrashAnalysis {
     <#
-      Decodes BSOD/bugcheck evidence and flags unexplained abrupt shutdowns:
-      Kernel-Power 41 without a matching BugCheck event (usually a hard freeze,
-      power loss, or thermal cutout rather than a Windows-detected crash).
+      Decodes BSOD/bugcheck evidence and joins it to the crash artifacts this
+      collector copies. The System event query is intentionally bounded to its
+      lookback window; dump rows outside that window remain visible and are
+      labelled instead of being silently lost. Filename hints are classification
+      evidence only - they are never presented as a root cause.
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [object[]]$Events
+        [object[]]$Events,
+
+        [AllowNull()][object[]]$MinidumpFiles = @(),
+
+        [AllowNull()][object[]]$LiveKernelReports = @(),
+
+        [AllowNull()][object]$EventWindowStartUtc,
+
+        [AllowNull()][object]$EventWindowEndUtc
     )
 
-    $bugchecks = @(
-        # Event Viewer may display this source as "BugCheck", while the
-        # underlying provider is usually Microsoft-Windows-WER-SystemErrorReporting.
-        $Events | Where-Object {
-            $_.Id -eq 1001 -and
-            ($_.ProviderName -eq 'BugCheck' -or $_.ProviderName -match 'WER-SystemErrorReporting')
-        } | ForEach-Object {
-            $code = $null
-            if ($_.Message -match '0x[0-9A-Fa-f]{8}') {
-                $code = $matches[0]
-            }
-            [pscustomobject]@{
-                TimeCreated = $_.TimeCreated
-                BugcheckCode = $code
-                Message = $_.Message
-            }
+    $eventItems = if ($null -ne $Events) { @($Events) } else { @() }
+    $lookbackStart = ConvertTo-CrashDateTime $EventWindowStartUtc
+    $lookbackEnd = ConvertTo-CrashDateTime $EventWindowEndUtc
+    $bugchecks = @()
+    foreach ($event in $eventItems) {
+        if ($null -eq $event) { continue }
+        $eventId = Get-SafeObjectProperty -InputObject $event -Name 'Id'
+        $provider = [string](Get-SafeObjectProperty -InputObject $event -Name 'ProviderName')
+        if ($eventId -ne 1001 -or ($provider -ne 'BugCheck' -and $provider -notmatch 'WER-SystemErrorReporting')) { continue }
+        $message = [string](Get-SafeObjectProperty -InputObject $event -Name 'Message')
+        $code = $null
+        if ($message -match '(?i)(?<![0-9a-z])0x[0-9a-f]{8}(?![0-9a-z])') {
+            $code = '0x' + $matches[0].Substring(2).ToUpperInvariant()
         }
-    )
+        $parsedEventTime = ConvertTo-CrashDateTime (Get-SafeObjectProperty -InputObject $event -Name 'TimeCreated')
+        if ($null -ne $parsedEventTime -and (($null -ne $lookbackStart -and $parsedEventTime -lt $lookbackStart) -or ($null -ne $lookbackEnd -and $parsedEventTime -gt $lookbackEnd))) { continue }
+        $bugchecks += [pscustomobject]@{
+            TimeCreated = ConvertTo-CrashIsoTimestamp $parsedEventTime
+            BugcheckCode = $code
+            Message = $message
+        }
+    }
 
-    $unexplained = @(
-        $Events | Where-Object { $_.ProviderName -match 'Kernel-Power' -and $_.Id -eq 41 } | Where-Object {
-            $crashTime = $_.TimeCreated
-            -not ($bugchecks | Where-Object { [math]::Abs(($_.TimeCreated - $crashTime).TotalMinutes) -le 5 })
-        } | ForEach-Object {
-            [pscustomobject]@{
-                TimeCreated = $_.TimeCreated
-                Message = $_.Message
+    $unexplained = @()
+    foreach ($event in $eventItems) {
+        if ($null -eq $event) { continue }
+        $eventId = Get-SafeObjectProperty -InputObject $event -Name 'Id'
+        $provider = [string](Get-SafeObjectProperty -InputObject $event -Name 'ProviderName')
+        if ($eventId -ne 41 -or $provider -notmatch 'Kernel-Power') { continue }
+        $crashTime = ConvertTo-CrashDateTime (Get-SafeObjectProperty -InputObject $event -Name 'TimeCreated')
+        if ($null -ne $crashTime -and (($null -ne $lookbackStart -and $crashTime -lt $lookbackStart) -or ($null -ne $lookbackEnd -and $crashTime -gt $lookbackEnd))) { continue }
+        $hasMatchingBugcheck = $false
+        if ($null -ne $crashTime) {
+            foreach ($bugcheck in $bugchecks) {
+                $bugcheckTime = ConvertTo-CrashDateTime $bugcheck.TimeCreated
+                if ($null -ne $bugcheckTime -and [math]::Abs(($bugcheckTime - $crashTime).TotalMinutes) -le 5) {
+                    $hasMatchingBugcheck = $true
+                    break
+                }
             }
         }
-    )
+        if (-not $hasMatchingBugcheck) {
+            $unexplained += [pscustomobject]@{
+                TimeCreated = ConvertTo-CrashIsoTimestamp $crashTime
+                Message = [string](Get-SafeObjectProperty -InputObject $event -Name 'Message')
+            }
+        }
+    }
+
+    $dumpRows = @()
+    foreach ($dump in $(if ($null -ne $MinidumpFiles) { @($MinidumpFiles) } else { @() })) {
+        if ($null -eq $dump) { continue }
+        $name = [string](Get-SafeObjectProperty -InputObject $dump -Name 'Name')
+        $sourceTime = ConvertTo-CrashDateTime (Get-SafeObjectProperty -InputObject $dump -Name 'SourceLastWriteTimeUtc')
+        $matchingBugchecks = @()
+        if ($null -ne $sourceTime) {
+            foreach ($bugcheck in $bugchecks) {
+                $bugcheckTime = ConvertTo-CrashDateTime $bugcheck.TimeCreated
+                if ($null -ne $bugcheckTime -and [math]::Abs(($bugcheckTime - $sourceTime).TotalMinutes) -le 5) {
+                    $matchingBugchecks += $bugcheck
+                }
+            }
+        }
+        $distinctCodes = New-Object System.Collections.ArrayList
+        $codeSet = @{}
+        foreach ($matchingBugcheck in $matchingBugchecks) {
+            $matchingCode = [string](Get-SafeObjectProperty -InputObject $matchingBugcheck -Name 'BugcheckCode')
+            if (-not [string]::IsNullOrWhiteSpace($matchingCode) -and -not $codeSet.ContainsKey($matchingCode)) {
+                $codeSet[$matchingCode] = $true
+                [void]$distinctCodes.Add($matchingCode)
+            }
+        }
+        $filenameDate = Get-CrashFilenameDate $name
+        $filenameOutsideLookback = $false
+        if (-not [string]::IsNullOrWhiteSpace($filenameDate)) {
+            $filenameDateValue = [datetime]::ParseExact($filenameDate, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+            if (($null -ne $lookbackStart -and $filenameDateValue.Date -lt $lookbackStart.Date) -or ($null -ne $lookbackEnd -and $filenameDateValue.Date -gt $lookbackEnd.Date)) {
+                $filenameOutsideLookback = $true
+            }
+        }
+        $sourceOutsideLookback = $false
+        if ($null -ne $sourceTime) {
+            if (($null -ne $lookbackStart -and $sourceTime -lt $lookbackStart) -or ($null -ne $lookbackEnd -and $sourceTime -gt $lookbackEnd)) {
+                $sourceOutsideLookback = $true
+            }
+        }
+        $correlationStatus = 'no-matching-bugcheck'
+        $correlatedCode = $null
+        $correlatedTime = $null
+        if ($sourceOutsideLookback -or ($null -eq $sourceTime -and $filenameOutsideLookback)) {
+            $correlationStatus = 'outside-event-lookback'
+        }
+        elseif ($distinctCodes.Count -eq 1) {
+            $correlationStatus = 'matched-bugcheck'
+            $correlatedCode = [string]$distinctCodes[0]
+            if ($matchingBugchecks.Count -gt 0) { $correlatedTime = $matchingBugchecks[0].TimeCreated }
+        }
+        elseif ($distinctCodes.Count -gt 1) {
+            $correlationStatus = 'ambiguous-bugcheck'
+        }
+        $problemSignature = if ($null -ne $correlatedCode) { "bugcheck:$correlatedCode" } elseif ($correlationStatus -eq 'ambiguous-bugcheck') { 'minidump:ambiguous-bugcheck' } else { 'minidump:unknown' }
+        $dumpRows += [pscustomobject]@{
+            Name = $name
+            SizeBytes = Get-SafeObjectProperty -InputObject $dump -Name 'SizeBytes'
+            SourceLastWriteTimeUtc = ConvertTo-CrashIsoTimestamp $sourceTime
+            filenameDate = $filenameDate
+            bugcheckCode = $correlatedCode
+            bugcheckTimeUtc = ConvertTo-CrashIsoTimestamp $correlatedTime
+            eventCorrelationStatus = $correlationStatus
+            problemSignature = $problemSignature
+            signatureSource = if ($null -ne $correlatedCode) { 'event-bugcheck-correlation' } else { 'none' }
+        }
+    }
+
+    $liveRows = @()
+    foreach ($live in $(if ($null -ne $LiveKernelReports) { @($LiveKernelReports) } else { @() })) {
+        if ($null -eq $live) { continue }
+        $name = [string](Get-SafeObjectProperty -InputObject $live -Name 'Name')
+        $upperName = $name.ToUpperInvariant()
+        $hint = 'unknown'
+        if ($upperName -match 'WHEA') { $hint = 'whea' }
+        elseif ($upperName -match 'WATCHDOG') { $hint = 'watchdog' }
+        elseif ($upperName -match 'TDR|DISPLAY|VIDEO') { $hint = 'tdr' }
+        $liveRows += [pscustomobject]@{
+            Name = $name
+            FullPath = Get-SafeObjectProperty -InputObject $live -Name 'FullPath'
+            SizeBytes = Get-SafeObjectProperty -InputObject $live -Name 'SizeBytes'
+            LastWriteTimeUtc = ConvertTo-CrashIsoTimestamp (Get-SafeObjectProperty -InputObject $live -Name 'LastWriteTimeUtc')
+            Directory = Get-SafeObjectProperty -InputObject $live -Name 'Directory'
+            filenameDate = Get-CrashFilenameDate $name
+            problemSignature = "livekernel:$hint"
+            signatureSource = 'filename-hint'
+        }
+    }
+
+    $minidumpSignatureMap = @{}
+    $minidumpSignatureOrder = New-Object System.Collections.ArrayList
+    foreach ($row in $dumpRows) {
+        $signature = [string]$row.problemSignature
+        if (-not $minidumpSignatureMap.ContainsKey($signature)) {
+            $minidumpSignatureMap[$signature] = [ordered]@{
+                problemSignature = $signature
+                signatureSource = [string]$row.signatureSource
+                count = 0
+                files = New-Object System.Collections.ArrayList
+            }
+            [void]$minidumpSignatureOrder.Add($signature)
+        }
+        $group = $minidumpSignatureMap[$signature]
+        $group.count = [int]$group.count + 1
+        if ($group.files.Count -lt 20) { [void]$group.files.Add($row.Name) }
+    }
+    $minidumpSignatures = @()
+    foreach ($signature in @($minidumpSignatureOrder)) {
+        $group = $minidumpSignatureMap[$signature]
+        $minidumpSignatures += [pscustomobject]@{
+            problemSignature = $group.problemSignature
+            signatureSource = $group.signatureSource
+            count = $group.count
+            files = @($group.files)
+        }
+    }
+
+    $liveSignatureMap = @{}
+    $liveSignatureOrder = New-Object System.Collections.ArrayList
+    foreach ($row in $liveRows) {
+        $signature = [string]$row.problemSignature
+        if (-not $liveSignatureMap.ContainsKey($signature)) {
+            $liveSignatureMap[$signature] = [ordered]@{
+                problemSignature = $signature
+                signatureSource = 'filename-hint'
+                count = 0
+                files = New-Object System.Collections.ArrayList
+            }
+            [void]$liveSignatureOrder.Add($signature)
+        }
+        $group = $liveSignatureMap[$signature]
+        $group.count = [int]$group.count + 1
+        if ($group.files.Count -lt 20) { [void]$group.files.Add($row.Name) }
+    }
+    $liveSignatures = @()
+    foreach ($signature in @($liveSignatureOrder)) {
+        $group = $liveSignatureMap[$signature]
+        $liveSignatures += [pscustomobject]@{
+            problemSignature = $group.problemSignature
+            signatureSource = $group.signatureSource
+            count = $group.count
+            files = @($group.files)
+        }
+    }
 
     return [ordered]@{
-        bugchecks = $bugchecks
-        unexplainedShutdowns = $unexplained
+        eventLookbackStartUtc = ConvertTo-CrashIsoTimestamp $lookbackStart
+        eventLookbackEndUtc = ConvertTo-CrashIsoTimestamp $lookbackEnd
+        eventCorrelationWindowMinutes = 5
+        bugchecks = @($bugchecks)
+        unexplainedShutdowns = @($unexplained)
+        minidumps = @($dumpRows)
+        minidumpSignatures = @($minidumpSignatures)
+        liveKernelReports = @($liveRows)
+        liveKernelSignatures = @($liveSignatures)
     }
 }
 
@@ -2088,6 +3141,9 @@ function Get-SafeObjectProperty {
 
     if ($null -eq $InputObject) { return $null }
     try {
+        if ($InputObject -is [System.Collections.IDictionary]) {
+            if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        }
         $property = $InputObject.PSObject.Properties[$Name]
         if ($null -ne $property) { return $property.Value }
     }
@@ -2955,7 +4011,13 @@ function Evaluate-Findings {
         [object]$ProcessMemoryTop,
 
         [AllowNull()]
-        [object]$MemoryMetricsRaw
+        [object]$MemoryMetricsRaw,
+
+        [AllowNull()]
+        [object]$CrashAnalysis,
+
+        [AllowNull()]
+        [object]$ServicingAnalysis
     )
 
     $findings = @()
@@ -3310,6 +4372,254 @@ function Evaluate-Findings {
         }
     }
 
+    # ---- Crash evidence: events plus the dump artifacts collected with them -
+    # A 24-hour event query is a bounded view, not a crash-history boundary.
+    # Dump and LiveKernelReports metadata therefore gets its own findings even
+    # when no matching event was pulled.
+    if ($null -ne $CrashAnalysis) {
+        $crashBugchecksValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'bugchecks'
+        $crashShutdownsValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'unexplainedShutdowns'
+        $crashDumpsValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'minidumps'
+        $crashLiveReportsValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'liveKernelReports'
+        $crashLiveSignaturesValue = Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'liveKernelSignatures'
+        $crashBugchecks = @()
+        $crashShutdowns = @()
+        $crashDumps = @()
+        $crashLiveReports = @()
+        $crashLiveSignatures = @()
+        if ($null -ne $crashBugchecksValue) { $crashBugchecks = @($crashBugchecksValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashShutdownsValue) { $crashShutdowns = @($crashShutdownsValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashDumpsValue) { $crashDumps = @($crashDumpsValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashLiveReportsValue) { $crashLiveReports = @($crashLiveReportsValue | Where-Object { $null -ne $_ }) }
+        if ($null -ne $crashLiveSignaturesValue) { $crashLiveSignatures = @($crashLiveSignaturesValue | Where-Object { $null -ne $_ }) }
+
+        if ($crashBugchecks.Count -gt 0) {
+            $codes = New-Object System.Collections.ArrayList
+            $codeSet = @{}
+            foreach ($bugcheck in $crashBugchecks) {
+                $code = [string](Get-SafeObjectProperty -InputObject $bugcheck -Name 'BugcheckCode')
+                if (-not [string]::IsNullOrWhiteSpace($code) -and -not $codeSet.ContainsKey($code)) {
+                    $codeSet[$code] = $true
+                    [void]$codes.Add($code)
+                }
+            }
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'system-events-last-24-hours.json'
+                metric = 'bugcheckEvents'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashBugchecks.Count
+                    bugcheckCodes = @($codes) -join ', '
+                }
+                ruleCondition = "The bounded System event query contains $($crashBugchecks.Count) BugCheck/WER event(s)"
+                uncertainty = 'The event query is limited to the recorded lookback; a code identifies a crash type but not its exact driver or root cause'
+                nextSteps = 'Open the event artifact and, when a matching dump is listed, analyze that dump with WinDbg !analyze -v'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($crashShutdowns.Count -gt 0) {
+            $shutdownTimes = @($crashShutdowns | ForEach-Object { [string](Get-SafeObjectProperty -InputObject $_ -Name 'TimeCreated') })
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'system-events-last-24-hours.json'
+                metric = 'unexplainedShutdowns'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashShutdowns.Count
+                    times = $shutdownTimes -join '; '
+                }
+                ruleCondition = "Kernel-Power 41 has no BugCheck/WER event within $([string](Get-CaseJsonProperty -InputObject $CrashAnalysis -Name 'eventCorrelationWindowMinutes')) minutes"
+                uncertainty = 'This pattern is consistent with a hard freeze, power loss or thermal cutout, but the event correlation does not establish which occurred'
+                nextSteps = 'Compare the shutdown timestamp with the dump and LiveKernelReports findings and inspect hardware/power evidence'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($crashDumps.Count -gt 0) {
+            $matchedDumpCount = @($crashDumps | Where-Object { (Get-SafeObjectProperty -InputObject $_ -Name 'eventCorrelationStatus') -eq 'matched-bugcheck' }).Count
+            $outsideDumpCount = @($crashDumps | Where-Object { (Get-SafeObjectProperty -InputObject $_ -Name 'eventCorrelationStatus') -eq 'outside-event-lookback' }).Count
+            $dumpNames = @($crashDumps | ForEach-Object { [string](Get-SafeObjectProperty -InputObject $_ -Name 'Name') } | Select-Object -First 20)
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'diagnostic-manifest.json'
+                metric = 'minidumpEvidence'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashDumps.Count
+                    matchedBugcheckCount = $matchedDumpCount
+                    outsideEventLookbackCount = $outsideDumpCount
+                    files = $dumpNames -join '; '
+                }
+                ruleCondition = "The case contains $($crashDumps.Count) copied minidump artifact(s), including dumps outside the bounded event lookback when present"
+                uncertainty = 'A dump proves that crash evidence exists; filename dates and nearby event matches are correlation aids, not proof of the failing component'
+                nextSteps = 'Open minidumps\<name> from the case and run WinDbg !analyze -v; do not infer a driver from the filename alone'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($crashLiveReports.Count -gt 0) {
+            $liveSignatureText = @($crashLiveSignatures | ForEach-Object {
+                    "$([string](Get-SafeObjectProperty -InputObject $_ -Name 'problemSignature')) x $([string](Get-SafeObjectProperty -InputObject $_ -Name 'count'))"
+                }) -join '; '
+            $liveNames = @($crashLiveReports | ForEach-Object { [string](Get-SafeObjectProperty -InputObject $_ -Name 'Name') } | Select-Object -First 20)
+            $findings += [pscustomobject]@{
+                category = 'crash-evidence'
+                sourceArtifact = 'livekernelreports.json'
+                metric = 'liveKernelReportEvidence'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $crashLiveReports.Count
+                    problemSignatures = $liveSignatureText
+                    files = $liveNames -join '; '
+                }
+                ruleCondition = "The case contains $($crashLiveReports.Count) LiveKernelReports artifact(s)"
+                uncertainty = 'LiveKernelReports filenames provide bounded classification hints only; they do not decode the dump or prove a WHEA, watchdog or TDR cause'
+                nextSteps = 'Open livekernelreports.json, correlate LastWriteTimeUtc with incident-events.json, and analyze the matching dump with the vendor or Microsoft debugger'
+                suggestedWprProfile = $null
+            }
+        }
+    }
+
+    # ---- CBS/DISM/setup text evidence ----------------------------------------
+    # The scanner emits only normalized signatures and line ranges. Aggregate
+    # the same signature across logs so recurring CBS_E_* failures become one
+    # actionable finding instead of a raw-log archaeology exercise.
+    if ($null -ne $ServicingAnalysis) {
+        $servicingStatus = [string](Get-CaseJsonProperty -InputObject $ServicingAnalysis -Name 'status')
+        $servicingError = [string](Get-CaseJsonProperty -InputObject $ServicingAnalysis -Name 'error')
+        $servicingLogsValue = Get-CaseJsonProperty -InputObject $ServicingAnalysis -Name 'logs'
+        $servicingLogs = @()
+        if ($null -ne $servicingLogsValue) { $servicingLogs = @($servicingLogsValue | Where-Object { $null -ne $_ }) }
+        $servicingMap = @{}
+        $servicingOrder = New-Object System.Collections.ArrayList
+        $completedServicingLogCount = 0
+        $incompleteServicingLogCount = 0
+        $truncatedServicingLogCount = 0
+        foreach ($servicingLog in $servicingLogs) {
+            $scanStatus = [string](Get-SafeObjectProperty -InputObject $servicingLog -Name 'scanStatus')
+            $scanTruncated = [bool](Get-SafeObjectProperty -InputObject $servicingLog -Name 'scanTruncated')
+            if ($scanStatus -eq 'completed') {
+                $completedServicingLogCount++
+            }
+            if ($scanStatus -ne 'completed' -or $scanTruncated) {
+                $incompleteServicingLogCount++
+            }
+            if ($scanTruncated) {
+                $truncatedServicingLogCount++
+            }
+            $logName = [string](Get-SafeObjectProperty -InputObject $servicingLog -Name 'name')
+            $logArtifact = [string](Get-SafeObjectProperty -InputObject $servicingLog -Name 'artifact')
+            foreach ($signature in @(Get-SafeObjectProperty -InputObject $servicingLog -Name 'signatures')) {
+                $signatureName = [string](Get-SafeObjectProperty -InputObject $signature -Name 'signature')
+                if ([string]::IsNullOrWhiteSpace($signatureName)) { continue }
+                if (-not $servicingMap.ContainsKey($signatureName)) {
+                    $servicingMap[$signatureName] = [ordered]@{
+                        signature = $signatureName
+                        kind = [string](Get-SafeObjectProperty -InputObject $signature -Name 'kind')
+                        count = 0
+                        logs = New-Object System.Collections.ArrayList
+                        firstLineNumber = $null
+                        lastLineNumber = $null
+                    }
+                    [void]$servicingOrder.Add($signatureName)
+                }
+                $aggregate = $servicingMap[$signatureName]
+                $aggregate.count = [int]$aggregate.count + [int](Get-SafeObjectProperty -InputObject $signature -Name 'count')
+                $signatureKind = [string](Get-SafeObjectProperty -InputObject $signature -Name 'kind')
+                if ($aggregate.kind -ne $signatureKind) { $aggregate.kind = 'mixed' }
+                if (-not [string]::IsNullOrWhiteSpace($logName) -and -not @($aggregate.logs | Where-Object { $_ -eq $logName })) { [void]$aggregate.logs.Add($logName) }
+                $firstLine = Get-SafeObjectProperty -InputObject $signature -Name 'firstLineNumber'
+                $lastLine = Get-SafeObjectProperty -InputObject $signature -Name 'lastLineNumber'
+                if ($null -ne $firstLine -and ($null -eq $aggregate.firstLineNumber -or [int]$firstLine -lt [int]$aggregate.firstLineNumber)) { $aggregate.firstLineNumber = [int]$firstLine }
+                if ($null -ne $lastLine -and ($null -eq $aggregate.lastLineNumber -or [int]$lastLine -gt [int]$aggregate.lastLineNumber)) { $aggregate.lastLineNumber = [int]$lastLine }
+            }
+        }
+
+        foreach ($signatureName in @($servicingOrder)) {
+            $aggregate = $servicingMap[$signatureName]
+            $findings += [pscustomobject]@{
+                category = 'servicing-failure'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = $aggregate.signature
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    count = $aggregate.count
+                    kind = $aggregate.kind
+                    logs = @($aggregate.logs) -join ', '
+                    firstLineNumber = $aggregate.firstLineNumber
+                    lastLineNumber = $aggregate.lastLineNumber
+                    recurring = ($aggregate.count -gt 1)
+                }
+                ruleCondition = "The bounded servicing-log scan found $($aggregate.count) occurrence(s) of $($aggregate.signature)"
+                uncertainty = 'Text matching identifies a recurring error signature, not the current package state or the root cause; a full CBS/DISM review is still required'
+                nextSteps = 'Open the referenced bootfailure log artifact(s) around the reported line range and correlate the signature with the servicing operation; no repair is performed automatically'
+                suggestedWprProfile = $null
+            }
+        }
+
+        if ($servicingStatus -eq 'failed') {
+            $findings += [pscustomobject]@{
+                category = 'coverage'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = 'servicingAnalysisFailed'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    status = $servicingStatus
+                    logCount = $servicingLogs.Count
+                    error = $servicingError
+                }
+                ruleCondition = 'The servicing-log analysis stage failed before producing a complete result'
+                uncertainty = 'CBS/DISM/setup evidence was not analyzed; the failure message may identify an access or runtime problem'
+                nextSteps = 'Review collectionErrors and servicing-log-analysis.json, then re-run with readable copied servicing logs'
+                suggestedWprProfile = $null
+            }
+        }
+        elseif ($servicingLogs.Count -eq 0 -or $completedServicingLogCount -eq 0) {
+            $findings += [pscustomobject]@{
+                category = 'coverage'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = 'servicingEvidenceUnavailable'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    logCount = $servicingLogs.Count
+                    completedLogCount = $completedServicingLogCount
+                }
+                ruleCondition = 'No copied CBS/DISM/setup log was available for text analysis'
+                uncertainty = 'Servicing health is unknown when the requested log evidence was not copied or could not be read'
+                nextSteps = 'Re-run with boot-failure log consent or inspect the source logs directly'
+                suggestedWprProfile = $null
+            }
+        }
+        elseif ($incompleteServicingLogCount -gt 0) {
+            $findings += [pscustomobject]@{
+                category = 'coverage'
+                sourceArtifact = 'servicing-log-analysis.json'
+                metric = 'servicingEvidencePartial'
+                windowStart = $null
+                windowEnd = $null
+                measuredValues = [ordered]@{
+                    logCount = $servicingLogs.Count
+                    completedLogCount = $completedServicingLogCount
+                    incompleteLogCount = $incompleteServicingLogCount
+                    truncatedLogCount = $truncatedServicingLogCount
+                }
+                ruleCondition = "$incompleteServicingLogCount of $($servicingLogs.Count) requested servicing log(s) could not be fully scanned"
+                uncertainty = 'Findings cover only the readable servicing logs; unavailable or truncated logs may contain additional failures'
+                nextSteps = 'Review the servicing-log-analysis.json errors and re-run with readable copied CBS/DISM/setup logs'
+                suggestedWprProfile = $null
+            }
+        }
+    }
+
     return $findings
 }
 
@@ -3457,6 +4767,8 @@ function ConvertTo-FindingsHtml {
     $pressureFindings = @($Findings | Where-Object { $_.category -match 'pressure|paging|disk' })
     $coverageFindings = @($Findings | Where-Object { $_.category -eq 'coverage' })
     $evidenceFindings = @($Findings | Where-Object { $_.category -eq 'evidence-coverage' })
+    $crashFindings = @($Findings | Where-Object { $_.category -eq 'crash-evidence' })
+    $servicingFindings = @($Findings | Where-Object { $_.category -eq 'servicing-failure' })
     $otherFindings = @($Findings | Where-Object {
             $_.category -notmatch 'pressure|paging|disk|coverage'
         })
@@ -3477,8 +4789,18 @@ function ConvertTo-FindingsHtml {
             [void]$sb.AppendLine("<tr><th>Rule</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
             # The measured numbers are the evidence; a finding that names a rule
             # without the values behind it cannot be checked by the reader.
-            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
-                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
@@ -3500,6 +4822,19 @@ function ConvertTo-FindingsHtml {
             [void]$sb.AppendLine("<table>")
             [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Condition</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
+            }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
             [void]$sb.AppendLine('</table>')
@@ -3516,8 +4851,18 @@ function ConvertTo-FindingsHtml {
             [void]$sb.AppendLine('<table>')
             [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Condition</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
-            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
-                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
@@ -3527,10 +4872,16 @@ function ConvertTo-FindingsHtml {
     }
 
     if ($otherFindings.Count -gt 0) {
-        [void]$sb.AppendLine('<h2>Attribution And Supporting Evidence</h2>')
-        [void]$sb.AppendLine('<p class="no-external">Attribution is not proof of causation: it says where a resource went, not why the machine slowed down.</p>')
+        $supportingHeading = 'Attribution And Supporting Evidence'
+        $supportingLead = 'Attribution is not proof of causation: it says where a resource went, not why the machine slowed down.'
+        if ($crashFindings.Count -gt 0 -or $servicingFindings.Count -gt 0) {
+            $supportingHeading = 'Crash, Servicing And Supporting Evidence'
+            $supportingLead = 'Crash and servicing records are evidence to correlate, not proof of causation or a recommendation to repair automatically.'
+        }
+        [void]$sb.AppendLine("<h2>$(ConvertTo-HtmlEncoded $supportingHeading)</h2>")
+        [void]$sb.AppendLine(('<p class="no-external">{0}</p>' -f (ConvertTo-HtmlEncoded $supportingLead)))
         foreach ($finding in $otherFindings) {
-            [void]$sb.AppendLine("<div class='finding pressure'>")
+            [void]$sb.AppendLine("<div class='finding info'>")
             [void]$sb.AppendLine("<h3>$(ConvertTo-HtmlEncoded $finding.category)</h3>")
             [void]$sb.AppendLine('<table>')
             [void]$sb.AppendLine("<tr><th>Source</th><td>$(ConvertTo-HtmlEncoded $finding.sourceArtifact)</td></tr>")
@@ -3539,8 +4890,18 @@ function ConvertTo-FindingsHtml {
                 [void]$sb.AppendLine("<tr><th>Window</th><td>$(ConvertTo-HtmlEncoded $finding.windowStart) to $(ConvertTo-HtmlEncoded $finding.windowEnd)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Rule</th><td>$(ConvertTo-HtmlEncoded $finding.ruleCondition)</td></tr>")
-            foreach ($measuredName in @($finding.measuredValues.PSObject.Properties.Name)) {
-                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded ($finding.measuredValues.$measuredName))</td></tr>")
+            $measuredNames = @()
+            if ($null -ne $finding.measuredValues) {
+                if ($finding.measuredValues -is [System.Collections.IDictionary]) {
+                    $measuredNames = @($finding.measuredValues.Keys)
+                }
+                else {
+                    $measuredNames = @($finding.measuredValues.PSObject.Properties.Name)
+                }
+            }
+            foreach ($measuredName in $measuredNames) {
+                $measuredValue = Get-CaseJsonProperty -InputObject $finding.measuredValues -Name ([string]$measuredName)
+                [void]$sb.AppendLine("<tr><th>$(ConvertTo-HtmlEncoded $measuredName)</th><td>$(ConvertTo-HtmlEncoded $measuredValue)</td></tr>")
             }
             [void]$sb.AppendLine("<tr><th>Uncertainty</th><td>$(ConvertTo-HtmlEncoded $finding.uncertainty)</td></tr>")
             [void]$sb.AppendLine("<tr><th>Next Steps</th><td>$(ConvertTo-HtmlEncoded $finding.nextSteps)</td></tr>")
@@ -3557,7 +4918,7 @@ function ConvertTo-FindingsHtml {
         # 'we could not measure this'.
         [void]$sb.AppendLine('<div class="finding info">')
         [void]$sb.AppendLine('<h3>No Sustained Pressure Detected</h3>')
-        [void]$sb.AppendLine('<p>The collected window was measured and no pressure rule was breached for a sustained period. This does not prove the system is healthy - a short or intermittent slowdown can fall outside the sampled window. did not trigger any pressure rules. Consider re-running with a longer duration or different WPR profile.</p>')
+        [void]$sb.AppendLine('<p>The collected window was measured and no pressure rule was breached for a sustained period. This does not prove the system is healthy - a short or intermittent slowdown can fall outside the sampled window. Consider re-running with a longer duration or different WPR profile.</p>')
         [void]$sb.AppendLine('</div>')
     }
 
@@ -3617,11 +4978,17 @@ function Write-CollectionOutputs {
 
         [AllowNull()][object]$CaptureWindow,
 
-        [AllowNull()][object]$ProcessMemoryTop
+        [AllowNull()][object]$ProcessMemoryTop,
+
+        [AllowNull()][object]$CrashAnalysis,
+
+        [AllowNull()][object]$ServicingAnalysis
     )
 
     $windowStart = Get-CaseJsonProperty -InputObject $CollectionManifest -Name 'startedAtUtc'
     $windowEnd = Get-CaseJsonProperty -InputObject $CollectionManifest -Name 'completedAtUtc'
+    if ($null -ne $CrashAnalysis) { $CollectionManifest.crashAnalysis = $CrashAnalysis }
+    if ($null -ne $ServicingAnalysis) { $CollectionManifest.servicingAnalysis = $ServicingAnalysis }
 
     # Disk interval series (raw paired counters) and volume state are evidence:
     # write and register them here so the shared tail - not the Windows-only
@@ -3648,9 +5015,19 @@ function Write-CollectionOutputs {
         Add-CollectionError -Stage 'volume-metrics-export' -ErrorRecord $_
     }
 
+    if ($null -ne $ServicingAnalysis) {
+        try {
+            Write-JsonFile -InputObject $ServicingAnalysis -Path (Join-Path -Path $OutputDirectory -ChildPath 'servicing-log-analysis.json')
+            if (-not $CollectedArtifacts.Contains('servicing-log-analysis.json')) { [void]$CollectedArtifacts.Add('servicing-log-analysis.json') }
+        }
+        catch {
+            Add-CollectionError -Stage 'servicing-analysis-export' -ErrorRecord $_
+        }
+    }
+
     $findingsList = @()
     try {
-        $findingsList = @(Evaluate-Findings -Samples $Samples -DiskSeries $DiskSeries -VolumeMetrics $VolumeMetrics -MemoryMetrics $MemoryMetrics -WindowStart $windowStart -WindowEnd $windowEnd -CaptureWindow $CaptureWindow -ProcessMemoryTop $ProcessMemoryTop -MemoryMetricsRaw $MemoryMetrics)
+        $findingsList = @(Evaluate-Findings -Samples $Samples -DiskSeries $DiskSeries -VolumeMetrics $VolumeMetrics -MemoryMetrics $MemoryMetrics -WindowStart $windowStart -WindowEnd $windowEnd -CaptureWindow $CaptureWindow -ProcessMemoryTop $ProcessMemoryTop -MemoryMetricsRaw $MemoryMetrics -CrashAnalysis $CrashAnalysis -ServicingAnalysis $ServicingAnalysis)
         Write-JsonFile -InputObject $findingsList -Path (Join-Path -Path $OutputDirectory -ChildPath 'findings.json')
         if (-not $CollectedArtifacts.Contains('findings.json')) { [void]$CollectedArtifacts.Add('findings.json') }
     }
@@ -3663,7 +5040,7 @@ function Write-CollectionOutputs {
 
     try {
         $reportHtml = ConvertTo-FindingsHtml -Findings $findingsList -Manifest $CollectionManifest -SymptomContext $SymptomContext
-        [System.IO.File]::WriteAllText((Join-Path -Path $OutputDirectory -ChildPath 'report.html'), $reportHtml, (New-Object System.Text.UTF8Encoding($false)))
+        Write-CaseFileAtomically -Path (Join-Path -Path $OutputDirectory -ChildPath 'report.html') -Content $reportHtml
         if (-not $CollectedArtifacts.Contains('report.html')) { [void]$CollectedArtifacts.Add('report.html') }
     }
     catch {
@@ -3677,6 +5054,1308 @@ function Write-CollectionOutputs {
     return $CollectionManifest
 }
 
+# =============================================================================
+# Tiered architecture integration (v2)
+# =============================================================================
+# The v2 surface is composed from the modules that ship beside this script
+# (<script root>\Wpd.*.psm1). The modules own domain logic (Tier 0 inventory,
+# Tier 1 telemetry, ETW/WPR, events, escalation, findings/report); this entry
+# point owns mode dispatch, consent, safe cleanup and the manifest contract.
+# Nothing in this section writes an artifact, so Plan mode calls the SAME
+# resolvers and describes the real preset, cadence, capture mode and escalation
+# set without collecting anything. Every module call is guarded: an absent
+# module is recorded as unavailable and never aborts the run, and no value is
+# ever invented when a module is missing (an unknown preset, profile or module
+# is reported unsupported, never silently substituted).
+
+function Complete-WpdRunTranscript {
+    param(
+        [Parameter(Mandatory = $true)][string]$TranscriptPath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.IList]$ArtifactNames,
+        [switch]$TranscriptStarted
+    )
+    if ($TranscriptStarted) { Stop-Transcript -ErrorAction Stop | Out-Null }
+    if (-not [System.IO.File]::Exists($TranscriptPath)) {
+        throw 'The run-owned transcript is missing and cannot be registered as evidence.'
+    }
+    $name = [System.IO.Path]::GetFileName($TranscriptPath)
+    if ($ArtifactNames -notcontains $name) { [void]$ArtifactNames.Add($name) }
+}
+
+function Get-WpdIntegrationProperty {
+    param(
+        [AllowNull()][object]$InputObject,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($null -eq $InputObject) { return $null }
+    $dictionary = $InputObject -as [System.Collections.IDictionary]
+    if ($null -ne $dictionary) {
+        if ($dictionary.Contains($Name)) { return $dictionary[$Name] }
+        foreach ($key in @($dictionary.Keys)) {
+            if ([string]::Equals([string]$key, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $dictionary[$key]
+            }
+        }
+    }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-WpdIntegrationNumber {
+    <# First finite numeric property value, or $null. Never coerces a string or a
+       non-finite value into a measurement. #>
+    param(
+        [AllowNull()][object]$InputObject,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+    foreach ($name in @($Names)) {
+        $value = Get-WpdIntegrationProperty -InputObject $InputObject -Name $name
+        if ($null -eq $value) { continue }
+        if ($value -is [bool]) { continue }
+        try {
+            $number = [double]$value
+        }
+        catch {
+            continue
+        }
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { continue }
+        return $number
+    }
+    return $null
+}
+
+function Get-WpdModuleCommandName {
+    <# Resolves a tiered-module command to the name that is actually callable here.
+       Import-WpdModuleSurface uses PowerShell's -Prefix WpdSurface, which inserts
+       the prefix after the verb (Get-WpdSurfaceWpdEtwPresetProfile), so that
+       prefixed name is tried first and the plain name second (which also lets a
+       caller that imported the modules itself drive the integration functions).
+       $null means the command is not available at all. #>
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $prefix = 'WpdSurface'
+    $dash = $Name.IndexOf('-')
+    $prefixedName = if ($dash -gt 0) {
+        $Name.Substring(0, $dash + 1) + $prefix + $Name.Substring($dash + 1)
+    }
+    else {
+        $prefix + $Name
+    }
+    if ($null -ne (Get-Command -Name $prefixedName -CommandType Function -ErrorAction SilentlyContinue)) { return $prefixedName }
+    if ($null -ne (Get-Command -Name $Name -CommandType Function -ErrorAction SilentlyContinue)) { return $Name }
+    return $null
+}
+
+function Test-WpdModuleCommand {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return ($null -ne (Get-WpdModuleCommandName -Name $Name))
+}
+
+function Invoke-WpdModuleCall {
+    <# Calls a tiered-module command through its callable name. An unavailable
+       command is a stated failure, never a silent no-op. #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()][hashtable]$Arguments
+    )
+    $commandName = Get-WpdModuleCommandName -Name $Name
+    if ($null -eq $commandName) {
+        throw ("The tiered module command '{0}' is not available." -f $Name)
+    }
+    if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
+        return & $commandName
+    }
+    return & $commandName @Arguments
+}
+
+function Import-WpdModuleSurface {
+    <# Imports the tiered modules from the script root. Returns a record stating
+       which modules loaded and why any did not. It never throws: a missing or
+       broken module is a stated coverage gap, not a failed run. #>
+    param(
+        [AllowNull()][string[]]$Name = @('Wpd.Collectors', 'Wpd.Common', 'Wpd.Inventory', 'Wpd.Telemetry', 'Wpd.Etw', 'Wpd.Events', 'Wpd.Escalation', 'Wpd.Report')
+    )
+    $loaded = New-Object System.Collections.ArrayList
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($moduleName in @($Name)) {
+        if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+            [void]$missing.Add([pscustomobject]@{ module = $moduleName; reason = 'script-root-unavailable' })
+            continue
+        }
+        $modulePath = Join-Path -Path $PSScriptRoot -ChildPath ($moduleName + '.psm1')
+        if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
+            [void]$missing.Add([pscustomobject]@{ module = $moduleName; reason = 'module-file-not-present' })
+            continue
+        }
+        try {
+            # Import into the session-global scope with a private command prefix.
+            # A Local or Script import made inside this function disappears when
+            # the function returns, leaving the surface marked loaded but making
+            # its commands unreachable to the resolvers. The prefix avoids
+            # shadowing legacy helpers while Get-WpdModuleCommandName can call the
+            # actual module-owned command through its verb-prefixed WpdSurface
+            # name.
+            $importedModule = Import-Module -Name $modulePath -PassThru -Scope Global -Prefix WpdSurface -DisableNameChecking -ErrorAction Stop -WarningAction SilentlyContinue
+            [void]$loaded.Add($moduleName)
+        }
+        catch {
+            [void]$missing.Add([pscustomobject]@{ module = $moduleName; reason = $_.Exception.Message })
+        }
+    }
+    $status = 'partial'
+    if ($missing.Count -eq 0) { $status = 'complete' }
+    if ($loaded.Count -eq 0) { $status = 'unavailable' }
+    return [pscustomobject]@{
+        status = $status
+        loaded = @($loaded)
+        missing = @($missing)
+        moduleRoot = $PSScriptRoot
+    }
+}
+
+function Get-WpdPresetConfigurationPath {
+    <# The preset and rule documents live in <script root>\..\config, with a
+       beside-the-script fallback for a staged standalone copy. #>
+    param([AllowNull()][string]$Root = $PSScriptRoot)
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
+    $candidates = @(
+        [System.IO.Path]::Combine($Root, '..', 'config', 'diagnostic-presets.json'),
+        [System.IO.Path]::Combine($Root, 'config', 'diagnostic-presets.json')
+    )
+    foreach ($candidate in $candidates) {
+        $full = $candidate
+        try { $full = [System.IO.Path]::GetFullPath($candidate) } catch { continue }
+        if (Test-Path -LiteralPath $full -PathType Leaf) { return $full }
+    }
+    return $null
+}
+
+function Get-WpdPresetDocument {
+    param([AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        return (Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Resolve-WpdPresetSelection {
+    <# Resolves the requested preset to its canonical name and its functional
+       contract (Tier 1 counters, expected duration, analysis modules, event
+       channels, escalation options, trace budget, privacy level). The alias map
+       and the enforcement both come from config/diagnostic-presets.json, never
+       from code. An unknown name is reported as unknown-preset with the canonical
+       list; it is never mapped onto a different preset. #>
+    param(
+        [AllowNull()][string]$Preset,
+        [AllowNull()][object]$PresetDocument,
+        [AllowNull()][string]$ConfigurationPath
+    )
+
+    $document = $PresetDocument
+    if ($null -eq $document -and -not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
+        $document = Get-WpdPresetDocument -Path $ConfigurationPath
+    }
+
+    $canonical = @()
+    $aliases = @{}
+    $privacyDefault = 'Standard'
+    $samplingFloorSeconds = 1
+    if ($null -ne $document) {
+        $canonicalValue = Get-WpdIntegrationProperty -InputObject $document -Name 'canonicalPresets'
+        if ($null -ne $canonicalValue) { $canonical = @($canonicalValue) }
+        $aliasValue = Get-WpdIntegrationProperty -InputObject $document -Name 'aliases'
+        if ($null -ne $aliasValue) {
+            foreach ($property in @($aliasValue.PSObject.Properties)) {
+                $aliases[$property.Name] = [string]$property.Value
+            }
+        }
+        $privacyValue = Get-WpdIntegrationProperty -InputObject $document -Name 'privacyDefault'
+        if (-not [string]::IsNullOrWhiteSpace([string]$privacyValue)) { $privacyDefault = [string]$privacyValue }
+        $floorValue = Get-WpdIntegrationProperty -InputObject $document -Name 'samplingFloorSeconds'
+        if ($null -ne $floorValue) { $samplingFloorSeconds = [int]$floorValue }
+    }
+
+    $requested = $null
+    if (-not [string]::IsNullOrWhiteSpace($Preset)) { $requested = $Preset.Trim() }
+
+    $record = [ordered]@{
+        status = 'not-requested'
+        requested = $requested
+        effective = $null
+        isAlias = $false
+        source = if ($null -ne $document) { 'config/diagnostic-presets.json' } else { 'unavailable' }
+        canonicalNames = @($canonical)
+        privacyDefault = $privacyDefault
+        samplingFloorSeconds = $samplingFloorSeconds
+        tier1Counters = @()
+        tier1SampleIntervalSeconds = $null
+        expectedDurationSeconds = $null
+        analysisModules = @()
+        eventChannels = @()
+        escalationOptions = @()
+        traceSizeBudget = $null
+        privacyLevel = $null
+        automaticRemediation = $false
+        displayName = $null
+        symptomSummary = $null
+        reasons = @()
+    }
+
+    if ($null -eq $requested) { return [pscustomobject]$record }
+
+    $effective = $requested
+    $isAlias = $false
+    if ($aliases.ContainsKey($requested)) {
+        $effective = [string]$aliases[$requested]
+        $isAlias = $true
+    }
+
+    $presetValue = $null
+    if ($null -ne $document) {
+        $presets = Get-WpdIntegrationProperty -InputObject $document -Name 'presets'
+        $presetValue = Get-WpdIntegrationProperty -InputObject $presets -Name $effective
+    }
+
+    if ($null -eq $presetValue) {
+        $record.status = 'unknown-preset'
+        $record.effective = $null
+        $record.isAlias = $false
+        $record.reasons = @('unknown-preset:' + $requested)
+        return [pscustomobject]$record
+    }
+
+    $tier2 = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'tier2'
+    $remediation = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'remediation'
+    $record.status = 'resolved'
+    $record.effective = $effective
+    $record.isAlias = $isAlias
+    $record.tier1Counters = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'tier1Counters')
+    $record.tier1SampleIntervalSeconds = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'tier1SampleIntervalSeconds'
+    $record.expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'expectedDurationSeconds'
+    $record.analysisModules = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'analysisModules')
+    $record.eventChannels = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'eventChannels')
+    $record.escalationOptions = @(Get-WpdIntegrationProperty -InputObject $presetValue -Name 'escalationOptions')
+    $record.traceSizeBudget = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'traceSizeBudget'
+    $record.privacyLevel = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'privacyLevel'
+    $record.displayName = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'displayName'
+    $record.symptomSummary = Get-WpdIntegrationProperty -InputObject $presetValue -Name 'symptomSummary'
+    $automaticRemediation = Get-WpdIntegrationProperty -InputObject $remediation -Name 'automaticRemediation'
+    $record.automaticRemediation = [bool]$automaticRemediation
+    $record.tier2WprProfiles = @(Get-WpdIntegrationProperty -InputObject $tier2 -Name 'wprProfiles')
+    $record.tier2WprDetail = Get-WpdIntegrationProperty -InputObject $tier2 -Name 'wprDetail'
+    $record.tier2WprMode = Get-WpdIntegrationProperty -InputObject $tier2 -Name 'wprMode'
+    if ($isAlias) { $record.reasons = @('alias-resolved:' + $requested + '->' + $effective) }
+    return [pscustomobject]$record
+}
+
+function Resolve-WpdPresetCapturePolicy {
+    <# The WPR profile/detail/mode/budget policy for a resolved preset. The Etw
+       module owns the preset-to-profile table, so it is used when present; the
+       configuration fallback accepts a profile only when the entry point already
+       accepts that name. An unverified profile name is reported as unsupported
+       and is never silently substituted. #>
+    param(
+        [AllowNull()][object]$Selection,
+        [switch]$AllowFileMode
+    )
+
+    $selectionStatus = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'status')
+    $effective = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'effective')
+    $record = [ordered]@{
+        status = 'not-requested'
+        preset = $effective
+        profile = $null
+        qualifier = $null
+        profileSpec = $null
+        mode = $null
+        unbounded = $false
+        bufferSemantics = $null
+        traceBudgetMB = $null
+        maxDurationSeconds = $null
+        expectedDurationSeconds = $null
+        analysisTables = @()
+        source = 'unavailable'
+        reasons = @()
+    }
+
+    if ($selectionStatus -ne 'resolved' -or [string]::IsNullOrWhiteSpace($effective)) {
+        $record.status = if ($selectionStatus -eq 'not-requested') { 'not-requested' } else { 'unavailable' }
+        if ($selectionStatus -eq 'unknown-preset') { $record.reasons = @('unknown-preset') }
+        return [pscustomobject]$record
+    }
+
+    if (Test-WpdModuleCommand -Name 'Get-WpdEtwPresetProfile') {
+        try {
+            $policyArguments = @{ Preset = $effective }
+            if ($AllowFileMode) { $policyArguments['AllowFileMode'] = $true }
+            $policy = Invoke-WpdModuleCall -Name 'Get-WpdEtwPresetProfile' -Arguments $policyArguments
+            $record.status = 'resolved'
+            $record.source = 'Wpd.Etw'
+            $record.profile = $policy.Profile
+            $record.qualifier = if (-not [string]::IsNullOrWhiteSpace([string]$Selection.tier2WprDetail)) { [string]$Selection.tier2WprDetail } else { $policy.Qualifier }
+            $record.profileSpec = if (-not [string]::IsNullOrWhiteSpace([string]$record.qualifier)) { '{0}.{1}' -f $record.profile, $record.qualifier } else { $policy.ProfileSpec }
+            $record.mode = $policy.Mode
+            $record.unbounded = [bool]$policy.Unbounded
+            $record.bufferSemantics = $policy.BufferSemantics
+            $configuredBudget = Get-WpdIntegrationProperty -InputObject $Selection.traceSizeBudget -Name 'budgetMiB'
+            $record.traceBudgetMB = if ($null -ne $configuredBudget) { $configuredBudget } else { $policy.TraceBudgetMB }
+            $record.maxDurationSeconds = $policy.MaxDurationSeconds
+            $record.expectedDurationSeconds = if ($null -ne $Selection.expectedDurationSeconds) { $Selection.expectedDurationSeconds } else { $policy.ExpectedDurationSeconds }
+            $record.analysisTables = @($policy.AnalysisTables)
+            $record.reasons = @('wpr-policy-from-module', 'budget-and-expected-duration-from-config')
+            return [pscustomobject]$record
+        }
+        catch {
+            $record.status = 'unavailable'
+            $record.reasons = @('preset-capture-policy-error:' + $_.Exception.Message)
+            return [pscustomobject]$record
+        }
+    }
+
+    # Fallback: the preset document is the only policy source available.
+    $profiles = @(Get-WpdIntegrationProperty -InputObject $Selection -Name 'tier2WprProfiles')
+    $detail = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'tier2WprDetail')
+    $mode = [string](Get-WpdIntegrationProperty -InputObject $Selection -Name 'tier2WprMode')
+    $budget = Get-WpdIntegrationProperty -InputObject $Selection -Name 'traceSizeBudget'
+    $acceptedProfiles = @('GeneralProfile', 'CPU', 'DiskIO', 'FileIO', 'Network', 'Power', 'GPU', 'Registry')
+    if ($profiles.Count -eq 0) {
+        $record.status = 'unavailable'
+        $record.reasons = @('preset-profile-not-declared')
+        return [pscustomobject]$record
+    }
+    $profileName = [string]$profiles[0]
+    if ($acceptedProfiles -notcontains $profileName) {
+        $record.status = 'unsupported-profile-name'
+        $record.reasons = @('profile-not-accepted-by-entry-point:' + $profileName)
+        return [pscustomobject]$record
+    }
+    $record.status = 'resolved'
+    $record.source = 'config/diagnostic-presets.json'
+    $record.profile = $profileName
+    $record.qualifier = $detail
+    $record.profileSpec = ('{0}.{1}' -f $profileName, $detail)
+    $record.mode = if ([string]::IsNullOrWhiteSpace($mode)) { 'memory' } else { $mode }
+    $record.unbounded = ($record.mode -eq 'file')
+    $record.bufferSemantics = if ($record.unbounded) { 'unbounded-file' } else { 'circular-memory' }
+    $record.traceBudgetMB = Get-WpdIntegrationProperty -InputObject $budget -Name 'budgetMiB'
+    $record.maxDurationSeconds = Get-WpdIntegrationProperty -InputObject $Selection -Name 'expectedDurationSeconds'
+    $record.expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $Selection -Name 'expectedDurationSeconds'
+    $record.reasons = @('preset-capture-policy-from-config')
+    return [pscustomobject]$record
+}
+
+function Resolve-WpdTier1Interval {
+    <# Tier 1 cadence: an explicit request wins, otherwise the preset's interval,
+       otherwise the 1 s floor. A requested interval below the floor is refused
+       with a stated reason - it is never clamped silently. #>
+    param(
+        [AllowNull()][object]$RequestedSeconds,
+        [AllowNull()][object]$PresetSeconds,
+        [AllowNull()][object]$SamplingFloorSeconds = 1
+    )
+
+    $floor = 1
+    if ($null -ne $SamplingFloorSeconds) { $floor = [int]$SamplingFloorSeconds }
+    if ($floor -lt 1) { $floor = 1 }
+
+    $record = [ordered]@{
+        status = 'resolved'
+        intervalSeconds = $floor
+        source = 'sampling-floor'
+        floorSeconds = $floor
+        reasons = @()
+    }
+
+    $requested = $RequestedSeconds
+    if ($null -ne $requested -and [string]::IsNullOrWhiteSpace([string]$requested)) { $requested = $null }
+    if ($null -ne $requested) {
+        $requestedValue = [double]$requested
+        if ($requestedValue -lt $floor) {
+            $record.status = 'refused-sub-second'
+            $record.intervalSeconds = $null
+            $record.source = 'requested'
+            $record.reasons = @('interval-below-floor:' + $floor)
+            return [pscustomobject]$record
+        }
+        $record.intervalSeconds = [int]$requestedValue
+        $record.source = 'requested'
+        return [pscustomobject]$record
+    }
+
+    if ($null -ne $PresetSeconds) {
+        $presetValue = [double]$PresetSeconds
+        if ($presetValue -lt $floor) {
+            $record.status = 'refused-sub-second'
+            $record.intervalSeconds = $null
+            $record.source = 'preset'
+            $record.reasons = @('preset-interval-below-floor:' + $floor)
+            return [pscustomobject]$record
+        }
+        $record.intervalSeconds = [int]$presetValue
+        $record.source = 'preset'
+    }
+    return [pscustomobject]$record
+}
+
+function Resolve-WpdCaptureMode {
+    <# Repro and Flight Recorder are mutually exclusive. Both selected is a stated
+       conflict, not a silent preference for one of them. #>
+    param(
+        [switch]$Repro,
+        [switch]$FlightRecorder,
+        [AllowNull()][string]$Preset,
+        [switch]$AcceptUnboundedFileMode
+    )
+
+    $record = [ordered]@{
+        status = 'not-requested'
+        captureMode = $null
+        strategy = $null
+        reasons = @()
+    }
+    if ($Repro -and $FlightRecorder) {
+        $record.status = 'conflicting-modes'
+        $record.reasons = @('repro-and-flight-recorder-are-mutually-exclusive')
+        return [pscustomobject]$record
+    }
+    if (-not $Repro -and -not $FlightRecorder) { return [pscustomobject]$record }
+
+    $mode = if ($FlightRecorder) { 'FlightRecorder' } else { 'Repro' }
+    $record.status = 'resolved'
+    $record.captureMode = $mode
+
+    if (Test-WpdModuleCommand -Name 'Get-WpdCaptureStrategy') {
+        try {
+            $strategyArguments = @{ CaptureMode = $mode; Preset = $Preset }
+            if ($AcceptUnboundedFileMode) { $strategyArguments['AcceptUnboundedFileMode'] = $true }
+            $strategy = Invoke-WpdModuleCall -Name 'Get-WpdCaptureStrategy' -Arguments $strategyArguments
+            $record.strategy = $strategy
+            return [pscustomobject]$record
+        }
+        catch {
+            $record.reasons = @('capture-strategy-error:' + $_.Exception.Message)
+            return [pscustomobject]$record
+        }
+    }
+
+    $record.strategy = [pscustomobject]@{
+        CaptureMode = $mode
+        BufferSemantics = 'circular-memory'
+        Unbounded = $false
+        Source = 'entry-point-default'
+        Note = 'The collector module is not loaded, so the strategy is the documented memory-mode default: bounded circular buffer, no unbounded file recording.'
+    }
+    return [pscustomobject]$record
+}
+
+function Get-WpdTier0InventorySnapshot {
+    <# Tier 0 inventory is collected at most once per run and served from a
+       session cache keyed by preset/privacy/host, because re-querying static
+       classes inside the sampling loop is the defect this replaces. -Refresh is
+       the explicit escape hatch. With no provider and no collector module the
+       snapshot is 'unavailable' with a reason - never a fabricated inventory. #>
+    param(
+        [AllowNull()][string]$CacheKey = 'tier0|default',
+        [AllowNull()][string]$Preset = 'general',
+        [AllowNull()][string]$PrivacyLevel = 'Standard',
+        [AllowNull()][object]$Provider,
+        [switch]$Refresh
+    )
+
+    if ($null -eq (Get-Variable -Scope Script -Name WpdTier0Cache -ErrorAction SilentlyContinue)) {
+        $script:WpdTier0Cache = @{}
+    }
+    if ([string]::IsNullOrWhiteSpace($CacheKey)) { $CacheKey = 'tier0|default' }
+
+    if ($Refresh -and $script:WpdTier0Cache.ContainsKey($CacheKey)) {
+        $script:WpdTier0Cache.Remove($CacheKey)
+    }
+    if ($script:WpdTier0Cache.ContainsKey($CacheKey)) {
+        $cached = $script:WpdTier0Cache[$CacheKey]
+        return [pscustomobject]@{
+            status = $cached.status
+            coverage = $cached.coverage
+            cached = $true
+            queries = $cached.queries
+            capabilities = @($cached.capabilities)
+            records = @($cached.records)
+            reasons = @($cached.reasons)
+            source = $cached.source
+            cacheKey = $CacheKey
+        }
+    }
+
+    $result = $null
+    $source = 'unavailable'
+    if ($null -ne $Provider) {
+        try {
+            $result = & $Provider
+            $source = 'injected-provider'
+        }
+        catch {
+            $result = $null
+            $source = 'provider-error:' + $_.Exception.Message
+        }
+    }
+    elseif (Test-WpdModuleCommand -Name 'Invoke-WpdTier0Collection') {
+        try {
+            $result = Invoke-WpdModuleCall -Name 'Invoke-WpdTier0Collection' -Arguments @{
+                CacheKey = $CacheKey
+                Preset = $Preset
+                PrivacyLevel = $PrivacyLevel
+            }
+            $source = 'Wpd.Collectors'
+        }
+        catch {
+            $result = $null
+            $source = 'collector-error:' + $_.Exception.Message
+        }
+    }
+
+    if ($null -eq $result) {
+        $snapshot = [pscustomobject]@{
+            status = 'unavailable'
+            coverage = 'unavailable'
+            cached = $false
+            queries = 0
+            capabilities = @()
+            records = @()
+            reasons = @('tier0-inventory-unavailable:' + $source)
+            source = $source
+            cacheKey = $CacheKey
+        }
+        $script:WpdTier0Cache[$CacheKey] = $snapshot
+        return $snapshot
+    }
+
+    $statusValue = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'status')
+    if ([string]::IsNullOrWhiteSpace($statusValue)) { $statusValue = 'partial' }
+    $coverageValue = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'coverage')
+    if ([string]::IsNullOrWhiteSpace($coverageValue)) { $coverageValue = 'partial' }
+    $recordsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'records'
+    if ($null -eq $recordsValue) { $recordsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'items' }
+    $reasonsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'reasons'
+    if ($null -eq $reasonsValue) { $reasonsValue = Get-WpdIntegrationProperty -InputObject $result -Name 'reason' }
+
+    $snapshot = [pscustomobject]@{
+        status = $statusValue
+        coverage = $coverageValue
+        cached = $false
+        queries = 1
+        capabilities = @(Get-WpdIntegrationProperty -InputObject $result -Name 'capabilities')
+        records = @($recordsValue)
+        reasons = @($reasonsValue)
+        source = $source
+        cacheKey = $CacheKey
+    }
+    $script:WpdTier0Cache[$CacheKey] = $snapshot
+    return $snapshot
+}
+
+function Get-WpdTier1SampleRow {
+    <# Pure Tier 1 sample transform: performance-COUNTER rows in, one sample row
+       out. It queries nothing, so it is exerciseable off Windows and, crucially,
+       so the sampling loop never re-queries a Tier 0 class
+       (Win32_OperatingSystem / Win32_Processor / Win32_LogicalDisk / Win32_Volume).
+       A missing counter row yields $null plus an explicit unavailable reason -
+       never zero, never a static value presented as a live measurement. #>
+    param(
+        [AllowNull()][object[]]$ProcessorCounterRows = @(),
+        [AllowNull()][object[]]$MemoryCounterRows = @(),
+        [AllowNull()][object[]]$LogicalDiskCounterRows = @(),
+        [AllowNull()][object[]]$SystemCounterRows = @()
+    )
+
+    $processorRows = @($ProcessorCounterRows)
+    $memoryRows = @($MemoryCounterRows)
+    $diskRows = @($LogicalDiskCounterRows)
+    $systemRows = @($SystemCounterRows)
+    $reasons = New-Object System.Collections.ArrayList
+
+    $perCore = @()
+    $totalCpu = $null
+    $totalUtility = $null
+    $totalUser = $null
+    $totalKernel = $null
+    $totalDpc = $null
+    $totalInterrupt = $null
+    $coreCount = 0
+
+    foreach ($row in $processorRows) {
+        $rowName = [string](Get-WpdIntegrationProperty -InputObject $row -Name 'Name')
+        $isTotal = ($rowName -eq '_Total' -or $rowName -like '*_Total')
+        $entry = [pscustomobject]@{
+            Name = $rowName
+            ProcessorNumber = if ($isTotal) { $null } else { $rowName }
+            IsTotal = $isTotal
+            CpuTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('CpuTimePercent', 'PercentProcessorTime', 'CpuTime', 'ProcessorTimePercent')
+            UtilityPercent = Get-WpdIntegrationNumber -InputObject $row -Names @('UtilityPercent', 'ProcessorUtilityPercent', 'ProcessorUtility', 'PercentProcessorUtility')
+            UserTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('UserTimePercent', 'PercentUserTime', 'UserPercent')
+            KernelTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('KernelTimePercent', 'PercentPrivilegedTime', 'PrivilegedTimePercent', 'KernelPercent')
+            DpcTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('DpcTimePercent', 'PercentDPCTime', 'PercentDpcTime')
+            InterruptTimePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('InterruptTimePercent', 'PercentInterruptTime')
+            DpcsQueuedPerSec = Get-WpdIntegrationNumber -InputObject $row -Names @('DpcsQueuedPerSec', 'DpcQueuedPerSec', 'DpcsQueued')
+            InterruptsPerSec = Get-WpdIntegrationNumber -InputObject $row -Names @('InterruptsPerSec', 'InterruptRate', 'Interrupts')
+        }
+        if ($isTotal) {
+            if ($null -eq $totalCpu) { $totalCpu = $entry.CpuTimePercent }
+            if ($null -eq $totalUtility) { $totalUtility = $entry.UtilityPercent }
+            if ($null -eq $totalUser) { $totalUser = $entry.UserTimePercent }
+            if ($null -eq $totalKernel) { $totalKernel = $entry.KernelTimePercent }
+            if ($null -eq $totalDpc) { $totalDpc = $entry.DpcTimePercent }
+            if ($null -eq $totalInterrupt) { $totalInterrupt = $entry.InterruptTimePercent }
+        }
+        else {
+            $coreCount++
+            $perCore += $entry
+        }
+    }
+
+    $cpuAverages = @()
+    foreach ($entry in $perCore) {
+        if ($null -ne $entry.CpuTimePercent) { $cpuAverages += $entry.CpuTimePercent }
+    }
+    if ($null -eq $totalCpu -and $cpuAverages.Count -gt 0) {
+        $totalCpu = [Math]::Round((($cpuAverages | Measure-Object -Average).Average), 2)
+    }
+    if ($null -eq $totalCpu) {
+        [void]$reasons.Add('cpu-counter-rows-unavailable')
+    }
+
+    $processorQueueLength = $null
+    $contextSwitchesPerSec = $null
+    foreach ($row in $systemRows) {
+        if ($null -eq $processorQueueLength) {
+            $processorQueueLength = Get-WpdIntegrationNumber -InputObject $row -Names @('ProcessorQueueLength', 'QueueLength', 'Queue')
+        }
+        if ($null -eq $contextSwitchesPerSec) {
+            $contextSwitchesPerSec = Get-WpdIntegrationNumber -InputObject $row -Names @('ContextSwitchesPerSec', 'ContextSwitchRate', 'ContextSwitches')
+        }
+    }
+
+    $availableBytes = $null
+    $commitPercent = $null
+    foreach ($row in $memoryRows) {
+        if ($null -eq $availableBytes) {
+            $availableBytes = Get-WpdIntegrationNumber -InputObject $row -Names @('AvailableBytes', 'AvailableMemoryBytes')
+        }
+        if ($null -eq $commitPercent) {
+            $commitPercent = Get-WpdIntegrationNumber -InputObject $row -Names @('CommitPercent', 'PercentCommittedBytesInUse', 'CommittedBytesInUsePercent')
+        }
+    }
+    $availableMemoryMegabytes = $null
+    if ($null -ne $availableBytes) {
+        $availableMemoryMegabytes = [Math]::Round(([double]$availableBytes / 1MB), 2)
+    }
+    else {
+        [void]$reasons.Add('memory-counter-rows-unavailable')
+    }
+
+    $logicalDisks = @()
+    $totalFreeBytes = $null
+    foreach ($row in $diskRows) {
+        # _Total already aggregates the volume rows; counting it again doubles
+        # the free-space total and presents an aggregate as a real volume.
+        $diskName = [string](Get-WpdIntegrationProperty -InputObject $row -Name 'Name')
+        if ($diskName -eq '_Total') { continue }
+        $freeMegabytes = Get-WpdIntegrationNumber -InputObject $row -Names @('FreeMegabytes', 'FreeMB', 'FreeMegaBytes')
+        $freeBytes = $null
+        if ($null -ne $freeMegabytes) { $freeBytes = [double]$freeMegabytes * 1MB }
+        $logicalDisks += [pscustomobject]@{
+            Name = [string](Get-WpdIntegrationProperty -InputObject $row -Name 'Name')
+            FreeBytes = $freeBytes
+            PercentFreeSpace = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentFreeSpace', 'PercentFree')
+            PercentFreePercent = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentFreeSpace', 'PercentFree')
+            PercentDiskReadTime = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentDiskReadTime')
+            PercentDiskWriteTime = Get-WpdIntegrationNumber -InputObject $row -Names @('PercentDiskWriteTime')
+        }
+        if ($null -ne $freeBytes) {
+            if ($null -eq $totalFreeBytes) { $totalFreeBytes = 0.0 }
+            $totalFreeBytes = $totalFreeBytes + $freeBytes
+        }
+    }
+    $totalFreeGB = $null
+    if ($null -ne $totalFreeBytes) { $totalFreeGB = [Math]::Round(([double]$totalFreeBytes / 1GB), 2) }
+    else { [void]$reasons.Add('logical-disk-counter-rows-unavailable') }
+
+    $coverage = [ordered]@{
+        cpu = if ($null -ne $totalCpu) { 'complete' } else { 'unavailable' }
+        scheduler = if ($null -ne $processorQueueLength -or $null -ne $contextSwitchesPerSec) { 'partial' } else { 'unavailable' }
+        dpcIsr = if ($null -ne $totalDpc -or $null -ne $totalInterrupt) { 'partial' } else { 'unavailable' }
+        memory = if ($null -ne $availableBytes) { 'complete' } else { 'unavailable' }
+        storage = if ($logicalDisks.Count -gt 0) { 'partial' } else { 'unavailable' }
+    }
+
+    return [pscustomobject]@{
+        AverageCpuLoadPercent = $totalCpu
+        CpuTimePercent = $totalCpu
+        CpuUtilityPercent = $totalUtility
+        CpuUserPercent = $totalUser
+        CpuKernelPercent = $totalKernel
+        DpcPercent = $totalDpc
+        InterruptPercent = $totalInterrupt
+        ProcessorQueueLength = $processorQueueLength
+        ContextSwitchesPerSec = $contextSwitchesPerSec
+        LogicalProcessorCount = $coreCount
+        PerCore = @($perCore)
+        AvailableBytes = $availableBytes
+        AvailableMemoryMB = $availableMemoryMegabytes
+        CommitPercent = $commitPercent
+        TotalLogicalDiskFreeGB = $totalFreeGB
+        LogicalDisks = @($logicalDisks)
+        Coverage = $coverage
+        CoverageStates = @($coverage.Keys)
+        UnavailableReasons = @($reasons)
+        CounterSources = [ordered]@{
+            processors = 'Win32_PerfFormattedData_PerfOS_Processor'
+            memory = 'Win32_PerfFormattedData_PerfOS_Memory'
+            logicalDisks = 'Win32_PerfFormattedData_PerfDisk_LogicalDisk'
+            system = 'Win32_PerfFormattedData_PerfOS_System'
+        }
+    }
+}
+
+function New-WpdIncidentMarkerPlan {
+    <# The incident marker set and the argv for each wpr -marker call. Marker
+       names are this toolkit's contract; the argv comes from the Etw module so no
+       undocumented switch can be introduced here. #>
+    param(
+        [AllowNull()][string[]]$MarkerName = @('CAPTURE_START', 'REPRO_START', 'INCIDENT_START', 'INCIDENT_PEAK', 'INCIDENT_END', 'CAPTURE_STOP'),
+        [AllowNull()][string]$WprExePath = 'wpr.exe'
+    )
+
+    $entries = @()
+    foreach ($name in @($MarkerName)) {
+        $commandRecord = $null
+        $status = 'unavailable'
+        $reason = 'etw-module-not-loaded'
+        if (Test-WpdModuleCommand -Name 'New-WpdEtwWprMarkerCommand') {
+            try {
+                $commandRecord = Invoke-WpdModuleCall -Name 'New-WpdEtwWprMarkerCommand' -Arguments @{ MarkerName = $name; ToolPath = $WprExePath }
+                $status = 'resolved'
+                $reason = $null
+            }
+            catch {
+                $status = 'unavailable'
+                $reason = 'marker-command-error:' + $_.Exception.Message
+            }
+        }
+        $entries += [pscustomobject]@{
+            marker = $name
+            status = $status
+            reason = $reason
+            tool = if ($null -ne $commandRecord) { $commandRecord.Tool } else { 'wpr' }
+            arguments = if ($null -ne $commandRecord) { @($commandRecord.Arguments) } else { @() }
+            usesDocumentedMarkerSwitch = ($null -ne $commandRecord)
+        }
+    }
+
+    return [pscustomobject]@{
+        mechanism = 'wpr -marker'
+        markerCount = @($entries).Count
+        markers = @($entries)
+        allCommandsResolved = (@($entries | Where-Object { $_.status -ne 'resolved' }).Count -eq 0)
+        note = 'Markers are placed inside the same capture window as the counters so the trace and the series share one time model.'
+    }
+}
+
+function New-WpdEscalationSelectionBlock {
+    <# Tier 3 is opt-in twice: a switch selects the adapters and consent enables
+       them. Without consent the block states the required consent and returns no
+       adapters, and nothing is executed. An absent tool is reported unsupported
+       by the module, never as healthy and never as a failed run. #>
+    param(
+        [AllowNull()][string[]]$RequestedAdapter = @(),
+        [switch]$Consent,
+        [AllowNull()][string]$PrivacyLevel = 'Standard'
+    )
+
+    $requested = @($RequestedAdapter | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $record = [ordered]@{
+        status = 'not-requested'
+        requested = @($requested)
+        consentRequired = ($requested.Count -gt 0)
+        consentGiven = [bool]$Consent
+        privacyLevel = $PrivacyLevel
+        automaticRemediation = $false
+        adapters = @()
+        reasons = @()
+        source = 'unavailable'
+    }
+    if ($requested.Count -eq 0) { return [pscustomobject]$record }
+
+    if (-not $Consent) {
+        $record.status = 'consent-required'
+        $record.reasons = @('tier3-escalations-require-explicit-consent')
+        return [pscustomobject]$record
+    }
+
+    if (Test-WpdModuleCommand -Name 'Get-WpdEscalationPlan') {
+        try {
+            $plan = Invoke-WpdModuleCall -Name 'Get-WpdEscalationPlan'
+            $descriptorsProperty = Get-WpdIntegrationProperty -InputObject $plan -Name 'Descriptors'
+            if ($null -ne $descriptorsProperty) {
+                $descriptors = @($descriptorsProperty)
+            }
+            else {
+                # Wpd.Escalation returns its descriptor collection directly;
+                # tolerate a wrapper object as well so the integration contract
+                # does not depend on one serialization shape.
+                $descriptors = @($plan)
+            }
+            # Entrypoint request identifiers and module descriptor identifiers
+            # are distinct vocabularies; preserve both through an explicit map.
+            $descriptorIds = @{ 'search-service-context' = 'search'; 'minifilter-enumeration' = 'minifilter'; 'wait-chain-traversal' = 'wct'; 'poolmon-tag-attribution' = 'pool' }
+            $wantedDescriptorIds = @($requested | ForEach-Object {
+                if ($descriptorIds.ContainsKey($_)) { $descriptorIds[$_] } else { $_ }
+            })
+            $selected = @($descriptors | Where-Object {
+                $descriptorId = Get-WpdIntegrationProperty -InputObject $_ -Name 'Id'
+                if ($null -eq $descriptorId) { $descriptorId = Get-WpdIntegrationProperty -InputObject $_ -Name 'id' }
+                $wantedDescriptorIds -contains [string]$descriptorId
+            })
+            $record.status = 'planned'
+            $record.source = 'Wpd.Escalation'
+            $record.adapters = @($selected)
+            if (@($selected).Count -ne $requested.Count) {
+                $record.reasons = @('some-requested-adapters-are-not-declared-by-the-escalation-module')
+            }
+            return [pscustomobject]$record
+        }
+        catch {
+            $record.status = 'unavailable'
+            $record.reasons = @('escalation-plan-error:' + $_.Exception.Message)
+            return [pscustomobject]$record
+        }
+    }
+
+    $record.status = 'planned'
+    $record.source = 'entry-point-request-list'
+    $record.adapters = @($requested | ForEach-Object { [pscustomobject]@{ Id = $_; Status = 'not-collected'; AbsentToolBehavior = 'report-unsupported' } })
+    $record.reasons = @('escalation-module-not-loaded:descriptors-not-resolved')
+    return [pscustomobject]$record
+}
+
+function New-WpdTieredPlanBlock {
+    <# The Plan-mode description of the tiered architecture. It states what WOULD
+       be collected and in which tier, and it collects nothing - Plan mode still
+       writes only diagnostic-plan.json. Every projected state is
+       not-collected/planned, never healthy. #>
+    param(
+        [AllowNull()][object]$Modules,
+        [AllowNull()][object]$PresetSelection,
+        [AllowNull()][object]$CapturePolicy,
+        [AllowNull()][object]$Tier1Interval,
+        [AllowNull()][object]$CaptureMode,
+        [AllowNull()][object]$EscalationBlock,
+        [AllowNull()][string]$PrivacyLevel = 'Standard',
+        [AllowNull()][object]$Tier = @(0, 1, 2)
+    )
+
+    $tiers = @(
+        [pscustomobject]@{ tier = 0; name = 'static-inventory'; collectedOnce = $true; cached = $true; projectedState = 'not-collected'; note = 'Collected once per run and served from the Tier 0 session cache; never re-queried inside the sampling loop.' }
+        [pscustomobject]@{ tier = 1; name = 'interval-counters'; collectedOnce = $false; cached = $false; projectedState = 'not-collected'; intervalSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'intervalSeconds'; floorSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'floorSeconds'; note = 'Performance counters at or above the 1 s floor; a sub-second request is refused rather than clamped.' }
+        [pscustomobject]@{ tier = 2; name = 'etw-wpr-recording'; collectedOnce = $false; cached = $false; projectedState = 'not-collected'; captureMode = Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'captureMode'; note = 'One WPR recording sharing the counter window; memory mode unless file mode is explicitly opted into.' }
+        [pscustomobject]@{ tier = 3; name = 'optional-escalation'; collectedOnce = $false; cached = $false; projectedState = 'not-collected'; consentRequired = $true; note = 'Off unless its switch and consent are both supplied; an absent tool is reported unsupported.' }
+    )
+
+    $selectedTiers = @($Tier | ForEach-Object { [int]$_ })
+    $block = [ordered]@{
+        schemaSurface = '1.3'
+        model = 'planner-collector-verifier with four collection tiers'
+        collectedTiers = @($selectedTiers)
+        tiers = @($tiers)
+        moduleSurface = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $Modules -Name 'status'
+            loaded = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'loaded')
+            missing = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'missing')
+        }
+        preset = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'status'
+            requested = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'requested'
+            effective = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'effective'
+            isAlias = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'isAlias'
+            displayName = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'displayName'
+            tier1Counters = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'tier1Counters')
+            tier1SampleIntervalSeconds = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'tier1SampleIntervalSeconds'
+            expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'expectedDurationSeconds'
+            analysisModules = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'analysisModules')
+            eventChannels = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'eventChannels')
+            escalationOptions = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'escalationOptions')
+            traceSizeBudget = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'traceSizeBudget'
+            privacyLevel = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'privacyLevel'
+            automaticRemediation = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'automaticRemediation'
+            source = Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'source'
+            canonicalNames = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'canonicalNames')
+            reasons = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'reasons')
+        }
+        capturePolicy = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'status'
+            profile = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'profile'
+            profileSpec = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'profileSpec'
+            qualifier = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'qualifier'
+            mode = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'mode'
+            unbounded = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'unbounded'
+            bufferSemantics = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'bufferSemantics'
+            traceBudgetMB = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'traceBudgetMB'
+            maxDurationSeconds = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'maxDurationSeconds'
+            expectedDurationSeconds = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'expectedDurationSeconds'
+            analysisTables = @(Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'analysisTables')
+            source = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'source'
+            reasons = @(Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'reasons')
+        }
+        captureMode = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'status'
+            mode = Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'captureMode'
+            reasons = @(Get-WpdIntegrationProperty -InputObject $CaptureMode -Name 'reasons')
+        }
+        tier1Cadence = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'status'
+            intervalSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'intervalSeconds'
+            floorSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'floorSeconds'
+            source = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'source'
+            reasons = @(Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'reasons')
+        }
+        privacy = [ordered]@{
+            level = $PrivacyLevel
+            defaultLevel = 'Standard'
+            optDown = ($PrivacyLevel -ne 'Standard')
+            secretsCollected = $false
+        }
+        escalation = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'status'
+            requested = @(Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'requested')
+            consentRequired = Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'consentRequired'
+            consentGiven = Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'consentGiven'
+            automaticRemediation = $false
+            reasons = @(Get-WpdIntegrationProperty -InputObject $EscalationBlock -Name 'reasons')
+        }
+        coveragePlan = [ordered]@{
+            states = @('complete', 'partial', 'unavailable', 'not-collected', 'unsupported')
+            noDataIsNeverHealth = $true
+            fields = @('collector', 'tier', 'status', 'coverage', 'recordCount', 'startedUtc', 'completedUtc', 'durationMs', 'reasons')
+        }
+        dataQualityPlan = [ordered]@{
+            fields = @('collector', 'metric', 'sampleCount', 'expectedSampleCount', 'coverage', 'intervals', 'gaps', 'reasons')
+            noDataIsNeverHealth = $true
+        }
+        evidenceIndexPlan = [ordered]@{
+            fields = @('id', 'artifact', 'path', 'metric', 'value', 'windowStart', 'windowEnd', 'sha256')
+            everyConclusionNeedsEvidence = $true
+        }
+        healthClaim = 'none'
+        neverHealthy = $true
+    }
+    return $block
+}
+
+function Invoke-WpdSelectedEscalations {
+    <# Execute only explicitly selected, read-only adapters. Publication is part
+       of success: unpersisted evidence never contributes to coverage/counts. #>
+    param(
+        [AllowNull()][string[]]$RequestedAdapter = @(),
+        [switch]$Consent,
+        [string]$PrivacyLevel = 'Standard',
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$CollectedArtifacts
+    )
+    $requested = @($RequestedAdapter | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $record = [ordered]@{ status = 'not-collected'; coverage = 'not-collected'; recordCount = 0; adapters = @(); reasons = @() }
+    if ($requested.Count -eq 0) { return [pscustomobject]$record }
+    if (-not $Consent) { throw 'Tier 3 execution requires explicit consent.' }
+    $allowed = @('minifilter-enumeration', 'search-service-context', 'wait-chain-traversal', 'poolmon-tag-attribution')
+    foreach ($id in $requested) {
+        if ($allowed -notcontains $id) { throw ('Unknown Tier 3 adapter: ' + $id) }
+    }
+    foreach ($id in $requested) {
+        $command = $null
+        if ($id -eq 'minifilter-enumeration') { $command = 'Invoke-WpdMinifilterEscalation' }
+        if ($id -eq 'search-service-context') { $command = 'Get-WpdSearchContext' }
+        $result = [pscustomobject]@{ status = 'unsupported'; coverage = 'unsupported'; reason = 'adapter-execution-not-wired'; items = @() }
+        try {
+            if ($null -ne $command -and (Test-WpdModuleCommand -Name $command)) {
+                $result = Invoke-WpdModuleCall -Name $command -Arguments @{ Consent = $true; PrivacyLevel = $PrivacyLevel }
+            }
+            elseif ($null -ne $command) {
+                $result.reason = 'escalation-module-command-unavailable'
+            }
+            $status = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'status')
+            $coverage = [string](Get-WpdIntegrationProperty -InputObject $result -Name 'coverage')
+            if (@('success', 'partial', 'unavailable', 'unsupported', 'not-collected', 'error') -notcontains $status) { throw 'Adapter returned an invalid result status.' }
+            if (@('complete', 'partial', 'unavailable', 'unsupported', 'not-collected') -notcontains $coverage) { throw 'Adapter returned an invalid coverage state.' }
+            $directory = Join-Path $OutputDirectory 'escalation'
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+            $relative = 'escalation/' + $id + '.json'
+            Write-JsonFile -InputObject $result -Path (Join-Path $OutputDirectory $relative)
+            [void]$CollectedArtifacts.Add($relative)
+            $count = @(Get-WpdIntegrationProperty -InputObject $result -Name 'items' | Where-Object { $null -ne $_ }).Count
+            if ($id -eq 'search-service-context') {
+                $count = 0
+                $data = Get-WpdIntegrationProperty -InputObject $result -Name 'data'
+                foreach ($field in @('service', 'index')) {
+                    if ($null -ne (Get-WpdIntegrationProperty -InputObject $data -Name $field)) { $count++ }
+                }
+            }
+            if ($status -notin @('success', 'partial')) { $count = 0 }
+            $record.recordCount += $count
+            $record.adapters += [pscustomobject]@{ id = $id; status = $status; coverage = $coverage; recordCount = $count; artifact = $relative; reason = Get-WpdIntegrationProperty -InputObject $result -Name 'reason'; startedUtc = Get-WpdIntegrationProperty -InputObject $result -Name 'startedUtc'; completedUtc = Get-WpdIntegrationProperty -InputObject $result -Name 'completedUtc' }
+        }
+        catch {
+            $record.adapters += [pscustomobject]@{ id = $id; status = 'error'; coverage = 'unavailable'; recordCount = 0; artifact = $null; reason = 'escalation-execution-or-publication-failed' }
+        }
+    }
+    $successful = @($record.adapters | Where-Object { $_.status -in @('success', 'partial') })
+    if ($successful.Count -eq $requested.Count -and @($record.adapters | Where-Object { $_.coverage -ne 'complete' }).Count -eq 0) {
+        $record.status = 'success'; $record.coverage = 'complete'
+    }
+    elseif ($successful.Count -gt 0) { $record.status = 'partial'; $record.coverage = 'partial' }
+    else { $record.status = 'unavailable'; $record.coverage = 'unavailable' }
+    $record.reasons = @($record.adapters | Where-Object { $_.status -ne 'success' } | ForEach-Object { $_.id + ':' + $_.reason })
+    return [pscustomobject]$record
+}
+
+function New-WpdTieredCollectBlock {
+    <# The Collect-mode counterpart: real per-tier envelopes in, one manifest
+       block out. Missing tiers stay not-collected; a tier whose collector failed
+       stays unavailable with its reason. No status is ever healthy. #>
+    param(
+        [AllowNull()][object]$Modules,
+        [AllowNull()][object]$Tier0,
+        [AllowNull()][object]$Tier2,
+        [AllowNull()][object]$Tier3,
+        [AllowNull()][object]$PresetSelection,
+        [AllowNull()][object]$CapturePolicy,
+        [AllowNull()][object]$Tier1Interval,
+        [AllowNull()][object]$CoverageRecords = @(),
+        [AllowNull()][object]$DataQualityRecords = @(),
+        [AllowNull()][object]$EvidenceIndex = $null
+    )
+
+    $tier0Status = [string](Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'status')
+    $tier0Coverage = [string](Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'coverage')
+    $tier2Status = [string](Get-WpdIntegrationProperty -InputObject $Tier2 -Name 'status')
+    $tier2Coverage = [string](Get-WpdIntegrationProperty -InputObject $Tier2 -Name 'coverage')
+    $tier3Status = [string](Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'status')
+    $tier3Coverage = [string](Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'coverage')
+
+    $block = [ordered]@{
+        schemaSurface = '1.3'
+        model = 'planner-collector-verifier with four collection tiers'
+        moduleSurface = [ordered]@{
+            status = Get-WpdIntegrationProperty -InputObject $Modules -Name 'status'
+            loaded = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'loaded')
+            missing = @(Get-WpdIntegrationProperty -InputObject $Modules -Name 'missing')
+        }
+        tier0 = [ordered]@{
+            status = $tier0Status
+            coverage = $tier0Coverage
+            cached = Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'cached'
+            queries = Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'queries'
+            capabilityCount = @(Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'capabilities').Count
+            reason = @(Get-WpdIntegrationProperty -InputObject $Tier0 -Name 'reasons')
+        }
+        tier1 = [ordered]@{
+            intervalSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'intervalSeconds'
+            floorSeconds = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'floorSeconds'
+            cadenceStatus = Get-WpdIntegrationProperty -InputObject $Tier1Interval -Name 'status'
+            counters = @(Get-WpdIntegrationProperty -InputObject $PresetSelection -Name 'tier1Counters')
+        }
+        tier2 = [ordered]@{
+            status = $tier2Status
+            coverage = $tier2Coverage
+            profile = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'profileSpec'
+            bufferSemantics = Get-WpdIntegrationProperty -InputObject $CapturePolicy -Name 'bufferSemantics'
+        }
+        tier3 = [ordered]@{
+            status = $tier3Status
+            coverage = $tier3Coverage
+            recordCount = Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'recordCount'
+            adapters = @(Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'adapters')
+            reasons = @(Get-WpdIntegrationProperty -InputObject $Tier3 -Name 'reasons')
+            consentRequired = $true
+            automaticRemediation = $false
+        }
+        coverage = @($CoverageRecords)
+        dataQuality = @($DataQualityRecords)
+        evidenceIndex = $EvidenceIndex
+        healthClaim = 'none'
+        neverHealthy = $true
+    }
+    return $block
+}
+
+function Write-WpdTechnicianReportHandoff {
+    <# Findings -> technician report artifact. When the report module is not
+       loaded the handoff is unavailable with a reason and no file is written, so
+       a missing module can never be mistaken for a generated report. #>
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [AllowNull()][object[]]$Findings = @(),
+        [AllowNull()][object]$EvidenceIndex,
+        [AllowNull()][object[]]$Artifacts = @(),
+        [AllowNull()][object[]]$DataQuality = @(),
+        [AllowNull()][object[]]$Timeline = @(),
+        [AllowNull()][object[]]$ProcessSamples = @(),
+        [AllowNull()][object]$Incident,
+        [AllowNull()][object]$Manifest,
+        [AllowNull()][object[]]$Samples = @(),
+        [AllowNull()][object[]]$DiskSeries = @(),
+        [AllowNull()][object[]]$EventRows = @(),
+        [AllowNull()][string]$RelativePath = 'case\technician-report.html'
+    )
+
+    $record = [ordered]@{
+        status = 'unavailable'
+        artifact = $RelativePath.Replace([char]92, '/')
+        reason = 'report-module-not-loaded'
+        findingCount = @($Findings).Count
+    }
+    if (-not (Test-WpdModuleCommand -Name 'New-WpdTechnicianReport') -or -not (Test-WpdModuleCommand -Name 'Write-WpdReportHtml')) {
+        return [pscustomobject]$record
+    }
+
+    try {
+        $report = Invoke-WpdModuleCall -Name 'New-WpdTechnicianReport' -Arguments @{
+            Findings = @($Findings)
+            EvidenceIndex = $EvidenceIndex
+            Artifacts = @($Artifacts)
+            DataQuality = @($DataQuality)
+            Timeline = @($Timeline)
+            ProcessSamples = @($ProcessSamples)
+            Incident = $Incident
+            Manifest = $Manifest
+            Samples = @($Samples)
+            DiskSeries = @($DiskSeries)
+            EventRows = @($EventRows)
+        }
+        $target = Join-Path -Path $OutputDirectory -ChildPath $RelativePath
+        $parent = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        $null = Invoke-WpdModuleCall -Name 'Write-WpdReportHtml' -Arguments @{
+            Path = $target
+            Report = $report
+        }
+        $record.status = 'written'
+        $record.reason = $null
+        $record.outcome = $report.Outcome
+        return [pscustomobject]$record
+    }
+    catch {
+        $record.status = 'unavailable'
+        $record.reason = 'report-generation-error:' + $_.Exception.Message
+        return [pscustomobject]$record
+    }
+}
+
+# ---- End of the tiered integration surface ---------------------------------
+
+# ---- Tiered run resolution (Plan and Collect share these resolvers) ---------
+# The requested preset, the capture policy, the Tier 1 cadence and the capture
+# mode are resolved before either mode dispatches, so a Plan manifest describes
+# exactly what Collect would do. Resolution reads configuration and modules only
+# - it creates no directory and writes no artifact.
+$script:WpdModuleSurface = Import-WpdModuleSurface
+$script:WpdPresetPath = Get-WpdPresetConfigurationPath
+$script:WpdPresetDocument = Get-WpdPresetDocument -Path $script:WpdPresetPath
+$script:WpdPresetSelection = Resolve-WpdPresetSelection -Preset $Preset -PresetDocument $script:WpdPresetDocument
+$script:WpdCapturePolicy = Resolve-WpdPresetCapturePolicy -Selection $script:WpdPresetSelection -AllowFileMode:$AllowWprFileMode
+
+$script:WpdRequestedTier1Seconds = $null
+if ($Tier1IntervalSeconds -gt 0) { $script:WpdRequestedTier1Seconds = $Tier1IntervalSeconds }
+$script:WpdTier1Interval = Resolve-WpdTier1Interval `
+    -RequestedSeconds $script:WpdRequestedTier1Seconds `
+    -PresetSeconds $script:WpdPresetSelection.tier1SampleIntervalSeconds `
+    -SamplingFloorSeconds $script:WpdPresetSelection.samplingFloorSeconds
+
+$script:WpdCaptureMode = Resolve-WpdCaptureMode `
+    -Repro:$Repro `
+    -FlightRecorder:$FlightRecorder `
+    -Preset $script:WpdPresetSelection.effective `
+    -AcceptUnboundedFileMode:$AcceptUnboundedFileMode
+
+$script:WpdRequestedEscalationAdapter = @()
+if ($CollectWaitChains) { $script:WpdRequestedEscalationAdapter += 'wait-chain-traversal' }
+if ($CollectPoolEscalation) { $script:WpdRequestedEscalationAdapter += 'poolmon-tag-attribution' }
+if ($CollectSearchContext) { $script:WpdRequestedEscalationAdapter += 'search-service-context' }
+if ($CollectMinifilters) { $script:WpdRequestedEscalationAdapter += 'minifilter-enumeration' }
+
+$script:WpdEffectivePrivacyLevel = $PrivacyLevel
+if ($null -ne $script:WpdPresetSelection.privacyLevel -and $PrivacyLevel -eq 'Standard') {
+    # Redacted is a stricter level than the preset's own default, so a preset may
+    # raise privacy but never lower it.
+    $script:WpdEffectivePrivacyLevel = [string]$script:WpdPresetSelection.privacyLevel
+}
+$script:WpdFullPrivacyConsentMissing = ($script:WpdEffectivePrivacyLevel -eq 'Full' -and -not $ConfirmFullPrivacy)
+
+$script:WpdEscalationBlock = New-WpdEscalationSelectionBlock `
+    -RequestedAdapter $script:WpdRequestedEscalationAdapter `
+    -Consent:$ConfirmEscalationCollection `
+    -PrivacyLevel $script:WpdEffectivePrivacyLevel
+
+# The tiered layer is engaged when the operator asked for a preset, a capture
+# mode or a cadence, or asked for an escalation. A plain v1 run stays v1.
+$script:WpdTieredEngaged = (
+    (-not [string]::IsNullOrWhiteSpace($Preset)) -or
+    $Repro -or $FlightRecorder -or
+    ($Tier1IntervalSeconds -gt 0) -or
+    ($script:WpdRequestedEscalationAdapter.Count -gt 0)
+)
+$script:WpdTieredReason = @()
+if (-not [string]::IsNullOrWhiteSpace($Preset)) { $script:WpdTieredReason += 'preset-selected' }
+if ($Repro) { $script:WpdTieredReason += 'repro-mode' }
+if ($FlightRecorder) { $script:WpdTieredReason += 'flight-recorder-mode' }
+if ($Tier1IntervalSeconds -gt 0) { $script:WpdTieredReason += 'explicit-tier1-interval' }
+if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { $script:WpdTieredReason += 'escalation-selected' }
+
+$script:WpdTieredTiers = @(0, 1)
+if ($CaptureWpr -or $script:WpdCaptureMode.status -eq 'resolved') { $script:WpdTieredTiers += 2 }
+if ($script:WpdRequestedEscalationAdapter.Count -gt 0) { $script:WpdTieredTiers += 3 }
+
+if ($script:WpdRequestedEscalationAdapter.Count -gt 0 -and -not $ConfirmEscalationCollection) {
+    throw ('Tier 3 escalation adapters ({0}) require -ConfirmEscalationCollection. No diagnostic data was collected.' -f ($script:WpdRequestedEscalationAdapter -join ', '))
+}
+if ($script:WpdFullPrivacyConsentMissing) {
+    throw 'Privacy level Full requires -ConfirmFullPrivacy. No diagnostic data was collected.'
+}
+
+# Fail closed on an unusable tiered request rather than silently degrading it.
+if ($script:WpdCaptureMode.status -eq 'conflicting-modes') {
+    throw 'Repro and Flight Recorder modes are mutually exclusive. No diagnostic data was collected.'
+}
+if ($script:WpdPresetSelection.status -eq 'unknown-preset') {
+    throw ("Unknown preset '{0}'. Known presets: {1}" -f $Preset, (@($script:WpdPresetSelection.canonicalNames) -join ', '))
+}
+if ($script:WpdTier1Interval.status -eq 'refused-sub-second') {
+    throw ('Tier 1 interval {0} s is below the documented {1} s floor. Performance counters are not designed for sub-second collection; no diagnostic data was collected.' -f $Tier1IntervalSeconds, $script:WpdTier1Interval.floorSeconds)
+}
+# A profile this entry point does not accept is refused for a collecting run; in
+# Plan mode it is described (status unsupported-profile-name) so the operator can
+# see the problem instead of getting no plan at all.
+if ($script:WpdCapturePolicy.status -eq 'unsupported-profile-name' -and $Mode -ne 'Plan') {
+    throw ('Preset ''{0}'' selects WPR profile ''{1}'', which this entry point does not accept. Confirm the profile with "wpr -profiles" and pass -WprProfile explicitly; the profile was not substituted.' -f $Preset, (@($script:WpdCapturePolicy.reasons) -join '; '))
+}
+if ($script:WpdTieredEngaged -and $script:WpdPresetSelection.status -eq 'resolved' -and $script:WpdCapturePolicy.status -eq 'unsupported' -and $Mode -ne 'Plan') {
+    throw ('Preset ''{0}'' has no usable WPR capture policy ({1}). No diagnostic data was collected.' -f $Preset, (@($script:WpdCapturePolicy.reasons) -join '; '))
+}
+
+# The preset drives the recording profile and the Tier 1 cadence when the
+# operator did not override them explicitly. An explicit switch always wins.
+if (-not $PSBoundParameters.ContainsKey('WprProfile') -and $script:WpdCapturePolicy.status -eq 'resolved' -and -not [string]::IsNullOrWhiteSpace([string]$script:WpdCapturePolicy.profile)) {
+    $WprProfile = [string]$script:WpdCapturePolicy.profile
+}
+if (-not $PSBoundParameters.ContainsKey('SampleIntervalSeconds') -and $null -ne $script:WpdTier1Interval.intervalSeconds) {
+    $SampleIntervalSeconds = [int]$script:WpdTier1Interval.intervalSeconds
+}
+
+if (Test-CasePathIsNetworkShare -Path $OutputDirectory) {
+    throw "OutputDirectory '$OutputDirectory' is a network-share path; local collection requires a local destination."
+}
 try {
     $resolvedOutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 }
@@ -3786,6 +6465,7 @@ if ($CollectMinidumps) {
 
 if ($CollectBootFailureLogs) {
     $planManifest.plannedActions += 'collect-boot-failure-evidence-after-explicit-consent'
+    $planManifest.plannedActions += 'analyze-servicing-logs-after-explicit-consent'
     $planManifest.bootFailureLogs = [ordered]@{
         maxBytesPerFile = $script:MaxBootFailureLogBytes
         sources = @('srt-trail', 'boot-log', 'cbs-log', 'setupapi-panther', 'setupapi-error', 'dism-log')
@@ -3830,9 +6510,55 @@ if ($SymptomContext -or $Preset) {
     $planManifest.symptom = $symptomBlock
 }
 
+# The tiered architecture is described in every plan (it is the architecture the
+# tool implements, not a mode), while the preset/capture/escalation detail is
+# added when the operator selected it. Plan mode still writes exactly one
+# artifact - diagnostic-plan.json - and creates no collector output.
+$planManifest.tiers = New-WpdTieredPlanBlock `
+    -Modules $script:WpdModuleSurface `
+    -PresetSelection $script:WpdPresetSelection `
+    -CapturePolicy $script:WpdCapturePolicy `
+    -Tier1Interval $script:WpdTier1Interval `
+    -CaptureMode $script:WpdCaptureMode `
+    -EscalationBlock $script:WpdEscalationBlock `
+    -PrivacyLevel $script:WpdEffectivePrivacyLevel `
+    -Tier $script:WpdTieredTiers
+
+if ($script:WpdFullPrivacyConsentMissing) {
+    $planManifest.tiers.privacy.consentMissing = $true
+    $planManifest.tiers.privacy.consentSwitch = '-ConfirmFullPrivacy'
+    $planManifest.tiers.privacy.reason = 'Full privacy requires -ConfirmFullPrivacy; Redacted was applied instead.'
+}
+
+if ($script:WpdTieredEngaged) {
+    $planManifest.plannedActions += 'collect-tier0-static-inventory-once-per-run'
+    $planManifest.plannedActions += 'sample-tier1-performance-counters-at-or-above-the-floor'
+    $planManifest.plannedActions += 'mark-the-incident-with-wpr-marker-inside-the-capture-window'
+    $planManifest.plannedActions += 'write-coverage-data-quality-and-evidence-index-blocks'
+    if ($script:WpdCaptureMode.status -eq 'resolved') {
+        if ($script:WpdCaptureMode.captureMode -eq 'FlightRecorder') {
+            $planManifest.plannedActions += 'run-the-flight-recorder-circular-capture'
+        }
+        else {
+            $planManifest.plannedActions += 'run-the-repro-bounded-capture'
+        }
+    }
+    if ($script:WpdTieredTiers -contains 3) {
+        $planManifest.plannedActions += 'collect-optional-tier3-escalations-after-explicit-consent'
+    }
+    $planManifest.tieredReason = @($script:WpdTieredReason)
+    $planManifest.schemaVersion = '1.3'
+}
+
 if ($Mode -eq 'Plan') {
     try {
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
         New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
     }
     catch {
         throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
@@ -3871,14 +6597,72 @@ if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw 'Collect mode is supported only on Windows. Use -Mode Plan for a non-collecting safety plan.'
 }
 
-# Consent gates passed: only now may the output directory be created, so a
-# consent-refusing Collect leaves no side effects behind.
+# Consent and platform gates passed. A default Collect gets a newly reserved
+# child; an explicit OutputDirectory remains the exact legacy case directory.
+if (-not $script:WpdOutputDirectoryWasExplicit -and -not $script:WpdCasePathModuleAvailable) {
+    throw 'Wpd.CasePath.psm1 is required for default Collect case-folder allocation. Restore the module or pass an explicit -OutputDirectory.'
+}
 try {
-    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+    if (-not $script:WpdOutputDirectoryWasExplicit) {
+        $resolvedOutputDirectory = New-WpdCaseDirectory -BaseDirectory $resolvedOutputDirectory
+        $OutputDirectory = $resolvedOutputDirectory
+    }
+    else {
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
+        New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($resolvedOutputDirectory)) -Candidate $resolvedOutputDirectory) {
+            throw 'OutputDirectory is a reparse point and is not a safe case root.'
+        }
+    }
 }
 catch {
     throw "OutputDirectory '$OutputDirectory' is not a valid local path: $($_.Exception.Message)"
 }
+
+$caseLeaf = [System.IO.Path]::GetFileName($resolvedOutputDirectory.TrimEnd([char]92, [char]47))
+$caseNameMatch = [regex]::Match($caseLeaf, '^(?<stamp>\d{8}T\d{9}Z)-(?<runId>[A-Za-z0-9-]{1,64})$')
+$script:WpdRunId = if ($caseNameMatch.Success) { $caseNameMatch.Groups['runId'].Value } else { [Guid]::NewGuid().ToString('N') }
+if (-not [string]::IsNullOrWhiteSpace($RunReceiptPath)) {
+    if ($script:WpdOutputDirectoryWasExplicit -or -not $caseNameMatch.Success) {
+        throw 'RunReceiptPath is supported only for an automatically reserved run directory.'
+    }
+    $receiptFullPath = [System.IO.Path]::GetFullPath($RunReceiptPath)
+    if ([System.IO.Directory]::Exists($receiptFullPath)) {
+        throw "RunReceiptPath is a directory: $receiptFullPath"
+    }
+    $receipt = [ordered]@{
+        schemaVersion = '1'
+        casePath = $resolvedOutputDirectory
+        runId = $script:WpdRunId
+    }
+    $receiptStream = $null
+    try {
+        $receiptStream = [System.IO.File]::Open($receiptFullPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $receiptBytes = [System.Text.Encoding]::UTF8.GetBytes(($receipt | ConvertTo-Json -Compress))
+        $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
+        $receiptStream.Flush()
+    }
+    finally {
+        if ($null -ne $receiptStream) { $receiptStream.Dispose() }
+    }
+}
+
+$script:WpdRunTranscriptStarted = $false
+$transcriptPath = Join-Path -Path $resolvedOutputDirectory -ChildPath ('diagnostics-run-' + $script:WpdRunId + '.log')
+$transcriptReservation = [System.IO.File]::Open($transcriptPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+$transcriptReservation.Dispose()
+trap {
+    if ($script:WpdRunTranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch { }
+        $script:WpdRunTranscriptStarted = $false
+    }
+    throw $_
+}
+Start-Transcript -LiteralPath $transcriptPath -Append -ErrorAction Stop | Out-Null
+$script:WpdRunTranscriptStarted = $true
+Write-Output "Collection case directory: $resolvedOutputDirectory"
 
 $script:collectionErrors = New-Object System.Collections.ArrayList
 
@@ -3992,7 +6776,15 @@ if ($RemoteComputer) {
 
         $remoteManifestPath = Join-Path $remoteOutDir 'diagnostic-manifest.json'
         $localManifestPath = Join-Path $resolvedOutputDirectory 'diagnostic-manifest.json'
-        Copy-Item -FromSession $session -Path $remoteManifestPath -Destination $localManifestPath -Force
+        $localManifestTemporaryPath = Join-Path $resolvedOutputDirectory ('.diagnostic-manifest.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            $null = Assert-CaseFileDestinationSafe -Path $localManifestTemporaryPath
+            Copy-Item -FromSession $session -Path $remoteManifestPath -Destination $localManifestTemporaryPath
+            $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $localManifestTemporaryPath -DestinationPath $localManifestPath
+        }
+        finally {
+            if ([System.IO.File]::Exists($localManifestTemporaryPath)) { [System.IO.File]::Delete($localManifestTemporaryPath) }
+        }
         $remotePulledManifest = Get-Content -LiteralPath $localManifestPath -Raw | ConvertFrom-Json
         if ($remotePulledManifest.mode -ne 'Collect') {
             throw 'Remote manifest mode was not Collect; refusing to certify the pulled case.'
@@ -4003,10 +6795,24 @@ if ($RemoteComputer) {
             $remoteArtifactPath = Join-Path $remoteOutDir $artifactName
             $localArtifactPath = Join-Path $resolvedOutputDirectory $artifactName
             $localArtifactDir = Split-Path -Parent $localArtifactPath
+            if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($localArtifactDir)) -Candidate $localArtifactDir) {
+                throw "Remote artifact directory contains a reparse point: $localArtifactDir"
+            }
             if (-not (Test-Path -LiteralPath $localArtifactDir)) {
                 New-Item -ItemType Directory -Force -Path $localArtifactDir | Out-Null
             }
-            Copy-Item -FromSession $session -Path $remoteArtifactPath -Destination $localArtifactPath -Force
+            if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($localArtifactDir)) -Candidate $localArtifactDir) {
+                throw "Remote artifact directory became a reparse point: $localArtifactDir"
+            }
+            $localArtifactTemporaryPath = Join-Path $localArtifactDir ('.' + [System.IO.Path]::GetFileName($localArtifactPath) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            try {
+                $null = Assert-CaseFileDestinationSafe -Path $localArtifactTemporaryPath
+                Copy-Item -FromSession $session -Path $remoteArtifactPath -Destination $localArtifactTemporaryPath
+                $null = Move-CaseTemporaryFileIntoPlace -TemporaryPath $localArtifactTemporaryPath -DestinationPath $localArtifactPath
+            }
+            finally {
+                if ([System.IO.File]::Exists($localArtifactTemporaryPath)) { [System.IO.File]::Delete($localArtifactTemporaryPath) }
+            }
             $remotePulledFileCount++
             $localHash = (Get-FileHash -LiteralPath $localArtifactPath -Algorithm SHA256).Hash
             if ($localHash -eq $artifact.Sha256) {
@@ -4102,6 +6908,9 @@ if ($RemoteComputer) {
         }
     }
 
+    Complete-WpdRunTranscript -TranscriptPath $transcriptPath -ArtifactNames $collectedArtifacts -TranscriptStarted:$script:WpdRunTranscriptStarted
+    $script:WpdRunTranscriptStarted = $false
+    $collectionManifest.artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
     $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
     Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
     if ($ZipOutput) {
@@ -4109,14 +6918,63 @@ if ($RemoteComputer) {
         Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
     }
     if ($remoteStatus -eq 'completed') {
+        if ($script:WpdRunTranscriptStarted) {
+            Stop-Transcript | Out-Null
+            $script:WpdRunTranscriptStarted = $false
+        }
         Write-Output "Remote collection complete. Manifest written to $collectionManifestPath"
         exit 0
+    }
+    if ($script:WpdRunTranscriptStarted) {
+        Stop-Transcript | Out-Null
+        $script:WpdRunTranscriptStarted = $false
     }
     Write-Output "Remote collection failed. Manifest written to $collectionManifestPath"
     exit 1
 }
 
 $collectedArtifacts = New-Object System.Collections.ArrayList
+
+# ---- Tier 0: static inventory, collected once per run ------------------------
+# Every static class the sampling loop used to re-query is collected here and
+# served from the Tier 0 session cache for the rest of the run. The snapshot is
+# written as its own artifact so coverage can cite it, and an unavailable
+# snapshot stays unavailable with a reason instead of a fabricated inventory.
+$script:WpdTier0Snapshot = $null
+$script:WpdTier0Artifact = 'inventory/tier0-inventory.json'
+$script:WpdPerCoreCpuSeries = New-Object System.Collections.ArrayList
+if ($script:WpdTieredEngaged) {
+    $tier0CacheKey = ('tier0|{0}|{1}|{2}' -f $script:WpdPresetSelection.effective, $script:WpdEffectivePrivacyLevel, $env:COMPUTERNAME)
+    $script:WpdTier0Snapshot = Get-WpdTier0InventorySnapshot `
+        -CacheKey $tier0CacheKey `
+        -Preset $script:WpdPresetSelection.effective `
+        -PrivacyLevel $script:WpdEffectivePrivacyLevel `
+        -Refresh:$RefreshInventory
+    try {
+        $inventoryDirectory = Join-Path -Path $resolvedOutputDirectory -ChildPath 'inventory'
+        if (-not (Test-Path -LiteralPath $inventoryDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $inventoryDirectory | Out-Null
+        }
+        Write-JsonFile -InputObject ([ordered]@{
+                status = $script:WpdTier0Snapshot.status
+                coverage = $script:WpdTier0Snapshot.coverage
+                preset = $script:WpdPresetSelection.effective
+                privacyLevel = $script:WpdEffectivePrivacyLevel
+                cached = $script:WpdTier0Snapshot.cached
+                source = $script:WpdTier0Snapshot.source
+                capabilities = @($script:WpdTier0Snapshot.capabilities)
+                records = @($script:WpdTier0Snapshot.records)
+                reasons = @($script:WpdTier0Snapshot.reasons)
+                collectedOncePerRun = $true
+                healthClaim = 'none'
+            }) -Path (Join-Path -Path $inventoryDirectory -ChildPath 'tier0-inventory.json')
+        [void]$collectedArtifacts.Add($script:WpdTier0Artifact)
+    }
+    catch {
+        Add-CollectionError -Stage 'tier0-inventory-export' -ErrorRecord $_
+    }
+}
+
 $startedAtUtc = Get-UtcTimestamp
 $systemSummary = [ordered]@{}
 try {
@@ -4227,7 +7085,7 @@ if ($MarkerMode) {
         try {
             [void](Read-Host 'Press Enter (or type MARK) when the slowdown happens')
             $stamp = (Get-Date).ToUniversalTime().ToString('o')
-            Set-Content -LiteralPath $Path -Value $stamp -Encoding Ascii -ErrorAction Stop
+            Write-CaseFileAtomically -Path $Path -Content $stamp
             return [pscustomobject]@{ MarkerFile = $Path; WrittenAtUtc = $stamp }
         }
         catch {
@@ -4257,14 +7115,37 @@ $captureComplete = $false
 # the operator marks the slowdown (whichever comes first once a marker exists).
 while (-not $captureComplete) {
     try {
-        $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
-        $processors = Get-CimInstance -ClassName Win32_Processor
-        $logicalDisks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 3"
+        # Tier 1 samples read performance-COUNTER classes only. Static inventory
+        # (operating system, processor identity, volumes) was collected once into
+        # the Tier 0 snapshot above; re-querying those classes here is the defect
+        # this loop no longer has. The row transform is pure, so a missing counter
+        # yields $null plus a stated reason rather than a zero or a cached value
+        # presented as a live measurement.
+        $tier1Row = Get-WpdTier1SampleRow `
+            -ProcessorCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_Processor' -ErrorAction SilentlyContinue) `
+            -MemoryCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_Memory' -ErrorAction SilentlyContinue) `
+            -LogicalDiskCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfDisk_LogicalDisk' -ErrorAction SilentlyContinue) `
+            -SystemCounterRows @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_PerfOS_System' -ErrorAction SilentlyContinue)
         $sampleTimestamp = Get-UtcTimestamp
-        $cpuLoads = @($processors | ForEach-Object { Get-SafeObjectProperty -InputObject $_ -Name 'LoadPercentage' } | Where-Object { $null -ne $_ })
-        $averageCpuLoad = $null
-        if ($cpuLoads.Count -gt 0) {
-            $averageCpuLoad = [Math]::Round((($cpuLoads | Measure-Object -Average).Average), 2)
+        $averageCpuLoad = $tier1Row.AverageCpuLoadPercent
+        foreach ($tier1Reason in @($tier1Row.UnavailableReasons)) {
+            Add-CollectionErrorText -Stage 'tier1-counter-sample' -Message $tier1Reason
+        }
+        if ($script:WpdPerCoreCpuSeries -is [System.Collections.ArrayList]) {
+            [void]$script:WpdPerCoreCpuSeries.Add([pscustomobject]@{
+                    TimestampUtc = $sampleTimestamp
+                    LogicalProcessorCount = $tier1Row.LogicalProcessorCount
+                    AverageCpuTimePercent = $tier1Row.CpuTimePercent
+                    AverageUtilityPercent = $tier1Row.CpuUtilityPercent
+                    AverageUserTimePercent = $tier1Row.CpuUserPercent
+                    AverageKernelTimePercent = $tier1Row.CpuKernelPercent
+                    AverageDpcPercent = $tier1Row.DpcPercent
+                    AverageInterruptPercent = $tier1Row.InterruptPercent
+                    ProcessorQueueLength = $tier1Row.ProcessorQueueLength
+                    ContextSwitchesPerSec = $tier1Row.ContextSwitchesPerSec
+                    PerCore = @($tier1Row.PerCore)
+                    Coverage = $tier1Row.Coverage
+                })
         }
 
         $memMetrics = Get-MemoryMetrics
@@ -4367,15 +7248,17 @@ while (-not $captureComplete) {
             $previousDiskRaw = $null
         }
 
+        # Initialized to unavailable and then filled from the Tier 1 counter row,
+        # so a missing counter row can never inherit the previous sample's value.
         $availableMemoryMB = $null
-        if ($null -ne $operatingSystem.FreePhysicalMemory) {
-            $availableMemoryMB = [Math]::Round(([double]$operatingSystem.FreePhysicalMemory / 1024), 2)
-        }
         $totalLogicalDiskFreeGB = $null
-        $freeSpaceMeasure = $logicalDisks | Where-Object { $null -ne (Get-SafeObjectProperty -InputObject $_ -Name 'FreeSpace') } | Measure-Object -Property FreeSpace -Sum
-        if ($null -ne $freeSpaceMeasure -and $freeSpaceMeasure.Count -gt 0) {
-            $totalLogicalDiskFreeGB = [Math]::Round(([double]$freeSpaceMeasure.Sum / 1GB), 2)
-        }
+
+        # Available memory and volume free space come from the Tier 1 counter row
+        # (Memory / LogicalDisk counter classes), not from a re-queried Tier 0
+        # class. A missing counter row leaves the value unknown and the reason is
+        # recorded above.
+        $availableMemoryMB = $tier1Row.AvailableMemoryMB
+        $totalLogicalDiskFreeGB = $tier1Row.TotalLogicalDiskFreeGB
 
         $topPrivateBytes = $null
         $topPrivateProcess = $null
@@ -4393,6 +7276,16 @@ while (-not $captureComplete) {
         [void]$samples.Add([pscustomobject]@{
             TimestampUtc = $sampleTimestamp
             AverageCpuLoadPercent = $averageCpuLoad
+            CpuUtilityPercent = $tier1Row.CpuUtilityPercent
+            CpuUserPercent = $tier1Row.CpuUserPercent
+            CpuKernelPercent = $tier1Row.CpuKernelPercent
+            DpcPercent = $tier1Row.DpcPercent
+            InterruptPercent = $tier1Row.InterruptPercent
+            ProcessorQueueLength = $tier1Row.ProcessorQueueLength
+            ContextSwitchesPerSec = $tier1Row.ContextSwitchesPerSec
+            LogicalProcessorCount = $tier1Row.LogicalProcessorCount
+            CommitPercent = $tier1Row.CommitPercent
+            Tier1Coverage = (@($tier1Row.CoverageStates) -join '+')
             AvailableMemoryMB = $availableMemoryMB
             TotalLogicalDiskFreeGB = $totalLogicalDiskFreeGB
             CommittedBytes = if ($memMetrics) { $memMetrics.committedBytes } else { $null }
@@ -4474,7 +7367,7 @@ $samplingActualSeconds = [Math]::Round((New-TimeSpan -Start ([datetime]$samplerS
 # counter window (the job also self-terminates at its maximum window).
 if ($null -ne $wprBackgroundJob) {
     try {
-        Set-Content -LiteralPath $wprStopSentinelPath -Value $completedAtSamplingUtc -Encoding Ascii -ErrorAction Stop
+        Write-CaseFileAtomically -Path $wprStopSentinelPath -Content $completedAtSamplingUtc
     }
     catch {
         Add-CollectionError -Stage 'wpr-stop-signal' -ErrorRecord $_
@@ -4623,7 +7516,7 @@ if ($null -ne $diskSourceError) {
 }
 
 try {
-    $samples | Export-Csv -LiteralPath (Join-Path -Path $resolvedOutputDirectory -ChildPath 'performance-samples.csv') -NoTypeInformation -Encoding UTF8
+    Write-CaseCsvFile -Rows $samples -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'performance-samples.csv')
     [void]$collectedArtifacts.Add('performance-samples.csv')
 }
 catch {
@@ -4634,7 +7527,7 @@ catch {
 # the commit charge", as CSV (one row per process per sample) plus a top-consumer
 # summary the report can cite.
 try {
-    $processMemorySeries | Export-Csv -LiteralPath (Join-Path -Path $resolvedOutputDirectory -ChildPath 'process-memory-samples.csv') -NoTypeInformation -Encoding UTF8
+    Write-CaseCsvFile -Rows $processMemorySeries -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'process-memory-samples.csv')
     [void]$collectedArtifacts.Add('process-memory-samples.csv')
 }
 catch {
@@ -4754,10 +7647,13 @@ catch {
 
 $systemLogInfo = $null
 $safeEvents = $null
+$eventStartTime = $null
+$eventEndTime = $null
 try {
     $eventStartTime = (Get-Date).AddHours(-24)
     $systemLogInfo = Get-WinEvent -ListLog 'System' -ErrorAction Stop
     $safeEvents = Get-EventsSafe -LogName 'System' -StartTime $eventStartTime -MaxEvents $MaxEventCount
+    $eventEndTime = Get-Date
     $events = $safeEvents.Events
     Write-JsonFile -InputObject $events -Path (Join-Path -Path $resolvedOutputDirectory -ChildPath 'system-events-last-24-hours.json')
     [void]$collectedArtifacts.Add('system-events-last-24-hours.json')
@@ -4859,16 +7755,15 @@ catch {
 }
 
 $crashAnalysis = [ordered]@{
+    eventLookbackStartUtc = $null
+    eventLookbackEndUtc = $null
+    eventCorrelationWindowMinutes = 5
     bugchecks = @()
     unexplainedShutdowns = @()
-}
-try {
-    if ($safeEvents -and $safeEvents.Events.Count -gt 0) {
-        $crashAnalysis = Get-CrashAnalysis -Events $safeEvents.Events
-    }
-}
-catch {
-    Add-CollectionError -Stage 'crash-analysis' -ErrorRecord $_
+    minidumps = @()
+    minidumpSignatures = @()
+    liveKernelReports = @()
+    liveKernelSignatures = @()
 }
 
 # ---- Minidump collection (consent-gated; read-only copy of crash dumps) ----
@@ -4888,7 +7783,13 @@ $minidumpFiles = @()
 if ($CollectMinidumps) {
     try {
         $minidumpDir = Join-Path $resolvedOutputDirectory 'minidumps'
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($minidumpDir)) -Candidate $minidumpDir) {
+            throw 'Minidump output directory is a reparse point or contains a reparse-point parent.'
+        }
         New-Item -ItemType Directory -Force -Path $minidumpDir | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($minidumpDir)) -Candidate $minidumpDir) {
+            throw 'Minidump output directory is a reparse point or contains a reparse-point parent.'
+        }
 
         $memoryDumpPath = Join-Path $env:SystemRoot 'MEMORY.DMP'
         if (Test-Path -LiteralPath $memoryDumpPath) {
@@ -4916,13 +7817,14 @@ if ($CollectMinidumps) {
                     continue
                 }
                 $minidumpDest = Join-Path $minidumpDir $dump.Name
-                Copy-Item -LiteralPath $dump.FullName -Destination $minidumpDest -Force
-                $minidumpTotalBytes += $dump.Length
+                $remainingMinidumpBytes = $script:MaxMinidumpTotalBytes - $minidumpTotalBytes
+                $copiedDumpBytes = Copy-CaseFileBounded -SourcePath $dump.FullName -DestinationPath $minidumpDest -MaxBytes $remainingMinidumpBytes
+                $minidumpTotalBytes += $copiedDumpBytes
                 $minidumpCopiedCount++
                 [void]$collectedArtifacts.Add("minidumps\$($dump.Name)")
                 $minidumpFiles += [pscustomobject]@{
                     Name = $dump.Name
-                    SizeBytes = $dump.Length
+                    SizeBytes = $copiedDumpBytes
                     SourceLastWriteTimeUtc = $dump.LastWriteTime.ToUniversalTime().ToString('o')
                 }
             }
@@ -4948,7 +7850,13 @@ $bootFailureSources = @()
 if ($CollectBootFailureLogs) {
     try {
         $bootFailureDir = Join-Path $resolvedOutputDirectory 'bootfailure'
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($bootFailureDir)) -Candidate $bootFailureDir) {
+            throw 'Boot-failure output directory is a reparse point or contains a reparse-point parent.'
+        }
         New-Item -ItemType Directory -Force -Path $bootFailureDir | Out-Null
+        if (Test-CasePathHasReparsePoint -Root ([System.IO.Path]::GetPathRoot($bootFailureDir)) -Candidate $bootFailureDir) {
+            throw 'Boot-failure output directory is a reparse point or contains a reparse-point parent.'
+        }
 
         $bootFailureCandidates = @(
             [pscustomobject]@{ Name = 'srt-trail'; SourcePath = (Join-Path $env:SystemRoot 'System32\LogFiles\Srt\SrtTrail.txt') }
@@ -4973,7 +7881,7 @@ if ($CollectBootFailureLogs) {
                 }
                 if ($candidateItem.Length -le $script:MaxBootFailureLogBytes) {
                     $bootFailureDest = Join-Path $bootFailureDir $candidateItem.Name
-                    Copy-Item -LiteralPath $candidate.SourcePath -Destination $bootFailureDest -Force
+                    $null = Copy-CaseFileBounded -SourcePath $candidate.SourcePath -DestinationPath $bootFailureDest -MaxBytes $script:MaxBootFailureLogBytes
                     $entry.copied = $true
                     $entry.copiedTo = "bootfailure\$($candidateItem.Name)"
                     $bootFailureCopiedCount++
@@ -5004,6 +7912,48 @@ if ($CollectBootFailureLogs) {
         Add-CollectionError -Stage 'boot-failure-log-collection' -ErrorRecord $_
         $bootFailureStatus = 'failed'
     }
+}
+
+# Analyze the copied text only after the boot-failure collection has established
+# the final relative artifact paths. The analysis artifact is written by the
+# shared tail together with findings.json, so it is hash-registered and included
+# in a package when requested.
+$servicingAnalysis = $null
+if ($CollectBootFailureLogs) {
+    try {
+        $servicingAnalysis = Get-ServicingLogAnalysis -SourceEntries @($bootFailureSources) -OutputDirectory $resolvedOutputDirectory -MaxScanBytes $script:MaxBootFailureLogBytes
+    }
+    catch {
+        Add-CollectionError -Stage 'servicing-log-analysis' -ErrorRecord $_
+        $servicingAnalysis = [ordered]@{
+            status = 'failed'
+            maxScanBytes = $script:MaxBootFailureLogBytes
+            logCount = @($bootFailureSources).Count
+            scannedLogCount = 0
+            failedLogCount = 1
+            truncatedLogCount = 0
+            unavailableLogCount = @($bootFailureSources).Count
+            logs = @()
+            error = $_.Exception.Message
+        }
+    }
+}
+
+# Run crash analysis after both consent-gated artifact stages. A dump or
+# LiveKernelReport can be older than the 24-hour event query and must still
+# reach the findings engine.
+try {
+    $crashEvents = @()
+    if ($null -ne $safeEvents) { $crashEvents = @($safeEvents.Events) }
+    $crashAnalysis = Get-CrashAnalysis `
+        -Events $crashEvents `
+        -MinidumpFiles @($minidumpFiles) `
+        -LiveKernelReports @($liveKernelReports) `
+        -EventWindowStartUtc $eventStartTime `
+        -EventWindowEndUtc $eventEndTime
+}
+catch {
+    Add-CollectionError -Stage 'crash-analysis' -ErrorRecord $_
 }
 
 if ($CaptureDefender) {
@@ -5054,6 +8004,10 @@ catch {
 $manifestSchemaVersion = '1.0'
 if ($SymptomContext -or $Preset) { $manifestSchemaVersion = '1.1' }
 if ($PerformanceMode -or $MarkerMode) { $manifestSchemaVersion = '1.2' }
+# Schema 1.3 adds the tiered/evidence surface: the per-tier status block plus the
+# coverage, data-quality and evidence-index blocks. Older 1.0-1.2 manifests stay
+# valid and Verify accepts all four versions (the surface is additive only).
+if ($script:WpdTieredEngaged) { $manifestSchemaVersion = '1.3' }
 
 $collectionManifest = [ordered]@{
     schemaVersion = $manifestSchemaVersion
@@ -5294,6 +8248,7 @@ if ($CollectBootFailureLogs) {
         skippedOversizedCount = $bootFailureSkippedOversizedCount
         sourceEntries = @($bootFailureSources)
     }
+    $collectionManifest.servicingAnalysis = $servicingAnalysis
 }
 
 if ($diskMetrics) {
@@ -5328,6 +8283,179 @@ if ($SymptomContext -or $Preset) {
     if ($Preset) { $collectionManifest.symptom.preset = $Preset }
 }
 
+# ---- Tiered telemetry, coverage, data quality and evidence blocks ------------
+# The per-core/util/user/kernel/DPC/ISR series is written as its own artifact so
+# the CSV sample row stays flat, and the tiered block records one coverage record
+# per tier plus the data-quality and evidence-index surface. A tier that did not
+# run stays not-collected and a failed collector stays unavailable - no status is
+# ever healthy.
+if ($script:WpdTieredEngaged) {
+    try {
+        $telemetryDirectory = Join-Path -Path $resolvedOutputDirectory -ChildPath 'telemetry'
+        if (-not (Test-Path -LiteralPath $telemetryDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $telemetryDirectory | Out-Null
+        }
+        Write-JsonFile -InputObject @($script:WpdPerCoreCpuSeries) -Path (Join-Path -Path $telemetryDirectory -ChildPath 'per-core-cpu-samples.json')
+        [void]$collectedArtifacts.Add('telemetry/per-core-cpu-samples.json')
+    }
+    catch {
+        Add-CollectionError -Stage 'per-core-cpu-export' -ErrorRecord $_
+    }
+}
+
+# Tier 3 snapshots run after the incident window, never inside its sample loop.
+# Register their evidence before constructing the shared hash/evidence index.
+if ($script:WpdTieredEngaged) {
+    $script:WpdEscalationExecution = Invoke-WpdSelectedEscalations `
+        -RequestedAdapter $script:WpdRequestedEscalationAdapter `
+        -Consent:$ConfirmEscalationCollection `
+        -PrivacyLevel $script:WpdEffectivePrivacyLevel `
+        -OutputDirectory $resolvedOutputDirectory `
+        -CollectedArtifacts $collectedArtifacts
+    foreach ($adapter in @($script:WpdEscalationExecution.adapters)) {
+        if ($adapter.status -eq 'error') {
+            Add-CollectionErrorText -Stage ('tier3-' + $adapter.id) -Message $adapter.reason
+        }
+    }
+}
+
+if ($script:WpdTieredEngaged) {
+    $tier0CoverageRecord = if ($null -ne $script:WpdTier0Snapshot) { $script:WpdTier0Snapshot.coverage } else { 'not-collected' }
+    $tier0StatusRecord = if ($null -ne $script:WpdTier0Snapshot) { $script:WpdTier0Snapshot.status } else { 'not-collected' }
+    $tier0CapabilityCount = 0
+    $tier0Reasons = @()
+    if ($null -ne $script:WpdTier0Snapshot) {
+        $tier0CapabilityCount = @($script:WpdTier0Snapshot.capabilities).Count
+        $tier0Reasons = @($script:WpdTier0Snapshot.reasons)
+    }
+    # -CaptureWpr is the only path that creates $wprResult, so its status is read
+    # through the variable table instead of assuming the variable exists.
+    $tier2StatusRecord = 'not-collected'
+    $tier2CoverageRecord = 'not-collected'
+    if ($CaptureWpr) {
+        $wprResultVariable = Get-Variable -Name wprResult -Scope Script -ErrorAction SilentlyContinue
+        if ($null -ne $wprResultVariable -and $null -ne $wprResultVariable.Value) {
+            $tier2StatusRecord = [string]$wprResultVariable.Value['status']
+        }
+        else {
+            $tier2StatusRecord = 'unavailable'
+        }
+        $tier2CoverageRecord = if ($tier2StatusRecord -eq 'completed') { 'complete' } else { 'unavailable' }
+    }
+    $tier3StatusRecord = $script:WpdEscalationExecution.status
+    $tier3CoverageRecord = $script:WpdEscalationExecution.coverage
+    $tier1CoverageRecord = if (@($samples).Count -gt 0) { 'partial' } else { 'unavailable' }
+
+    $coverageRecords = @(
+        [pscustomobject]@{ collector = 'tier0-static-inventory'; tier = 0; status = $tier0StatusRecord; coverage = $tier0CoverageRecord; recordCount = $tier0CapabilityCount; reason = @($tier0Reasons) }
+        [pscustomobject]@{ collector = 'tier1-performance-counters'; tier = 1; status = if (@($samples).Count -gt 0) { 'success' } else { 'unavailable' }; coverage = $tier1CoverageRecord; recordCount = @($samples).Count; reason = @() }
+        [pscustomobject]@{ collector = 'tier2-wpr-recording'; tier = 2; status = $tier2StatusRecord; coverage = $tier2CoverageRecord; recordCount = if ($CaptureWpr) { 1 } else { 0 }; reason = @() }
+        [pscustomobject]@{ collector = 'tier3-optional-escalation'; tier = 3; status = $tier3StatusRecord; coverage = $tier3CoverageRecord; recordCount = $script:WpdEscalationExecution.recordCount; reason = @($script:WpdEscalationExecution.reasons) }
+    )
+
+    $collectionErrorsData = @($script:collectionErrors)
+    $intervalValue = $script:WpdTier1Interval.intervalSeconds
+    $collectedSeconds = $null
+    if ($null -ne $startedAtUtc -and $null -ne $completedAtUtc) {
+        try {
+            $collectedSeconds = [Math]::Round(([datetime]$completedAtUtc - [datetime]$startedAtUtc).TotalSeconds, 2)
+        }
+        catch {
+            $collectedSeconds = $null
+        }
+    }
+    $expectedSampleCount = $null
+    if ($null -ne $intervalValue -and $null -ne $collectedSeconds -and [double]$intervalValue -gt 0) {
+        $expectedSampleCount = [int][Math]::Floor(([double]$collectedSeconds / [double]$intervalValue)) + 1
+    }
+    $sampleGapCount = $null
+    if ($null -ne $expectedSampleCount) { $sampleGapCount = [Math]::Max(0, $expectedSampleCount - @($samples).Count) }
+
+    $dataQualityRecords = @(
+        [pscustomobject]@{
+            collector = 'tier1-performance-counters'
+            metric = 'sample-cadence'
+            sampleCount = @($samples).Count
+            expectedSampleCount = $expectedSampleCount
+            intervalSeconds = $intervalValue
+            gaps = $sampleGapCount
+            coverage = $tier1CoverageRecord
+            collectionErrorCount = @($collectionErrorsData).Count
+            reasons = @()
+            noDataIsNeverHealth = $true
+        }
+        [pscustomobject]@{
+            collector = 'tier0-static-inventory'
+            metric = 'inventory-capabilities'
+            sampleCount = @($script:WpdTier0Snapshot.capabilities).Count
+            expectedSampleCount = $null
+            coverage = $tier0CoverageRecord
+            reasons = @($script:WpdTier0Snapshot.reasons)
+            noDataIsNeverHealth = $true
+        }
+    )
+
+    # The evidence index maps every artifact the run registered to its hash, so a
+    # conclusion can always cite a verified artifact. An artifact whose hash is
+    # absent is indexed as not-registered rather than assumed intact.
+    $evidenceIndexRecords = @()
+    $indexCounter = 0
+    foreach ($artifactEntry in @(Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts))) {
+        $indexCounter++
+        $artifactWindowStart = $startedAtUtc
+        $artifactWindowEnd = $completedAtUtc
+        if ($artifactEntry.Name -like 'escalation/*') {
+            $snapshot = @($script:WpdEscalationExecution.adapters | Where-Object { $_.artifact -eq $artifactEntry.Name } | Select-Object -First 1)
+            # Absent timestamps remain unknown; never bind a post-window snapshot
+            # to the earlier counter incident just because it shares the case.
+            $artifactWindowStart = $null
+            $artifactWindowEnd = $null
+            if ($snapshot.Count -eq 1) {
+                $artifactWindowStart = Get-WpdIntegrationProperty -InputObject $snapshot[0] -Name 'startedUtc'
+                $artifactWindowEnd = Get-WpdIntegrationProperty -InputObject $snapshot[0] -Name 'completedUtc'
+            }
+        }
+        $evidenceIndexRecords += [pscustomobject]@{
+            id = ('evidence-{0:d3}' -f $indexCounter)
+            artifact = $artifactEntry.Name
+            path = $artifactEntry.Name
+            sha256 = $artifactEntry.Sha256
+            sizeBytes = $artifactEntry.SizeBytes
+            windowStart = $artifactWindowStart
+            windowEnd = $artifactWindowEnd
+            registered = ($null -ne $artifactEntry.Sha256)
+        }
+    }
+
+    $collectionManifest.tiers = New-WpdTieredCollectBlock `
+        -Modules $script:WpdModuleSurface `
+        -Tier0 $script:WpdTier0Snapshot `
+        -Tier2 ([pscustomobject]@{ status = $tier2StatusRecord; coverage = $tier2CoverageRecord }) `
+        -Tier3 $script:WpdEscalationExecution `
+        -PresetSelection $script:WpdPresetSelection `
+        -CapturePolicy $script:WpdCapturePolicy `
+        -Tier1Interval $script:WpdTier1Interval `
+        -CoverageRecords $coverageRecords `
+        -DataQualityRecords $dataQualityRecords `
+        -EvidenceIndex ([pscustomobject]@{ generatedAtUtc = Get-UtcTimestamp; recordCount = @($evidenceIndexRecords).Count; records = @($evidenceIndexRecords); everyConclusionNeedsEvidence = $true; healthClaim = 'none' })
+    $collectionManifest.coverage = @($coverageRecords)
+    $collectionManifest.dataQuality = @($dataQualityRecords)
+    $collectionManifest.evidenceIndex = $collectionManifest.tiers.evidenceIndex
+    $collectionManifest.privacy = [ordered]@{
+        level = $script:WpdEffectivePrivacyLevel
+        requestedLevel = $PrivacyLevel
+        # Labels affect selected module fields only, not raw evidence/dumps/ETL.
+        # A whole-case secret scan/redaction pass has not been implemented.
+        secretsCollected = $null
+        redactionApplied = $false
+        wholeCaseRedaction = 'not-implemented'
+        sensitiveDataWarning = $true
+    }
+    if ($PerformanceMode -or $MarkerMode -or $script:WpdCaptureMode.status -eq 'resolved') {
+        $collectionManifest.incidentMarkers = New-WpdIncidentMarkerPlan
+    }
+}
+
 # Generate findings.json/report.html, hash ALL evidence into the manifest, then
 # package. Write-CollectionOutputs is the same function exercised by the
 # fixture-driven Collect-tail regression test.
@@ -5341,12 +8469,203 @@ $collectionManifest = Write-CollectionOutputs `
     -MemoryMetrics $finalMemMetrics `
     -SymptomContext $SymptomContext `
     -CaptureWindow $collectionManifest.captureWindow `
-    -ProcessMemoryTop @($processMemoryTop)
+    -ProcessMemoryTop @($processMemoryTop) `
+    -CrashAnalysis $crashAnalysis `
+    -ServicingAnalysis $servicingAnalysis
 
 $collectionManifestPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'diagnostic-manifest.json'
-Write-Output "Collection complete. Manifest written to $collectionManifestPath"
 
+# ---- Report handoff ----------------------------------------------------------
+# The technician report is generated from the findings the shared tail wrote, so
+# it renders the same conclusions the manifest carries. A missing report module
+# leaves the handoff unavailable with a stated reason and creates no artifact.
+if ($script:WpdTieredEngaged) {
+    $handoffFindings = @()
+    try {
+        $findingsPath = Join-Path -Path $resolvedOutputDirectory -ChildPath 'findings.json'
+        if (Test-Path -LiteralPath $findingsPath -PathType Leaf) {
+            $handoffFindings = @(Get-Content -LiteralPath $findingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+        }
+        else {
+            Add-CollectionErrorText -Stage 'report-handoff' -Message 'findings.json is absent, so the technician report has no conclusions to render.'
+        }
+    }
+    catch {
+        Add-CollectionError -Stage 'report-handoff-findings' -ErrorRecord $_
+    }
+
+    $reportHandoff = Write-WpdTechnicianReportHandoff `
+        -OutputDirectory $resolvedOutputDirectory `
+        -Findings $handoffFindings `
+        -EvidenceIndex $collectionManifest.evidenceIndex `
+        -Artifacts @(Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)) `
+        -DataQuality @($coverageRecords) `
+        -Incident $collectionManifest.incident `
+        -Manifest $collectionManifest `
+        -Samples @($samples) `
+        -DiskSeries @($diskSeries) `
+        -EventRows @($incidentEvents)
+    $collectionManifest.reportHandoff = [ordered]@{
+        status = $reportHandoff.status
+        artifact = $reportHandoff.artifact
+        reason = $reportHandoff.reason
+        findingCount = $reportHandoff.findingCount
+        outcome = if ($null -ne (Get-Variable -Name reportHandoff -ErrorAction SilentlyContinue) -and $null -ne $reportHandoff.PSObject.Properties['outcome']) { $reportHandoff.outcome } else { $null }
+    }
+    if ($reportHandoff.status -eq 'written') {
+        [void]$collectedArtifacts.Add('case/technician-report.html')
+        $collectionManifest.artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
+    }
+    # Persist unavailable/error handoffs too. Otherwise the on-disk case loses
+    # the coverage reason whenever the optional report module cannot write.
+    Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+}
+
+Complete-WpdRunTranscript -TranscriptPath $transcriptPath -ArtifactNames $collectedArtifacts -TranscriptStarted:$script:WpdRunTranscriptStarted
+$script:WpdRunTranscriptStarted = $false
+$collectionManifest.artifacts = Get-ArtifactMetadata -Directory $resolvedOutputDirectory -Names @($collectedArtifacts)
+Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+Write-Output "Collection complete. Manifest written to $collectionManifestPath"
 if ($ZipOutput) {
     $collectionManifest = Add-CasePackageBlock -CollectionManifest $collectionManifest -OutputDirectory $resolvedOutputDirectory -ArtifactNames @($collectedArtifacts)
     Write-JsonFile -InputObject $collectionManifest -Path $collectionManifestPath
+}
+if ($script:WpdRunTranscriptStarted) {
+    Stop-Transcript | Out-Null
+    $script:WpdRunTranscriptStarted = $false
+}
+
+# Verify the persisted case and any published ZIP with the same production
+# Verify entry point users invoke. Capture the native exit code immediately so
+# later JSON handling or console presentation cannot replace it.
+$verificationExitCode = 1
+$verificationReport = $null
+$verificationText = ''
+$verificationFailure = $null
+try {
+    $verifyEngineName = if ($PSVersionTable.PSVersion.Major -le 5) { 'powershell.exe' } else { 'pwsh.exe' }
+    $verifyEnginePath = Join-Path -Path $PSHOME -ChildPath $verifyEngineName
+    $verificationOutput = @(& $verifyEnginePath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $PSCommandPath -Mode Verify -InputDirectory $resolvedOutputDirectory 2>&1)
+    $verificationExitCode = $LASTEXITCODE
+    $verificationText = ($verificationOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+    if ($verificationExitCode -ne 0) {
+        throw "production Verify exited $($verificationExitCode): $verificationText"
+    }
+    $verificationReport = $verificationText | ConvertFrom-Json -ErrorAction Stop
+    if ([string]$verificationReport.status -ne 'verified') {
+        throw "production Verify status was '$($verificationReport.status)'"
+    }
+    if ($ZipOutput -and [string]$verificationReport.package.status -ne 'verified') {
+        throw "production Verify package status was '$($verificationReport.package.status)'"
+    }
+    if (-not $ZipOutput -and [string]$verificationReport.package.status -notin @('verified', 'not-present')) {
+        throw "production Verify package status was '$($verificationReport.package.status)'"
+    }
+}
+catch {
+    $verificationFailure = $_.Exception.Message
+}
+
+$completionModulePath = Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.Completion.psm1'
+if (-not [System.IO.File]::Exists($completionModulePath)) {
+    # Standalone copies (including WinRM staging) retain their verified legacy
+    # output path. They cannot promise the new summary/presentation without its
+    # helper, and failed integrity checks still propagate as failures.
+    Write-Warning 'Completion summary unavailable: Wpd.Completion.psm1 is absent from this standalone copy.'
+    if ($null -ne $verificationFailure -or $OpenOutputs -or -not [string]::IsNullOrWhiteSpace($CompletionEnvelopePath)) {
+        throw 'Final verification failed or requested completion presentation requires Wpd.Completion.psm1.'
+    }
+    return
+}
+Import-Module -Name $completionModulePath -Force -ErrorAction Stop
+$requiredCompletionArtifacts = @($collectedArtifacts | Where-Object { [string]$_ -match '\.json$' })
+if ($CollectSearchContext -and $requiredCompletionArtifacts -notcontains 'escalation/search-service-context.json') {
+    $requiredCompletionArtifacts += 'escalation/search-service-context.json'
+}
+if ($CollectMinifilters -and $requiredCompletionArtifacts -notcontains 'escalation/minifilter-enumeration.json') {
+    $requiredCompletionArtifacts += 'escalation/minifilter-enumeration.json'
+}
+$completionCollectorExitCode = if ($null -ne $verificationFailure) { 1 } else { 0 }
+$completion = Get-WpdRunCompletion -CaseDirectory $resolvedOutputDirectory `
+    -RequiredArtifacts $requiredCompletionArtifacts `
+    -CollectorExitCode $completionCollectorExitCode
+if ($null -ne $verificationFailure) {
+    Write-Warning ('Production Verify rejected the final case/package: ' + $verificationFailure)
+}
+
+$showParameters = @{ Completion = $completion }
+if ($OpenOutputs) { $showParameters.OpenOutputs = $true }
+if ($null -ne $PresentationRunner) { $showParameters.PresentationRunner = $PresentationRunner }
+$showOutput = @(Show-WpdRunCompletion @showParameters 6>&1)
+$renderedSummaryLines = @(
+    $showOutput |
+        Where-Object { $_ -is [System.Management.Automation.InformationRecord] } |
+        ForEach-Object { [string]$_.MessageData }
+)
+foreach ($line in $renderedSummaryLines) { Write-Host $line }
+$presentationResult = $null
+foreach ($item in $showOutput) {
+    if ($null -ne $item -and $null -ne $item.PSObject.Properties['openedCase']) {
+        $presentationResult = $item
+    }
+}
+if ($null -ne $presentationResult -and [string]$presentationResult.status -eq 'failed') {
+    Write-Warning ('Collection completed, but output presentation failed: ' + [string]$presentationResult.reason)
+}
+
+$effectiveCompletionExitCode = if ([string]$completion.status -eq 'failed') { 1 } else { 0 }
+if (-not [string]::IsNullOrWhiteSpace($CompletionEnvelopePath)) {
+    $completionStages = @(
+        foreach ($stage in @($completion.stages)) {
+            $stageReason = ''
+            $stageCoverage = Get-WpdIntegrationProperty -InputObject $stage -Name 'coverage'
+            if ($null -ne $stageCoverage -and -not [string]::IsNullOrWhiteSpace([string]$stageCoverage)) {
+                $stageReason = [string]$stageCoverage
+            }
+            elseif ([string]$stage.outcome -eq 'skipped') {
+                $stageReason = [string]$stage.status
+            }
+            [pscustomobject]@{
+                name = [string]$stage.collector
+                status = [string]$stage.status
+                reason = $stageReason
+            }
+        }
+    )
+    $completionEnvelope = [ordered]@{
+        status = [string]$completion.status
+        exitCode = [int]$effectiveCompletionExitCode
+        caseDirectory = [string]$completion.caseDirectory
+        manifestPath = [System.IO.Path]::Combine($resolvedOutputDirectory, 'diagnostic-manifest.json')
+        reportPath = $completion.reportPath
+        errors = @($completion.reasons)
+        missingJson = @($completion.missingArtifacts | Where-Object { [string]$_ -match '\.json$' })
+        stages = @($completionStages)
+        renderedText = $renderedSummaryLines -join [Environment]::NewLine
+    }
+    $envelopeStream = $null
+    try {
+        $envelopeFullPath = [System.IO.Path]::GetFullPath($CompletionEnvelopePath)
+        $caseFullPath = [System.IO.Path]::GetFullPath($resolvedOutputDirectory)
+        $casePrefix = $caseFullPath.TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
+        if ([string]::Equals($envelopeFullPath, $caseFullPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $envelopeFullPath.StartsWith($casePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Completion handoff must be outside the finalized case directory.'
+        }
+        $envelopeStream = [System.IO.File]::Open($envelopeFullPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $envelopeBytes = [System.Text.Encoding]::UTF8.GetBytes(($completionEnvelope | ConvertTo-Json -Depth 12))
+        $envelopeStream.Write($envelopeBytes, 0, $envelopeBytes.Length)
+        $envelopeStream.Flush()
+    }
+    catch {
+        Write-Warning ('Completion handoff could not be retained at the caller-owned path: ' + $_.Exception.Message)
+    }
+    finally {
+        if ($null -ne $envelopeStream) { $envelopeStream.Dispose() }
+    }
+}
+
+if ($effectiveCompletionExitCode -ne 0) {
+    throw 'Collection failed final completion or integrity verification; see the run summary and Verify output.'
 }

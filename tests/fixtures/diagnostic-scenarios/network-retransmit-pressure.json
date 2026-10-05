@@ -1,0 +1,131 @@
+{
+  "id": "network-retransmit-pressure",
+  "title": "TCP retransmissions with connection failures",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T16:00:00Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:05Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:10Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:15Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:20Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:25Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:30Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:35Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:40Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:45Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:50Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        },
+        {
+          "TimestampUtc": "2026-09-10T16:00:55Z",
+          "SegmentsRetransmittedPerSec": 6,
+          "ConnectionFailures": 2
+        }
+      ],
+      "rules": [
+        {
+          "id": "network-retransmission-pressure",
+          "category": "network-errors",
+          "title": "TCP retransmissions",
+          "summary": "Segments were retransmitted during the measured window.",
+          "metric": "SegmentsRetransmittedPerSec",
+          "comparator": "gt",
+          "threshold": 0,
+          "minimumSamples": 10,
+          "minimumDurationSeconds": 10,
+          "sourceArtifact": "network-state.json",
+          "severity": {
+            "default": "medium",
+            "escalations": []
+          },
+          "confidence": {
+            "default": "Low",
+            "conditions": [
+              {
+                "level": "Medium",
+                "when": "retransmissions and a failure or reset counter both move on the same interval"
+              },
+              {
+                "level": "Low",
+                "when": "retransmissions are non-zero without any failure or reset evidence"
+              }
+            ]
+          },
+          "correlationRequirements": [
+            {
+              "metric": "ConnectionFailures",
+              "comparator": "gt",
+              "threshold": 0,
+              "kind": "required-any-of",
+              "note": "Independent channel: connection failures on the same interval"
+            },
+            {
+              "metric": "ConnectionsReset",
+              "comparator": "gt",
+              "threshold": 0,
+              "kind": "required-any-of",
+              "note": "Independent channel: connection resets on the same interval"
+            }
+          ],
+          "uncertainty": "Retransmissions can be caused by the peer or the path.",
+          "nextSteps": [
+            "Capture a network trace over the same window."
+          ],
+          "suggestedWprProfile": "NetworkProfile"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "network-state.json",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

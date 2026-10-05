@@ -1,0 +1,39 @@
+{
+  "id": "storage-controller-warning-recurrence",
+  "title": "StorPort controller warnings repeating inside the incident window",
+  "driver": {
+    "kind": "repetitive-events",
+    "args": {
+      "records": [
+        {
+          "provider": "Microsoft-Windows-StorPort",
+          "eventId": 11,
+          "level": 3,
+          "levelName": "Warning",
+          "timeCreatedUtc": "2026-09-11T06:00:00Z",
+          "message": "The controller reset the device."
+        },
+        {
+          "provider": "Microsoft-Windows-StorPort",
+          "eventId": 11,
+          "level": 3,
+          "levelName": "Warning",
+          "timeCreatedUtc": "2026-09-11T06:00:20Z",
+          "message": "The controller reset the device."
+        },
+        {
+          "provider": "Microsoft-Windows-StorPort",
+          "eventId": 11,
+          "level": 3,
+          "levelName": "Warning",
+          "timeCreatedUtc": "2026-09-11T06:00:40Z",
+          "message": "The controller reset the device."
+        }
+      ],
+      "windowStart": "2026-09-11T05:59:00Z",
+      "windowEnd": "2026-09-11T06:10:00Z",
+      "minimumCount": 3
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

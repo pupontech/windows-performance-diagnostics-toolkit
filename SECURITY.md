@@ -11,8 +11,9 @@ Treat the following as potentially sensitive diagnostic material:
 - Defender diagnostic CABs
 - DISM/SFC logs
 
-The toolkit must not upload, email, or copy these artifacts off-device by default. The
-one exception is **remote mode** (`-RemoteComputer`): with explicit
+The toolkit must not upload, email, or copy these artifacts off-device by default. Local
+Plan and Collect output paths must not be UNC/network-share paths. The one exception is
+**remote mode** (`-RemoteComputer`): with explicit
 `-ConfirmRemoteCollection` consent (in addition to `-ConfirmLocalCollection`), the
 collector runs on the target over WinRM and pulls the case folder back to the
 technician's machine, verifying every file's SHA-256 against the remote manifest.

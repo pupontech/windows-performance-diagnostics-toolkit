@@ -2,8 +2,8 @@
 setlocal
 pushd "%~dp0"
 
-set "OUTDIR=C:\Temp\WPD-Case"
-set "LOG=%OUTDIR%\diagnostics-run.log"
+set "OUTDIR=C:\WPD-Case"
+if not defined WPD_POWERSHELL_EXE set "WPD_POWERSHELL_EXE=powershell.exe"
 set "CHOICE=%~1"
 set "INPUTDIR=%~2"
 
@@ -31,8 +31,8 @@ if not "%CHOICE%"=="" goto :choice_set
 echo Choose an operating mode:
 echo.
 echo   1 - Plan preview
-echo   2 - Collect diagnostics (recommended)
-echo   3 - Incident capture (performance window + symptom marker)
+echo   2 - Collect diagnostics + Search/minifilter snapshots (recommended)
+echo   3 - Incident capture + Search/minifilter snapshots
 echo   4 - Verify an existing case
 echo   5 - Exit
 echo.
@@ -50,7 +50,7 @@ goto :end
 
 :opt_plan
 echo Writing plan only...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Plan -OutputDirectory "%OUTDIR%"
+"%WPD_POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Plan -OutputDirectory "%OUTDIR%"
 if errorlevel 1 goto :plan_failed
 echo Plan written to %OUTDIR%\diagnostic-plan.json
 goto :end
@@ -66,8 +66,7 @@ if "%errorlevel%"=="1" goto :end_failed
 goto :end_no_pause
 
 :collect_ready
-set "EXTRA=-CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
-set "DURATION=30"
+set "LAUNCHMODE=GuidedCollect"
 goto :run
 
 :opt_incident
@@ -81,15 +80,15 @@ echo.
 echo Incident capture runs ONE shared window for counters, process/commit,
 echo GPU, disk, pagefile and the WPR trace. Press Enter when the slowdown
 echo happens: 60 s before the marker and 30 s after it are kept.
-set "EXTRA=-PerformanceMode -MarkerMode -CaptureWpr -ConfirmWprCapture -CollectMinidumps -ConfirmMinidumpCollection -CollectBootFailureLogs -ConfirmBootFailureLogCollection -ZipOutput"
-set "DURATION=120"
+echo Counters and the WPR trace are running in the SAME window.
+set "LAUNCHMODE=IncidentCollect"
 goto :run
 
 :opt_verify
 if not defined INPUTDIR set /p INPUTDIR="Enter the case directory to verify: "
 if not defined INPUTDIR goto :verify_failed
 echo Verifying case: "%INPUTDIR%"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Verify -InputDirectory "%INPUTDIR%"
+"%WPD_POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1" -Mode Verify -InputDirectory "%INPUTDIR%"
 if errorlevel 1 goto :verify_failed
 echo Verify completed successfully.
 goto :end
@@ -99,44 +98,20 @@ echo [ERROR] Verify mode failed. Review the JSON report above.
 goto :end_failed
 
 :run
-if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 echo.
-echo Collecting: baseline sampling for %DURATION% seconds, with the WPR trace,
-echo process/commit, GPU, pagefile and UDP capture running in the SAME window.
-echo The console shows baseline progress by sample and percentage.
+echo Collecting diagnostics. The console shows baseline progress by sample and percentage.
 echo Allow additional time for event/log collection and final export, hashing, and ZIP packaging.
-echo Output: %OUTDIR%
-echo Run started: %date% %time% - mode Collect >> "%LOG%"
-echo ============================================================ >> "%LOG%"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '%~dp0src\Invoke-WindowsPerformanceDiagnostics.ps1' -Mode Collect -ConfirmLocalCollection %EXTRA% -DurationSeconds %DURATION% -OutputDirectory '%OUTDIR%' 2>&1 | Tee-Object -FilePath '%LOG%'"
-echo.
+echo Read-only Search service and minifilter snapshots are included.
+echo New case folders are created beneath %OUTDIR%.
+"%WPD_POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Invoke-WpdLauncher.ps1" -LaunchMode "%LAUNCHMODE%"
 if errorlevel 1 goto :collection_failed
-if exist "%OUTDIR%\diagnostic-manifest.json" goto :manifest_ok
-echo [ERROR] Collection did not produce %OUTDIR%\diagnostic-manifest.json
-echo         See %LOG% for details.
-goto :end_failed
+echo.
+echo Collection complete. The exact case directory, matching log, and manifest were verified above.
+goto :end
 
 :collection_failed
-echo [ERROR] Collection returned a failure. See %LOG% for details.
+echo [ERROR] Collection failed or produced no manifest. Review the exact run path and log printed above.
 goto :end_failed
-
-:manifest_ok
-echo Collection complete. Output saved to %OUTDIR%
-echo   - diagnostic-manifest.json     (report + SHA-256 hashes)
-echo   - performance-samples.csv      (CPU/memory/disk samples)
-echo   - top-processes.json           (process snapshot)
-echo   - system-events-last-24-hours.json
-echo   - process-memory-samples.csv (per-process commit charge)
-echo   - gpu-metrics.json           (GPU engines + memory)
-echo   - pagefile-metrics.json      (size/usage/location)
-echo   - incident-events.json       (window-labelled events)
-echo   - wpr-trace.etl                (when WPR is available)
-echo   - minidumps\                   (crash dumps)
-echo   - bootfailure\                 (SRT/boot/CBS logs)
-echo   - WPD-Case-^<time^>.zip          (case package, next to the output folder)
-echo Full log: %LOG%
-echo.
-goto :end
 
 :ensure_elevated
 net session >nul 2>&1
@@ -144,7 +119,7 @@ if %errorlevel% equ 0 exit /b 0
 if "%CI%"=="true" goto :ci_not_elevated
 echo Requesting administrator privileges via UAC...
 echo.
-powershell.exe -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%CHOICE%' -Verb RunAs"
+"%WPD_POWERSHELL_EXE%" -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%CHOICE%' -Verb RunAs"
 exit /b 2
 
 :ci_not_elevated

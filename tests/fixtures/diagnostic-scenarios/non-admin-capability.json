@@ -1,0 +1,15 @@
+{
+  "id": "non-admin-capability",
+  "title": "Elevated-only capability on an unelevated run",
+  "driver": {
+    "kind": "inventory",
+    "args": {
+      "capabilityId": "filters",
+      "providerIds": [
+        "filters"
+      ],
+      "elevated": false
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

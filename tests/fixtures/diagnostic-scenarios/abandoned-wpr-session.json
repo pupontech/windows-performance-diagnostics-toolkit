@@ -1,0 +1,13 @@
+{
+  "id": "abandoned-wpr-session",
+  "title": "A toolkit-owned WPR recording is still running",
+  "driver": {
+    "kind": "abandoned-session",
+    "args": {
+      "statusOutput": "Recording is in progress.\nInstance name: wpd-diag-2026-09-11\nDropped event: 2\nLogging mode: Memory",
+      "ownerTag": "wpd-",
+      "expectedInstanceName": "wpd-diag-2026-09-11"
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

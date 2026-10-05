@@ -1,0 +1,21 @@
+{
+  "id": "perflib-all-observed",
+  "title": "Perflib counters all observed",
+  "driver": {
+    "kind": "perflib",
+    "args": {
+      "rows": [
+        {
+          "Value": 10
+        },
+        {
+          "Value": 12
+        },
+        {
+          "Value": 11
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

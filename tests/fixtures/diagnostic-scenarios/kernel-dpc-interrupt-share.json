@@ -1,0 +1,106 @@
+{
+  "id": "kernel-dpc-interrupt-share",
+  "title": "DPC and interrupt CPU share",
+  "driver": {
+    "kind": "report",
+    "args": {
+      "samples": [
+        {
+          "TimestampUtc": "2026-09-10T21:00:00Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:05Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:10Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:15Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:20Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:25Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:30Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:35Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:40Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:45Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:50Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        },
+        {
+          "TimestampUtc": "2026-09-10T21:00:55Z",
+          "DpcInterruptTimePercent": 12,
+          "AverageCpuLoadPercent": 30
+        }
+      ],
+      "rules": [
+        {
+          "id": "cpu-dpc-interrupt-share",
+          "category": "cpu-pressure",
+          "title": "DPC and interrupt CPU share",
+          "summary": "DPC and interrupt time stayed at or above the configured share of CPU.",
+          "metric": "DpcInterruptTimePercent",
+          "comparator": "ge",
+          "threshold": 10,
+          "minimumSamples": 10,
+          "minimumDurationSeconds": 10,
+          "sourceArtifact": "performance-samples.csv",
+          "severity": {
+            "default": "medium",
+            "escalations": []
+          },
+          "confidence": {
+            "default": "Medium",
+            "conditions": []
+          },
+          "uncertainty": "The share does not name the driver.",
+          "nextSteps": [
+            "Collect a DPC/ISR trace to name the driver."
+          ],
+          "suggestedWprProfile": "CPU"
+        }
+      ],
+      "artifacts": [
+        {
+          "Name": "performance-samples.csv",
+          "SizeBytes": 1234,
+          "Sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

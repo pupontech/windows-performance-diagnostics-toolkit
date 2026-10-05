@@ -1,0 +1,12 @@
+{
+  "id": "unsupported-smart",
+  "title": "Disk exposes no reliability counters",
+  "driver": {
+    "kind": "storage-reliability",
+    "args": {
+      "counters": null,
+      "deviceId": "nvme0"
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

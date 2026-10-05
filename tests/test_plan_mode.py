@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "src" / "Invoke-WindowsPerformanceDiagnostics.ps1"
@@ -78,6 +80,43 @@ def test_plan_mode_writes_a_local_only_read_only_manifest(tmp_path):
     assert "registry-change" not in manifest["plannedActions"]
 
 
+def test_plan_mode_rejects_unc_output_paths(tmp_path):
+    """The local-only safety contract must reject network-share output paths
+    before writing even in Plan mode."""
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-OutputDirectory",
+        r"\\server\share\wpd-case",
+    )
+
+    assert result.returncode != 0
+    assert "network-share" in result.stderr.lower()
+
+
+def test_plan_mode_rejects_output_under_a_reparse_parent(tmp_path):
+    """A normal-looking case path beneath a junction/symlink parent must not
+    be used as an alternate output root."""
+    target = tmp_path / "real-target"
+    target.mkdir()
+    parent = tmp_path / "link-parent"
+    try:
+        parent.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"directory symlink creation unavailable: {error}")
+
+    result = run_tool(
+        "-Mode",
+        "Plan",
+        "-OutputDirectory",
+        str(parent / "case-output"),
+    )
+
+    assert result.returncode != 0
+    assert "reparse point" in result.stderr.lower()
+    assert not (target / "case-output").exists()
+
+
 def test_collect_mode_refuses_to_collect_without_explicit_consent(tmp_path):
     output_directory = tmp_path / "no-consent"
     result = run_tool("-Mode", "Collect", "-OutputDirectory", str(output_directory))
@@ -126,7 +165,12 @@ def test_collect_progress_uses_a_wall_clock_deadline_and_launchers_explain_extra
     assert "running in the SAME window" in start_here
     assert "then a separate 30-second WPR trace" not in start_here
     assert "final export, hashing, and ZIP packaging" in start_here
-    assert "-PerformanceMode -MarkerMode" in start_here
+    assert 'set "LAUNCHMODE=IncidentCollect"' in start_here
+    assert '-LaunchMode "%LAUNCHMODE%"' in start_here
+    helper = (REPO_ROOT / 'src' / 'Invoke-WpdLauncher.ps1').read_text(encoding='utf-8-sig')
+    incident_route = helper.split("'IncidentCollect' {", 1)[1].split("'StandaloneCollect' {", 1)[0]
+    assert '$collectorParameters.PerformanceMode = $true' in incident_route
+    assert '$collectorParameters.MarkerMode = $true' in incident_route
     assert "30-second baseline sampling" in run_diagnostics
 
 
@@ -435,6 +479,7 @@ def test_plan_mode_with_boot_failure_logs_lists_action_and_scope(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
 
     assert "collect-boot-failure-evidence-after-explicit-consent" in manifest["plannedActions"]
+    assert "analyze-servicing-logs-after-explicit-consent" in manifest["plannedActions"]
     assert manifest["bootFailureLogs"]["maxBytesPerFile"] == 104857600  # 100 MB
     assert manifest["bootFailureLogs"]["sources"] == [
         "srt-trail",
@@ -544,7 +589,7 @@ def test_new_case_package_zips_only_named_files(tmp_path):
     command = (
         f"$null = . '{script}' -Mode Plan -OutputDirectory {tmp_path.as_posix()}/plan; "
         f"New-CasePackage -Directory '{src.as_posix()}' "
-        f"-RelativeNames @('performance-samples.csv','network-state.json','minidumps/082826-12345-01.dmp') "
+        f"-RelativeNames @('performance-samples.csv','network-state.json','minidumps\\082826-12345-01.dmp') "
         f"-DestinationDirectory '{out.as_posix()}' -LeafName 'wpd-test'"
     )
     result = subprocess.run(
@@ -567,6 +612,32 @@ def test_new_case_package_zips_only_named_files(tmp_path):
         ], names
         assert "STALE.etl" not in names
         assert zf.read("minidumps/082826-12345-01.dmp") == b"MZDUMP"
+
+
+def test_new_case_package_rejects_traversal_entries(tmp_path):
+    src = tmp_path / "case"
+    src.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must-not-be-packaged", encoding="utf-8")
+    out = tmp_path / "packages"
+    out.mkdir()
+
+    script = str(SCRIPT).replace("\\", "/")
+    command = (
+        f"$null = . '{script}' -Mode Plan -OutputDirectory '{(tmp_path / 'plan').as_posix()}'; "
+        f"New-CasePackage -Directory '{src.as_posix()}' "
+        f"-RelativeNames @('../outside.txt') "
+        f"-DestinationDirectory '{out.as_posix()}' -LeafName 'wpd-test'"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert outside.read_text(encoding="utf-8") == "must-not-be-packaged"
+    assert not list(out.glob("wpd-test-*.zip"))
 
 
 def test_plan_mode_with_remote_lists_action_and_remote_safety_block(tmp_path):
@@ -861,9 +932,13 @@ def test_run_diagnostics_bat_is_quote_safe_and_ci_safe():
     assert b'\\"' not in bat, "backslash-immediately-before-quote hazard in Run-Diagnostics.bat"
 
     text = bat.decode("ascii")
-    assert "-Mode Collect" in text
-    assert "-ConfirmLocalCollection" in text  # consent flag must be passed explicitly
-    assert "-ZipOutput" in text  # case package is part of the standard launcher
+    assert '-LaunchMode StandaloneCollect' in text
+    assert 'src\\Invoke-WpdLauncher.ps1' in text
+    helper = (REPO_ROOT / 'src' / 'Invoke-WpdLauncher.ps1').read_text(encoding='utf-8-sig')
+    standalone = helper.split("'StandaloneCollect' {", 1)[1].split('\n}', 1)[0]
+    assert "Mode = 'Collect'" in helper
+    assert 'ConfirmLocalCollection = $true' in helper
+    assert '$collectorParameters.ZipOutput = $true' in standalone
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
 
 
@@ -873,7 +948,11 @@ def test_run_diagnostics_bat_reports_collection_failures():
     text = (REPO_ROOT / "Run-Diagnostics.bat").read_bytes().decode("ascii")
 
     assert "if errorlevel 1 goto :collection_failed" in text
-    assert 'if not exist "%OUTDIR%\\diagnostic-manifest.json" goto :collection_failed' in text
+    assert 'Invoke-WpdLauncher.ps1' in text
+    helper = (REPO_ROOT / 'src' / 'Invoke-WpdLauncher.ps1').read_text(encoding='utf-8-sig')
+    missing_manifest = helper.split('if (-not [System.IO.File]::Exists($manifestPath)) {', 1)[1].split('if (-not [System.IO.File]::Exists($logPath)) {', 1)[0]
+    assert 'exit 1' in missing_manifest
+    assert 'if (-not $collectorSucceeded) { exit 1 }' in helper
     assert ":collection_failed" in text
     failure_block = text.split(":collection_failed", 1)[1]
     assert "exit /b 1" in failure_block
@@ -1290,30 +1369,40 @@ def test_start_here_bat_is_elevation_safe_and_quote_safe():
         "5 - Exit",
     ):
         assert option in text, f"missing menu option {option!r}"
-    # the incident-capture path must reach the same elevatable Collect flow with
-    # its own consent flags and a marker-aware duration
+    # Collect is intentionally routed through the shared PowerShell launcher;
+    # its mode table owns the consent flags and per-mode duration.
+    launcher = (REPO_ROOT / "src" / "Invoke-WpdLauncher.ps1").read_text(encoding="utf-8")
     assert ":opt_incident" in text
-    assert 'set "DURATION=120"' in text
-    assert "-DurationSeconds %DURATION%" in text
-    # Consent flags remain explicit in the single launcher Collect flow
-    assert "-Mode Collect" in text
-    assert "-ConfirmLocalCollection" in text
-    assert "-CaptureWpr" in text
-    assert "-ConfirmWprCapture" in text
-    assert "-CollectMinidumps" in text
-    assert "-ConfirmMinidumpCollection" in text
-    assert "-CollectBootFailureLogs" in text
-    assert "-ConfirmBootFailureLogCollection" in text
-    assert "-ZipOutput" in text
+    assert 'set "LAUNCHMODE=IncidentCollect"' in text
+    assert "$collectorParameters.DurationSeconds = 120" in launcher
+    assert "Mode = 'Collect'" in launcher
+    for flag in (
+        "ConfirmLocalCollection = $true",
+        "CaptureWpr = $true",
+        "ConfirmWprCapture = $true",
+        "CollectMinidumps = $true",
+        "ConfirmMinidumpCollection = $true",
+        "CollectBootFailureLogs = $true",
+        "ConfirmBootFailureLogCollection = $true",
+        "ZipOutput = $true",
+        "OpenOutputs = $true",
+    ):
+        assert flag in launcher, f"shared launcher lost collection contract {flag!r}"
     assert "-Mode Verify" in text
     assert "-InputDirectory" in text
     # Defender-strip resilience: pre-flight existence check with recovery steps
     assert "src\\Invoke-WindowsPerformanceDiagnostics.ps1 was not found" in text
-    # Result visibility: log everything with Tee-Object, never a silent failure
-    assert "Tee-Object" in text
-    assert "diagnostic-manifest.json" in text
-    # No trailing backslash before the closing quote of -OutputDirectory
-    assert '-OutputDirectory \'%OUTDIR%\'' in text
+    # The actual route now uses an exact run receipt rather than Tee-Object and
+    # a fixed shared output path. Plan remains rooted at OUTDIR; Collect uses the
+    # launcher's unique child under that same base.
+    assert '"%WPD_POWERSHELL_EXE%"' in text
+    assert "if not defined WPD_POWERSHELL_EXE set \"WPD_POWERSHELL_EXE=powershell.exe\"" in text
+    assert "Invoke-WpdLauncher.ps1" in text
+    assert "RunReceiptPath = $receiptPath" in launcher
+    assert "CaseBaseDirectory = $baseDirectory" in launcher
+    assert "Tee-Object" not in text
+    assert "diagnostic-manifest.json" not in text
+    assert '-Mode Plan -OutputDirectory "%OUTDIR%"' in text
     assert 'if not "%CI%"=="true" pause' in text  # CI-safe pause guard
 
 
@@ -2645,6 +2734,7 @@ $html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext
     claimsInsufficient   = [bool]($html -match 'Insufficient Evidence')
     statesNoPressure     = [bool]($html -match 'No Sustained Pressure Detected')
     retainsCaveat        = [bool]($html -match 'does not prove the system is healthy')
+    hasBrokenFragment    = [bool]($html -match '\. did not trigger any pressure rules')
 } | ConvertTo-Json
 """
     result = _run_ps(body.replace("__SCRIPT__", script))
@@ -2654,6 +2744,7 @@ $html = ConvertTo-FindingsHtml -Findings @() -Manifest $manifest -SymptomContext
     assert output["statesNoPressure"] is True
     assert output["claimsInsufficient"] is False
     assert output["retainsCaveat"] is True
+    assert output["hasBrokenFragment"] is False
 
 
 def test_html_report_encodes_artifact_size_bytes():

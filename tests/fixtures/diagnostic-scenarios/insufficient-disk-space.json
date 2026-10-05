@@ -1,0 +1,18 @@
+{
+  "id": "insufficient-disk-space",
+  "title": "Capture refused because the target volume is too small",
+  "driver": {
+    "kind": "storage-bound",
+    "args": {
+      "storagePolicy": "circular-memory",
+      "bounded": true,
+      "traceBudgetMB": 512,
+      "maxDurationSeconds": 600,
+      "mode": "memory",
+      "freeSpaceBytes": 104857600,
+      "outputDirectory": "/tmp/wpd-capture",
+      "requestedDurationSeconds": 300
+    }
+  },
+  "note": "Synthetic fixture input only; no Windows provider is queried."
+}

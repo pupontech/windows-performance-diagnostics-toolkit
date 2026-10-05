@@ -285,7 +285,7 @@ function Get-WpdRunCompletion {
         $item = $manifest.$name
         if ($null -ne $item) { Add-WpdCompletionStage -Stages $stages -Collector $name -Status $item.status -Coverage $null }
     }
-    $collectionErrors = @(Get-WpdCompletionProperty -InputObject $manifest -Name 'collectionErrors')
+    $collectionErrors = @(Get-WpdCompletionProperty -InputObject $manifest -Name 'collectionErrors' | Where-Object { $null -ne $_ })
     if ($collectionErrors.Count -gt 0) {
         [void]$reasons.Add(('collection-errors:{0}' -f $collectionErrors.Count))
         foreach ($item in $collectionErrors) {

@@ -10,6 +10,29 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Get-WpdWindowsPowerShellModulePath {
+    param([string]$NativeModuleDirectory, [AllowNull()][string[]]$RegisteredPaths)
+    $parts = @($NativeModuleDirectory)
+    foreach ($value in $RegisteredPaths) {
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        foreach ($part in $value.Split([char]59)) {
+            if (-not [string]::IsNullOrWhiteSpace($part)) { $parts += $part }
+        }
+    }
+    return [string]::Join(';', $parts)
+}
+
+# A cmd.exe hop from pwsh preserves its process module path, unlike a direct
+# powershell.exe invocation. Restore native discovery in this launcher process
+# only; do not modify registered User/Machine environment settings.
+if ($PSVersionTable.PSVersion.Major -le 5) {
+    $env:PSModulePath = Get-WpdWindowsPowerShellModulePath `
+        -NativeModuleDirectory ([System.IO.Path]::Combine($PSHOME, 'Modules')) `
+        -RegisteredPaths @(
+            [System.Environment]::GetEnvironmentVariable('PSModulePath', 'User'),
+            [System.Environment]::GetEnvironmentVariable('PSModulePath', 'Machine'))
+}
 $modulePath = Join-Path -Path $PSScriptRoot -ChildPath 'Wpd.CasePath.psm1'
 Import-Module -Name $modulePath -Force -ErrorAction Stop
 $collectorPath = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-WindowsPerformanceDiagnostics.ps1'
